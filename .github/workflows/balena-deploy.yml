@@ -18,20 +18,23 @@ jobs:
 
       - name: Compile and Deploy to BalenaCloud
         run: |
-          # 1. Log into your balena account
+          # 1. Log cleanly into your balena account
           balena login --token ${{ secrets.BALENA_TOKEN }}
           
-          # 2. Hard-inject version 2.0.0 into package.json so balena adopts it as the official release tag
+          # 2. Hard-inject version 2.0.0 so balena adopts it as the official release tag
           node -e "const fs = require('fs'); const pkg = JSON.parse(fs.readFileSync('package.json')); pkg.version = '2.0.0'; fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));"
           
-          # 3. Manually parse the template file into a valid docker-compose configuration
-          cp docker-compose.balena.yml.tmpl docker-compose.yml
+          # 3. Make the internal script executable
+          chmod +x ./bin/deploy_to_balena.sh
           
-          # 4. Inject structural fallback tags for the Pi 3 images to fix the platform OS parsing error
-          sed -i 's/${IMAGE_TAG}/latest-pi3/g' docker-compose.yml
-          sed -i 's/${SERVER_IMAGE}/ghcr.io\/screenly\/anthias-server:latest-pi3/g' docker-compose.yml
-          sed -i 's/${VIEWER_IMAGE}/ghcr.io\/screenly\/anthias-viewer:latest-pi3/g' docker-compose.yml
-          sed -i 's/${CELERY_IMAGE}/ghcr.io\/screenly\/anthias-celery:latest-pi3/g' docker-compose.yml
+          # 4. Let Anthias generate the dev deployment schema so it handles the Pi 3 logic natively
+          ./bin/deploy_to_balena.sh --board pi3 --fleet it71/anthias-pi3 --dev || true
           
-          # 5. Push the perfectly compiled schema using Balena's native engine
-          balena deploy it71/anthias-pi3 --emulated
+          # 5. SANITIZE: Aggressively sweep and replace any raw ${VARIABLES} the script failed to parse with 'latest'
+          sed -i -E 's/\$\{[A-Za-z0-9_]+\}/latest/g' docker-compose.yml
+          
+          # 6. SANITIZE: Fix any dangling empty tags (e.g., 'image: my-image:') that break the builder
+          sed -i -E 's/:[[:space:]]*$/:latest/g' docker-compose.yml
+          
+          # 7. Push the fully sanitized schema using Balena's native emulation engine
+          balena deploy it71/anthias-pi3 --emulated --build
