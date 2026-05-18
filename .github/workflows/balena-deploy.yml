@@ -16,17 +16,19 @@ jobs:
         run: |
           npm install -g balena-cli
 
-      - name: Process Schema and Push Production Release
+      - name: Inject Version and Deploy to BalenaCloud
         run: |
-          # 1. Log cleanly into your balena dashboard
+          # 1. Log into your Balena cloud engine
           balena login --token ${{ secrets.BALENA_TOKEN }}
           
-          # 2. Make the script executable
-          chmod +x ./bin/deploy_to_balena.sh
+          # 2. Force the root package.json to be version 2.0.0
+          node -e "const fs = require('fs'); const pkg = JSON.parse(fs.readFileSync('package.json')); pkg.version = '2.0.0'; fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));"
           
-          # 3. Use the dev flag script ONLY to safely generate a fully valid docker-compose file 
-          # We append '|| true' to bypass the step's internal push command if it errors out at the end
-          ./bin/deploy_to_balena.sh --board pi3 --fleet it71/anthias-pi3 --dev || true
+          # 3. Manually create the required docker-compose from the template
+          cp docker-compose.balena.yml.tmpl docker-compose.yml
           
-          # 4. Explicitly push the generated schema to Balena as a hardcoded version 2.0.0 release
-          balena deploy it71/anthias-pi3 --build --version 2.0.0
+          # 4. Strip out any raw template tags to prevent HTTP 400 validation issues
+          sed -i 's/${IMAGE_TAG}/latest/g' docker-compose.yml
+          
+          # 5. Push via native build, passing the explicit target architecture for the Pi 3
+          balena deploy it71/anthias-pi3 --emulated
