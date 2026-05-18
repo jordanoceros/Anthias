@@ -16,13 +16,13 @@ jobs:
         run: |
           npm install -g balena-cli
 
-      - name: Generate Compose Schema and Push to Fleet
+      - name: Deploy to BalenaCloud
         run: |
-          # Log into the Balena CLI using your saved secret token
+          # Log into Balena CLI
           balena login --token ${{ secrets.BALENA_TOKEN }}
           
-          # Make the template deployment script executable
-          chmod +x ./bin/deploy_to_balena.sh
+          # Manually create the missing docker-compose file from Anthias's template
+          cp docker-compose.balena.yml.tmpl docker-compose.yml
           
-          # Run the Anthias self-deploy script mapped explicitly to your Pi 3 fleet
-          ./bin/deploy_to_balena.sh --board pi3 --fleet it71/anthias-pi3 --dev
+          # Push cleanly using the native CLI build engine
+          balena deploy it71/anthias-pi3 --build
