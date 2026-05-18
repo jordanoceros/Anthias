@@ -8,6 +8,8 @@ on:
 jobs:
   balena_cloud_build:
     runs-on: ubuntu-latest
+    env:
+      DOCKER_DEFAULT_PLATFORM: linux/arm/v7
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
