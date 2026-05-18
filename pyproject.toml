@@ -100,8 +100,8 @@ dev = [
     "pytest-django==4.12.0",
     "pytest-mock==3.15.1",
     "pytest-xdist==3.6.1",
-    "playwright==1.59.0",
-    "pytest-playwright==0.7.2",
+    "playwright==1.59.0; platform_machine != 'armv7l'",
+    "pytest-playwright==0.7.2; platform_machine != 'armv7l'",
     "time-machine==2.15.0",
 ]
 host = [
