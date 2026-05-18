@@ -12,17 +12,9 @@ jobs:
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      - name: Install Balena CLI
-        run: |
-          npm install -g balena-cli
-
       - name: Deploy to BalenaCloud
-        run: |
-          # Log into Balena CLI
-          balena login --token ${{ secrets.BALENA_TOKEN }}
-          
-          # Manually create the missing docker-compose file from Anthias's template
-          cp docker-compose.balena.yml.tmpl docker-compose.yml
-          
-          # Push cleanly using the native CLI build engine
-          balena deploy it71/anthias-pi3 --build
+        uses: ./.github/actions/balena-deploy
+        with:
+          balena_token: ${{ secrets.BALENA_TOKEN }}
+          fleet: it71/anthias-pi3
+          board: pi3
