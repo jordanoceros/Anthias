@@ -12,9 +12,20 @@ jobs:
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      - name: Deploy to BalenaCloud
-        uses: ./.github/actions/balena-deploy
-        with:
-          balena_token: ${{ secrets.BALENA_TOKEN }}
-          fleet: it71/anthias-pi3
-          board: pi3
+      - name: Install Balena CLI
+        run: |
+          npm install -g balena-cli
+
+      - name: Process Schema and Push
+        run: |
+          # Log into your Balena cloud engine cleanly
+          balena login --token ${{ secrets.BALENA_TOKEN }}
+          
+          # Copy the file over 
+          cp docker-compose.balena.yml.tmpl docker-compose.yml
+          
+          # Run a bash sweep to swap the unparsed template tag out for a clean "latest" string
+          sed -i 's/${IMAGE_TAG}/latest/g' docker-compose.yml
+          
+          # Deploy cleanly using native image compilation rules
+          balena deploy it71/anthias-pi3 --build
