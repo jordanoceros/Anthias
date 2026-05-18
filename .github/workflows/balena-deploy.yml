@@ -18,18 +18,20 @@ jobs:
 
       - name: Compile and Deploy to BalenaCloud
         run: |
-          # 1. Log cleanly into your Balena cloud engine
+          # 1. Log into your balena account
           balena login --token ${{ secrets.BALENA_TOKEN }}
           
-          # 2. Inject version 2.0.0 into package.json so Balena adopts it as the official release tag
+          # 2. Hard-inject version 2.0.0 into package.json so balena adopts it as the official release tag
           node -e "const fs = require('fs'); const pkg = JSON.parse(fs.readFileSync('package.json')); pkg.version = '2.0.0'; fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));"
           
-          # 3. Make Anthias's internal script executable
-          chmod +x ./bin/deploy_to_balena.sh
+          # 3. Manually parse the template file into a valid docker-compose configuration
+          cp docker-compose.balena.yml.tmpl docker-compose.yml
           
-          # 4. Use their script ONLY to safely generate a fully valid docker-compose file.
-          # We append '|| true' so that when its built-in push command fails, the workflow doesn't stop.
-          ./bin/deploy_to_balena.sh --board pi3 --fleet it71/anthias-pi3 --dev || true
+          # 4. Inject structural fallback tags for the Pi 3 images to fix the platform OS parsing error
+          sed -i 's/${IMAGE_TAG}/latest-pi3/g' docker-compose.yml
+          sed -i 's/${SERVER_IMAGE}/ghcr.io\/screenly\/anthias-server:latest-pi3/g' docker-compose.yml
+          sed -i 's/${VIEWER_IMAGE}/ghcr.io\/screenly\/anthias-viewer:latest-pi3/g' docker-compose.yml
+          sed -i 's/${CELERY_IMAGE}/ghcr.io\/screenly\/anthias-celery:latest-pi3/g' docker-compose.yml
           
-          # 5. Push the perfectly compiled schema using Balena's native ARM emulation engine
+          # 5. Push the perfectly compiled schema using Balena's native engine
           balena deploy it71/anthias-pi3 --emulated
