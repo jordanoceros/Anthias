@@ -12,36 +12,21 @@ jobs:
       - name: Checkout Source Code
         uses: actions/checkout@v4
         with:
-          # Fetch all history and tags so Git versioning commands work properly
+          # Crucial: Fetches all history and tags so the native build script 
+          # can generate valid tag formats automatically
           fetch-depth: 0
 
       - name: Install Balena CLI
         run: |
           npm install -g balena-cli
 
-      - name: Compile, Tag and Deploy
+      - name: Authenticate and Deploy via Anthias Script
         run: |
-          # 1. Log cleanly into your balena account
+          # 1. Authenticate with Balena Cloud
           balena login --token ${{ secrets.BALENA_TOKEN }}
           
-          # 2. Configure dummy git identity for the runner environment
-          git config --global user.email "action@github.com"
-          git config --global user.name "GitHub Action"
-          
-          # 3. Create a local git tag so Anthias natively compiles everything as release 2.0.0
-          git tag -a v2.0.0 -m "Release version 2.0.0"
-          
-          # 4. Make the internal script executable
+          # 2. Ensure execution permissions are set on the script
           chmod +x ./bin/deploy_to_balena.sh
           
-          # 5. Run the Anthias builder script to handle the native Pi 3 layout
-          ./bin/deploy_to_balena.sh --board pi3 --fleet it71/anthias-pi3 --dev || true
-          
-          # 6. SANITIZE: Sweep and replace any remaining raw unparsed ${VARIABLES} with 'latest'
-          sed -i -E 's/\$\{[A-Za-z0-9_]+\}/latest/g' docker-compose.yml
-          
-          # 7. SANITIZE: Fix trailing empty tags ONLY on image configuration lines to prevent syntax crashes
-          sed -i -E '/image:/ s/:[[:space:]]*$/:latest/g' docker-compose.yml
-          
-          # 8. Push the pristine, 2.0.0-stamped schema using Balena's native emulation engine
-          balena deploy it71/anthias-pi3 --emulated
+          # 3. Run the standard deployment pipeline for the Pi 3 target
+          ./bin/deploy_to_balena.sh --board pi3 --fleet it71/anthias-pi3 --dev
