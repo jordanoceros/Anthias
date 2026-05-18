@@ -18,14 +18,11 @@ jobs:
 
       - name: Process Schema and Push
         run: |
-          # Log into your Balena cloud engine cleanly
+          # 1. Log cleanly into your balena dashboard
           balena login --token ${{ secrets.BALENA_TOKEN }}
           
-          # Copy the file over 
-          cp docker-compose.balena.yml.tmpl docker-compose.yml
+          # 2. Make Anthias's internal deployment builder script executable
+          chmod +x ./bin/deploy_to_balena.sh
           
-          # Run a bash sweep to swap the unparsed template tag out for a clean "latest" string
-          sed -i 's/${IMAGE_TAG}/latest/g' docker-compose.yml
-          
-          # Deploy cleanly using native image compilation rules
-          balena deploy it71/anthias-pi3 --build
+          # 3. Force the script to compile the templates and push directly using the local dev code flag
+          ./bin/deploy_to_balena.sh --board pi3 --fleet it71/anthias-pi3 --dev
