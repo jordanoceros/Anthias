@@ -17,9 +17,10 @@ jobs:
           npm install -g balena-cli
 
       - name: Generate Compose Schema and Push to Fleet
-        env:
-          BALENARC_TOKEN: ${{ secrets.BALENA_TOKEN }}
         run: |
+          # Log into the Balena CLI using your saved secret token
+          balena login --token ${{ secrets.BALENA_TOKEN }}
+          
           # Make the template deployment script executable
           chmod +x ./bin/deploy_to_balena.sh
           
