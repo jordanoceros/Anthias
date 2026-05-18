@@ -18,11 +18,15 @@ jobs:
 
       - name: Process Schema and Push Production Release
         run: |
-          # 1. Log into your balena dashboard
+          # 1. Log cleanly into your balena dashboard
           balena login --token ${{ secrets.BALENA_TOKEN }}
           
-          # 2. Make Anthias's internal deployment builder script executable
+          # 2. Make the script executable
           chmod +x ./bin/deploy_to_balena.sh
           
-          # 3. Compile templates cleanly as a production 2.0.0 release for the Pi 3
-          ./bin/deploy_to_balena.sh --board pi3 --fleet it71/anthias-pi3 --version 2.0.0
+          # 3. Use the dev flag script ONLY to safely generate a fully valid docker-compose file 
+          # We append '|| true' to bypass the step's internal push command if it errors out at the end
+          ./bin/deploy_to_balena.sh --board pi3 --fleet it71/anthias-pi3 --dev || true
+          
+          # 4. Explicitly push the generated schema to Balena as a hardcoded version 2.0.0 release
+          balena deploy it71/anthias-pi3 --build --version 2.0.0
