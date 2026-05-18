@@ -18,6 +18,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Patch playwright for armv7l incompatibility
+        run: |
+          sed -i 's/"playwright==1.59.0"/"playwright==1.59.0; platform_machine != '\''armv7l'\''"/g' pyproject.toml
+          sed -i 's/"pytest-playwright==0.7.2"/"pytest-playwright==0.7.2; platform_machine != '\''armv7l'\''"/g' pyproject.toml
+          rm -f uv.lock
+
       - name: Install Balena CLI
         run: npm install -g balena-cli
 
