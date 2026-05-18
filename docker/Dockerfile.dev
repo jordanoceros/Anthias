@@ -1,6 +1,9 @@
 FROM mirror.gcr.io/library/python:3.13-trixie
 
+# Install uv and the required development libraries for compiling pygit2
 RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends libgit2-dev pkg-config && \
+    rm -rf /var/lib/apt/lists/* && \
     pip install uv
 
 WORKDIR /app
