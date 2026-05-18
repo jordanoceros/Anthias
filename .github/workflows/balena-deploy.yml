@@ -1,0 +1,19 @@
+name: Deploy Fork to Balena
+
+on:
+  push:
+    branches:
+      - master  # Anthias uses 'master' as its primary branch
+
+jobs:
+  balena_cloud_build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Deploy to BalenaCloud
+        uses: balena-io/deploy-to-balena-action@v2
+        with:
+          balena_token: ${{ secrets.BALENA_TOKEN }}
+          fleet: it71/anthias-pi3
