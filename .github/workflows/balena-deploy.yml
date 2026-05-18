@@ -1,10 +1,8 @@
 name: Deploy Fork to Balena
-
 on:
   push:
     branches:
       - master
-
 jobs:
   balena_cloud_build:
     runs-on: ubuntu-latest
@@ -14,21 +12,19 @@ jobs:
       - name: Checkout Source Code
         uses: actions/checkout@v4
         with:
-          # Crucial: Fetches all history and tags so the native build script 
-          # can generate valid tag formats automatically
           fetch-depth: 0
 
+      - name: Set up QEMU (ARM emulation)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Install Balena CLI
-        run: |
-          npm install -g balena-cli
+        run: npm install -g balena-cli
 
       - name: Authenticate and Deploy via Anthias Script
         run: |
-          # 1. Authenticate with Balena Cloud
           balena login --token ${{ secrets.BALENA_TOKEN }}
-          
-          # 2. Ensure execution permissions are set on the script
           chmod +x ./bin/deploy_to_balena.sh
-          
-          # 3. Run the standard deployment pipeline for the Pi 3 target
           ./bin/deploy_to_balena.sh --board pi3 --fleet it71/anthias-pi3 --dev
