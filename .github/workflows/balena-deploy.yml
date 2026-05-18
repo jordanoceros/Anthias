@@ -12,8 +12,16 @@ jobs:
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      - name: Deploy to BalenaCloud
-        uses: balena-io/deploy-to-balena-action@master
-        with:
-          balena_token: ${{ secrets.BALENA_TOKEN }}
-          fleet: it71/anthias-pi3
+      - name: Install Balena CLI
+        run: |
+          npm install -g balena-cli
+
+      - name: Generate Compose Schema and Push to Fleet
+        env:
+          BALENARC_TOKEN: ${{ secrets.BALENA_TOKEN }}
+        run: |
+          # Make the template deployment script executable
+          chmod +x ./bin/deploy_to_balena.sh
+          
+          # Run the Anthias self-deploy script mapped explicitly to your Pi 3 fleet
+          ./bin/deploy_to_balena.sh --board pi3 --fleet it71/anthias-pi3 --dev
