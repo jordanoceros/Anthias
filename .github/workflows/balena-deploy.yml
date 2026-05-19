@@ -3,9 +3,19 @@ on:
   push:
     branches:
       - master
+
 jobs:
   balena_cloud_build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - board: "pi3"
+            fleet: "it71/anthias-pi3"
+          - board: "rpi5"  # Verify if your script expects 'rpi5' or 'raspberrypi5'
+            fleet: "it71/anthias-pi5"
+            
+    name: Deploy to ${{ matrix.fleet }}
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
@@ -19,4 +29,4 @@ jobs:
         run: |
           balena login --token ${{ secrets.BALENA_TOKEN }}
           chmod +x ./bin/deploy_to_balena.sh
-          ./bin/deploy_to_balena.sh --board pi3 --fleet it71/anthias-pi3
+          ./bin/deploy_to_balena.sh --board ${{ matrix.board }} --fleet ${{ matrix.fleet }}
