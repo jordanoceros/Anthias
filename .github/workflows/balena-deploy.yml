@@ -8,11 +8,12 @@ jobs:
   balena_cloud_build:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false  # Prevents one failing board from canceling the other
       matrix:
         include:
           - board: "pi3"
             fleet: "it71/anthias-pi3"
-          - board: "rpi5"  # Verify if your script expects 'rpi5' or 'raspberrypi5'
+          - board: "pi5"   # Fixed from rpi5
             fleet: "it71/anthias-pi5"
             
     name: Deploy to ${{ matrix.fleet }}
