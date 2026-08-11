@@ -4,6 +4,13 @@ on:
     branches:
       - master
   workflow_dispatch:
+  schedule:
+    # Redeploy daily so fleets pick up the next published latest-${board} images.
+    - cron: "23 10 * * *"
+
+concurrency:
+  group: balena-deploy-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   balena_cloud_build:
