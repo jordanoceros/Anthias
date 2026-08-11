@@ -3,22 +3,23 @@ on:
   push:
     branches:
       - master
+  workflow_dispatch:
 
 jobs:
   balena_cloud_build:
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false  # Prevents one failing board from canceling the other
+      fail-fast: false
       matrix:
         include:
-          - board: "pi3"
-            fleet: "it71/anthias-pi3"
-          - board: "pi5"   # Fixed from rpi5
-            fleet: "it71/anthias-pi5"
-            
+          - board: pi3
+            fleet: it71/anthias-pi3
+          - board: pi5
+            fleet: it71/anthias-pi5
+
     name: Deploy to ${{ matrix.fleet }}
     steps:
-      - name: Checkout Source Code
+      - name: Checkout source code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -26,7 +27,7 @@ jobs:
       - name: Install Balena CLI
         run: npm install -g balena-cli
 
-      - name: Authenticate and Deploy via Anthias Script
+      - name: Authenticate and deploy via Anthias script
         run: |
           balena login --token ${{ secrets.BALENA_TOKEN }}
           chmod +x ./bin/deploy_to_balena.sh
