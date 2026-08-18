@@ -70,6 +70,15 @@ services:
 
   redis:
     image: ghcr.io/screenly/anthias-redis:${GIT_SHORT_HASH}-${BOARD}
+    command: >
+      sh -ec '
+        if [ -f /var/lib/redis/appendonlydir/appendonly.aof.manifest ]; then
+          echo "Checking Redis AOF manifest before startup";
+          cp -a /var/lib/redis/appendonlydir "/var/lib/redis/appendonlydir.backup.$(date +%Y%m%d%H%M%S)" || true;
+          yes | redis-check-aof --fix /var/lib/redis/appendonlydir/appendonly.aof.manifest;
+        fi;
+        exec redis-server --protected-mode no --dir /var/lib/redis --appendonly yes --save "3600 1" --save "300 100" --save "60 10000"
+      '
     ports:
       - 127.0.0.1:6379:6379
     restart: always
