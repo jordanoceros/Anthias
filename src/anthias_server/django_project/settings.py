@@ -8,14 +8,27 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
+import asyncio
+import configparser
+import logging
+import math
+import platform
 import secrets
+import socket
 import sys
+import zoneinfo
+from collections.abc import Iterator
 from os import getenv
 from pathlib import Path
 from typing import Any
 
-import pytz
+import redis.exceptions
+import sentry_sdk
+from sentry_sdk.integrations.logging import ignore_logger
+from sentry_sdk.types import Event, Hint
 
+from anthias_common.version import get_anthias_release
+from anthias_server.settings import CONFIG_DIR, CONFIG_FILE
 from anthias_server.settings import settings as device_settings
 
 # django_stubs_ext.monkeypatch() makes Django generic classes
@@ -36,13 +49,376 @@ except ModuleNotFoundError as exc:
 # Repo root: src/anthias_server/django_project/settings.py → up 3 to repo root.
 BASE_DIR = Path(__file__).resolve().parents[3]
 
+# Detect "running under tests" without depending solely on the
+# ENVIRONMENT env var. The root conftest.py sets ENVIRONMENT=test via
+# os.environ.setdefault, but pytest-django's plugin-time settings load
+# can fire before that conftest executes — leaving getenv() blank and
+# this module pointed at the production /data path on local pytest
+# runs. Detect pytest itself by inspecting argv (covers `pytest ...`,
+# `python -m pytest ...`, and `uv run pytest ...`) so the test branch
+# is taken regardless of import order. Used by IS_TEST below.
+_running_under_pytest = any('pytest' in (a or '') for a in sys.argv)
+
+# The deployment environment: 'development', 'test', or 'production'
+# (the default). Everything environment-dependent in this file derives
+# from these two names rather than re-reading the env var.
+ENVIRONMENT = getenv('ENVIRONMENT', 'production')
+
+# Deliberately not folded into ENVIRONMENT, and deliberately not
+# derived from DEBUG:
+#
+#   * Keeping the argv sniff out of ENVIRONMENT keeps it out of DEBUG.
+#     A stray process whose argv mentions pytest must never be able to
+#     turn debug error pages on in production.
+#   * pytest-django sets settings.DEBUG = False for the duration of a
+#     run, so DEBUG is not readable as "is this a test". IS_TEST is
+#     computed once at import and cannot be mutated that way.
+IS_TEST = ENVIRONMENT == 'test' or _running_under_pytest
+
+# Operators can point crash reporting at their own Sentry project by
+# setting SENTRY_DSN, or disable it entirely by setting it to an
+# empty string (sentry_sdk treats a falsy DSN as "don't send").
+#
+# Test runs default to the empty DSN: the unit suite is built to run
+# with no external network dependencies (conftest.py force-mocks
+# Redis for the same reason), and exceptions raised on purpose by
+# failing tests must not land in the production Sentry project. An
+# explicit SENTRY_DSN still wins so the integration stack can opt in
+# deliberately.
+_default_sentry_dsn = (
+    ''
+    if IS_TEST
+    else (
+        'https://da18c7bdab65c9adc4afcd311f5b6f09'
+        '@o4511522371534848.ingest.us.sentry.io/4511522375794688'
+    )
+)
+
+
+def _exception_chain(exc: BaseException | None) -> Iterator[BaseException]:
+    """Walk ``exc`` and everything it was raised from.
+
+    Wrappers matter here: channels-redis and kombu re-raise the
+    underlying ``redis.exceptions.ConnectionError`` wrapped in their
+    own types, so the transient-noise check below has to look at the
+    whole ``__cause__``/``__context__`` chain, not just the head.
+    """
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        # Mirror traceback rendering: an explicit ``raise ... from
+        # None`` sets __suppress_context__, meaning the author
+        # deliberately detached the causal chain — don't let a
+        # suppressed redis error hide the wrapper exception.
+        exc = exc.__cause__ or (
+            None if exc.__suppress_context__ else exc.__context__
+        )
+
+
+def _raised_outside_anthias_code(exc: BaseException) -> bool:
+    """Whether ``exc``'s traceback contains no Anthias frame at all.
+
+    Used to tell a soft time limit that interrupted *our* code from one
+    that landed in third-party teardown after the task body had already
+    returned. An exception with no traceback is treated as "unknown" and
+    kept, so a missing traceback can never silence a real event.
+    """
+    tb = exc.__traceback__
+    if tb is None:
+        return False
+    while tb is not None:
+        if tb.tb_frame.f_globals.get('__name__', '').startswith('anthias_'):
+            return False
+        tb = tb.tb_next
+    return True
+
+
+def _is_late_soft_time_limit(exc: BaseException) -> bool:
+    """A celery soft limit that landed after the task body returned.
+
+    Matched by name+module rather than by importing celery: the viewer
+    imports this settings module and its image ships no celery.
+    """
+    cls = type(exc)
+    return (
+        cls.__name__ == 'SoftTimeLimitExceeded'
+        and cls.__module__.split('.')[0] in ('billiard', 'celery')
+        and _raised_outside_anthias_code(exc)
+    )
+
+
+def _sentry_before_send(event: Event, hint: Hint) -> Event | None:
+    """Drop events that report expected transient states, not bugs.
+
+    The classes of noise dropped here, each observed fleet-wide:
+
+      * ``redis.exceptions.ConnectionError`` AND
+        ``redis.exceptions.TimeoutError`` (plus subclasses and
+        anything raised from one) — redis restarts after its
+        container recycles or before its DNS name resolves during
+        compose startup. ``ConnectionError`` is a refusal/reset;
+        ``TimeoutError`` is the same outage when the socket hangs
+        instead of refusing, and in redis-py the two are *siblings*
+        under ``RedisError``, not parent/child — so both must be
+        named explicitly (a post-deploy event slipped through on the
+        TimeoutError branch: Sentry ANTHIAS-1B). Every consumer
+        already self-heals: celery's consumer reconnects with
+        backoff, the viewer's reporter loop retries on its next tick,
+        and Channels re-establishes on the next WebSocket frame. A
+        *persistent* redis outage still surfaces — the device stops
+        working and the watchdog restart loop is visible in balena —
+        but a 5-second blip is not worth an event per process (Sentry
+        ANTHIAS-M / ANTHIAS-K / ANTHIAS-H / ANTHIAS-J / ANTHIAS-1B).
+      * ``asyncio.CancelledError`` — an HTTP client hanging up
+        mid-request under ASGI; Django/uvicorn cancel the handler by
+        design (Sentry ANTHIAS-N).
+      * ``AuthSettingsError`` — an operator-facing validation failure
+        from the settings-save flow (mismatched/incorrect password,
+        a taken username, a too-weak password). It is expected input
+        validation, not a bug: the message is already shown to the
+        operator and the next attempt self-corrects. The save views
+        now log it at warning rather than ``logger.exception`` so it
+        never reaches the logging integration in the first place; this
+        is the backstop for any other path that logs it as an error
+        (Sentry ANTHIAS-3D).
+      * ``socket.gaierror`` — DNS resolution failing because the
+        device is offline (captive network, upstream outage, no
+        uplink at all). Being offline is a routine operating state
+        for a signage device, and a DNS-less box otherwise burns an
+        event per attempted external call — 253/day from a single
+        pi3-64, mostly via asyncio's "Future exception was never
+        retrieved" error log (Sentry ANTHIAS-3G). Chain-checked like
+        the redis errors because requests wraps it several layers
+        deep (urllib3 ``NameResolutionError`` →
+        ``requests.ConnectionError``).
+      * yt-dlp ``DownloadError`` — a YouTube/remote-video download that
+        failed (network timeout, geo-block, private/deleted video, bad
+        URL). None of these are Anthias bugs, and the download task's
+        ``on_failure`` already records ``metadata.error_message`` so the
+        asset renders a "Failed" pill with the reason — the operator
+        gets the feedback without a Sentry page (Sentry ANTHIAS-3T).
+        Matched by name+module so we don't import yt_dlp here.
+      * ``RuntimeError: Response content shorter than Content-Length`` —
+        a client that hangs up mid-response while Django's ASGI handler
+        is still streaming a static file (WhiteNoise serving e.g. the
+        splash SVG as the viewer navigates away). Django declared a
+        Content-Length from the file size, then the transfer is cut
+        short by the disconnect — a broken pipe, not a truncated file.
+        Same client-disconnect class as ``CancelledError`` above, but it
+        surfaces as a bare ``RuntimeError``, so it's matched by message
+        text to avoid swallowing unrelated RuntimeErrors (Sentry
+        ANTHIAS-37).
+      * ``SoftTimeLimitExceeded`` **with no Anthias frame anywhere in
+        its traceback** — celery arms the soft-limit timer for the whole
+        job, not just the task body, so a task that finishes a hair
+        under its budget can still take the signal during teardown. The
+        two observed landing sites are celery's ``on_task_postrun``
+        fixup (``close_cache``) and billiard's idle ``workloop`` waiting
+        for its next job. Neither is inside Anthias code, so no task
+        handler can catch them and nothing was interrupted — the task
+        had already returned its result. A soft limit that really did
+        cut a task short has our frames in the traceback and still
+        reports (Sentry ANTHIAS-45 / ANTHIAS-5Y). Matched by
+        name+module, like the yt-dlp case above, so this module does not
+        import celery — the viewer imports these settings and its image
+        ships no celery. This one rule is applied to the head exception
+        only rather than down the chain; see the comment at the check.
+    """
+    # Imported lazily — this runs only when an event is about to send,
+    # well after Django is configured, and avoids an import cycle at
+    # settings-module load. ``lib.auth`` only pulls stdlib at import
+    # time, so the cost is a cached module lookup.
+    from anthias_server.lib.auth import AuthSettingsError
+
+    exc_info = hint.get('exc_info')
+    if not exc_info:
+        return event
+    transient_redis = (
+        redis.exceptions.ConnectionError,
+        redis.exceptions.TimeoutError,
+    )
+    # Checked on the head exception only, deliberately unlike every
+    # rule below it. The late-delivery case is always an *unwrapped*
+    # ``SoftTimeLimitExceeded`` logged by celery or billiard itself. If
+    # Anthias ever catches one and raises its own error from it, that
+    # wrapper is a real bug: walking the chain would discard the report
+    # on the strength of its cause, which is the one failure mode a
+    # before_send filter must never have.
+    if _is_late_soft_time_limit(exc_info[1]):
+        return None
+    for exc in _exception_chain(exc_info[1]):
+        if isinstance(exc, asyncio.CancelledError):
+            return None
+        if isinstance(exc, transient_redis):
+            return None
+        if isinstance(exc, AuthSettingsError):
+            return None
+        if isinstance(exc, socket.gaierror):
+            return None
+        if isinstance(exc, RuntimeError) and (
+            'Response content shorter than Content-Length' in str(exc)
+        ):
+            return None
+        exc_cls = type(exc)
+        if exc_cls.__name__ == 'DownloadError' and (
+            exc_cls.__module__ == 'yt_dlp'
+            or exc_cls.__module__.startswith('yt_dlp.')
+        ):
+            return None
+    return event
+
+
+# celery's consumer, the embedded beat scheduler, and the redis
+# result backend all log every broker/backend reconnect attempt at
+# ERROR ("consumer: Cannot connect to redis://..., Trying again in
+# 6.00 seconds" / "beat: Connection error: ..., Trying again in 2.0
+# seconds" / "Connection to Redis lost: Retry (4/20) in 1.00
+# second.") while they retry on their own — same expected-transient
+# rationale as the before_send filter above, but these arrive as log
+# messages rather than exceptions, so they have to be silenced at the
+# logger. (Sentry ANTHIAS-K / ANTHIAS-P / ANTHIAS-2E.)
+ignore_logger('celery.worker.consumer.consumer')
+ignore_logger('celery.beat')
+ignore_logger('celery.backends.redis')
+# The async result backend logs "Retry limit exceeded while trying to
+# reconnect to the Celery result store backend. The Celery application
+# must be restarted." at a fatal level when redis stays unreachable
+# past its reconnect budget — the same transient-redis outage as the
+# loggers above, just from the result-backend's polling side. It self-
+# heals once redis returns (celery re-establishes on the next result
+# fetch); a persistent outage still surfaces via the watchdog restart
+# loop. (Sentry ANTHIAS-3X.)
+ignore_logger('celery.backends.asynchronous')
+# A device exposed to the internet gets a steady drip of background
+# scanners and bots hitting it with a bogus/spoofed Host header
+# ("Invalid HTTP_HOST header: '141.212.44.121/..'"). Django rejects the
+# request with a 400 and logs it at ERROR to ``django.security.
+# DisallowedHost``, which the logging integration then turns into a
+# Sentry event. It is neither an Anthias bug nor actionable — the
+# request never reaches a view — so silence the logger, exactly as
+# Django's own docs suggest for this well-known noise source. (Sentry
+# ANTHIAS-2A.)
+ignore_logger('django.security.DisallowedHost')
+
+
+def get_sentry_release() -> str | None:
+    """CalVer release, postfixed with the build's short git hash.
+
+    The CalVer alone proved ambiguous in the field: a balena OTA
+    deploy from master ships new code while pyproject still carries
+    the last tagged version, so events from pre- and post-deploy
+    builds were indistinguishable in the 2026.6.2 audit.
+    ``GIT_SHORT_HASH`` is baked into every image by
+    tools/image_builder (the same hash the docker tag carries), which
+    pins each event to the exact build. ``+`` is semver
+    build-metadata syntax and Sentry handles it natively. Falls back
+    to the bare CalVer when the env is absent (host/dev runs), or
+    ``None`` when the version itself is unknown so Sentry doesn't
+    record a bogus '' release.
+    """
+    release = get_anthias_release()
+    if not release:
+        return None
+    git_short_hash = getenv('GIT_SHORT_HASH')
+    if git_short_hash:
+        return f'{release}+{git_short_hash}'
+    return release
+
+
+sentry_sdk.init(
+    dsn=getenv('SENTRY_DSN', _default_sentry_dsn),
+    before_send=_sentry_before_send,
+    # Same value the DEBUG flag below keys off: 'development', 'test',
+    # or 'production' (the default) — lets dev events be filtered out
+    # in Sentry. (Test runs don't send at all — see the DSN default
+    # above.)
+    environment=ENVIRONMENT,
+    # CalVer (pyproject [project].version, via the same helper the
+    # System Info page and v2 info API use) plus the image's git
+    # short hash — see get_sentry_release above.
+    release=get_sentry_release(),
+    # Request headers and user IPs are PII. Attach them only when the
+    # operator hasn't opted out of analytics in anthias.conf — the
+    # same knob that gates GA telemetry (see lib/telemetry.py). Crash
+    # events themselves still flow; this gates only the PII
+    # enrichment. See
+    # https://docs.sentry.io/platforms/python/data-management/data-collected/
+    send_default_pii=not device_settings['analytics_opt_out'],
+)
+
+
+def get_board_model(model_file: str = '/proc/device-tree/model') -> str:
+    """Host board model from the device tree, '' when unavailable.
+
+    x86 hosts have no device tree; boards that have one expose the
+    model as a NUL-terminated UTF-8 string.
+
+    Read through ``device_helper.read_firmware_file`` like every other
+    firmware string, so the bound and the sanitising are shared rather
+    than reimplemented here: a Sentry tag is one more sink for a value
+    we don't author. The import is function-local and ``device_helper``
+    has no imports of its own, so settings load stays as light as it
+    was.
+
+    Note this reads '' in the server container on *every* board:
+    ``/proc/device-tree`` resolves to ``/sys/firmware/devicetree/base``
+    and Docker masks ``/sys/firmware`` in unprivileged containers, so
+    the Sentry ``board_model`` tag is only populated where the tree is
+    readable (the host, the privileged viewer). Reading the
+    host_agent's Redis key instead is not an option here — settings
+    load must stay import-light and can't block on a Redis that may
+    not be up yet — so triage should lean on ``device_type`` /
+    ``kernel_machine`` for server-side events.
+    """
+    from anthias_common.device_helper import read_firmware_file
+
+    return read_firmware_file(model_file)
+
+
+# Board / kernel context for fleet triage. Events are sent from inside
+# a container, so Sentry's stock OS detection never sees the host —
+# which made the armv7 webview-crash cohort (ANTHIAS-D / ANTHIAS-F)
+# impossible to segment: the same Qt5/armhf viewer image behaves
+# differently under a 32-bit and a 64-bit host kernel, and nothing on
+# the event said which one the device boots. A container shares the
+# host kernel, so platform.release()/machine() report the host
+# values; DEVICE_TYPE is baked into the image at build time (pi1 /
+# pi2 / pi3 / pi3-64 / pi4-64 / x86 / ...).
+sentry_sdk.set_tag('device_type', getenv('DEVICE_TYPE') or 'unknown')
+sentry_sdk.set_tag('kernel_release', platform.release())
+sentry_sdk.set_tag('kernel_machine', platform.machine())
+
+
+def is_balena_deploy() -> bool:
+    """True when running under balenaOS.
+
+    Same check as ``anthias_common.utils.is_balena_app`` (the BALENA
+    env var the balena supervisor injects), inlined rather than
+    imported: pulling anthias_common.utils into this module would
+    drag sh/requests/redis into every Django settings load, which the
+    slim environment django-stubs' mypy plugin runs under can't
+    satisfy.
+    """
+    return bool(getenv('BALENA'))
+
+
+# balena vs plain docker-compose installs differ operationally
+# (supervisor-managed restarts, no depends_on conditions, journald
+# unavailable) — segmenting by deployment kind tells the triage
+# which playbook applies.
+sentry_sdk.set_tag('balena', 'true' if is_balena_deploy() else 'false')
+_board_model = get_board_model()
+if _board_model:
+    sentry_sdk.set_tag('board_model', _board_model)
+
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = getenv('ENVIRONMENT', 'production') in ['development', 'test']
+DEBUG = ENVIRONMENT in ['development', 'test']
 
 if not DEBUG:
     if not device_settings.get('django_secret_key'):
@@ -56,7 +432,7 @@ if not DEBUG:
 else:
     # SECURITY WARNING: keep the secret key used in production secret!
     SECRET_KEY = (
-        'django-insecure-7rz*$)g6dk&=h-3imq2xw*iu!zuhfb&w6v482_vs!w@4_gha=j'  # noqa: E501
+        'django-insecure-7rz*$)g6dk&=h-3imq2xw*iu!zuhfb&w6v482_vs!w@4_gha=j'
     )
 
 # Anthias is a local-network signage device with no fixed public
@@ -135,8 +511,16 @@ if getenv('ANTHIAS_SERVICE') != 'viewer':
 # closing bracket where S4502 actually raises its issue.
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
-    'whitenoise.middleware.WhiteNoiseMiddleware',
+    # Fault-tolerant subclass of whitenoise's middleware: its startup
+    # scan of STATIC_ROOT survives unreadable entries (a corrupted SD
+    # card raising EUCLEAN bricked a device into a uvicorn crash-loop
+    # — Sentry ANTHIAS-Y). See anthias_server/lib/whitenoise.py.
+    'anthias_server.lib.whitenoise.ResilientWhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+    # Re-resolve + activate the operator-selected timezone per request
+    # so a Settings change is live without a restart. After sessions so
+    # request teardown order is predictable; before the view runs.
+    'anthias_server.lib.timezone.TimezoneActivationMiddleware',
     'django.middleware.common.CommonMiddleware',
     'anthias_server.lib.csrf.SameHostOriginCsrfMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -168,7 +552,26 @@ CHANNEL_LAYERS = {
     'default': {
         'BACKEND': 'channels_redis.core.RedisChannelLayer',
         'CONFIG': {
-            'hosts': [(getenv('REDIS_HOST', 'redis'), 6379)],
+            # channels_redis polls each channel with a blocking BZPOPMIN
+            # whose server-side timeout is brpop_timeout (5s). redis-py
+            # 8.0.1 introduced a default 5s async socket read timeout
+            # (DEFAULT_SOCKET_TIMEOUT = 5); with no override the blocking
+            # read inherits it and an empty 5s poll races the socket
+            # timeout, raising "Timeout reading from redis:6379" on every
+            # cycle of an open WebSocket (issue #3228).
+            #
+            # Keep a read timeout so a genuinely dead redis connection is
+            # still detected, but set it well above the 5s poll so it
+            # cannot race: 15s = 3x brpop_timeout, leaving margin for a
+            # slow / memory-pressured board to return the empty poll
+            # before the socket read gives up.
+            'hosts': [
+                {
+                    'host': getenv('REDIS_HOST', 'redis'),
+                    'port': 6379,
+                    'socket_timeout': 15,
+                }
+            ],
         },
     },
 }
@@ -176,23 +579,13 @@ CHANNEL_LAYERS = {
 
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
-#
-# Detect "running under tests" without depending solely on the
-# ENVIRONMENT env var. The root conftest.py sets ENVIRONMENT=test via
-# os.environ.setdefault, but pytest-django's plugin-time settings load
-# can fire before that conftest executes — leaving getenv() blank and
-# this module pointed at the production /data path on local pytest
-# runs. Detect pytest itself by inspecting argv (covers `pytest ...`,
-# `python -m pytest ...`, and `uv run pytest ...`) so the test branch
-# is taken regardless of import order.
-_running_under_pytest = any('pytest' in (a or '') for a in sys.argv)
 
 # In test mode the DB path defaults to a repo-local file so the suite
 # runs without Docker / without writable `/data`. CI containers can
 # preserve their existing layout by exporting
 # `ANTHIAS_TEST_DB_PATH=/data/.anthias/test.db` (see
 # docker-compose.test.yml).
-if getenv('ENVIRONMENT') == 'test' or _running_under_pytest:
+if IS_TEST:
     db_path = getenv('ANTHIAS_TEST_DB_PATH') or str(
         BASE_DIR / '.anthias-test.db'
     )
@@ -216,9 +609,50 @@ else:
 # `:memory:` DB, which is what we want for unit runs.
 # .github/workflows/test-runner.yml exports ANTHIAS_INTEGRATION_TEST=1
 # only for the `pytest -m integration` step.
+# Three processes share this SQLite file across containers (uvicorn,
+# the celery worker, the viewer — they bind-mount the same
+# ~/.anthias). The stock rollback journal allows exactly one writer
+# and blocks readers while a write transaction is open, and the stock
+# busy timeout is 0 — so a celery sweep UPDATE landing while the
+# viewer reads its asset list raised ``OperationalError: database is
+# locked`` immediately instead of waiting (Sentry ANTHIAS-C/E/G).
+#
+#   * ``timeout`` — sqlite's busy handler: wait up to 20s for a lock
+#     instead of failing on the spot. Longer than any transaction
+#     Anthias runs (the writes are single-row UPDATEs; the longest
+#     holder is the startup ``migrate``/``dbbackup`` pass).
+#   * ``synchronous=NORMAL`` — the recommended pairing with WAL;
+#     FULL's per-commit fsync cost buys nothing extra under WAL on
+#     a power-loss-prone SD card (WAL commits are crash-safe at
+#     NORMAL; worst case is losing the very last commit).
+#   * ``transaction_mode=IMMEDIATE`` — take the write lock at
+#     transaction start so two writers queue on the busy handler
+#     instead of deadlocking mid-transaction on the read→write lock
+#     upgrade (those fail instantly, ignoring the busy timeout).
+#
+# ``journal_mode=WAL`` is deliberately NOT here. It is a property of
+# the database file rather than of a connection, and asserting it per
+# connect made the *un*converted case fatal: the switch takes an
+# exclusive lock, so with three processes on the file it blocked for
+# the whole busy timeout and then raised ``OperationalError: database
+# is locked`` out of ``get_new_connection`` — before Django owns the
+# connection, so the request 500s and the half-built sqlite handle
+# leaks an fd (Sentry ANTHIAS-38, and the ANTHIAS-62/63 EMFILE that
+# followed it on the same device). ``lib.sqlite_journal`` performs the
+# conversion once per process at startup instead, where a refusal is
+# survivable; the busy timeout above is what keeps a database that is
+# still on the rollback journal usable meanwhile.
+#
+# Unit runs (pytest-django's per-worker ``:memory:`` DBs) accept the
+# remaining pragma harmlessly.
 _db_default: dict[str, Any] = {
     'ENGINE': 'django.db.backends.sqlite3',
     'NAME': db_path,
+    'OPTIONS': {
+        'timeout': 20,
+        'init_command': 'PRAGMA synchronous=NORMAL;',
+        'transaction_mode': 'IMMEDIATE',
+    },
 }
 if getenv('ANTHIAS_INTEGRATION_TEST') == '1':
     _db_default['TEST'] = {'NAME': db_path}
@@ -254,12 +688,104 @@ USE_I18N = True
 
 USE_TZ = True
 
-try:
-    with open('/etc/timezone', 'r') as f:
-        TIME_ZONE = f.read().strip()
-        pytz.timezone(TIME_ZONE)  # Checks if the timezone is valid.
-except (pytz.exceptions.UnknownTimeZoneError, FileNotFoundError):
-    TIME_ZONE = 'UTC'
+
+def is_valid_time_zone(
+    time_zone: str,
+    zoneinfo_root: Path = Path('/usr/share/zoneinfo'),
+) -> bool:
+    """True if ``time_zone`` is a zone Django will accept at startup.
+
+    Validate the same way Django does in django.conf.Settings.__init__
+    — a zoneinfo lookup PLUS the /usr/share/zoneinfo file check.
+    Validating with a bundled database alone (the old pytz check) is
+    not enough: it accepts names like ``US/Central`` that the image's
+    tzdata may not ship on disk, and Django then raises ValueError at
+    startup, crash-looping every Django process on the device.
+    """
+    try:
+        zoneinfo.ZoneInfo(time_zone)
+    except (ValueError, zoneinfo.ZoneInfoNotFoundError):
+        return False
+    return not (
+        zoneinfo_root.exists()
+        and not zoneinfo_root.joinpath(*time_zone.split('/')).exists()
+    )
+
+
+def get_host_time_zone(
+    timezone_file: str = '/etc/timezone',
+    zoneinfo_root: Path = Path('/usr/share/zoneinfo'),
+) -> str:
+    """Read the host's /etc/timezone, falling back to UTC.
+
+    /etc/timezone is bind-mounted from the host on docker-compose
+    installs, so its value is whatever the host distro wrote there.
+    On balena it is not mounted, so this is the container image's own
+    zone (UTC) — the reason the in-app override below matters most
+    there. An invalid value falls back to UTC, never crash-loops.
+    """
+    try:
+        with open(timezone_file, 'r') as f:
+            time_zone = f.read().strip()
+    except OSError:
+        return 'UTC'
+    return time_zone if is_valid_time_zone(time_zone, zoneinfo_root) else 'UTC'
+
+
+def get_configured_time_zone(
+    config_file: str | None = None,
+    zoneinfo_root: Path = Path('/usr/share/zoneinfo'),
+) -> str | None:
+    """Operator-selected timezone from anthias.conf, or None.
+
+    Parsed directly with configparser rather than via AnthiasSettings
+    so this stays import-safe during Django settings evaluation (no
+    dependency on the device-settings object). ``None`` (empty/absent)
+    lets resolve_time_zone() fall through to TZ env -> /etc/timezone ->
+    UTC; an invalid value is ignored so a bad hand-edit can never
+    crash-loop Django.
+    """
+    if config_file is None:
+        home = getenv('HOME')
+        if not home:
+            return None
+        # Reuse the same constants AnthiasSettings uses so the config
+        # location can never drift between the two.
+        config_file = str(Path(home) / CONFIG_DIR / CONFIG_FILE)
+    parser = configparser.ConfigParser()
+    try:
+        # See get_configured_upload_chunk_size_mb: this is read on
+        # every request too, so the same refusal of non-plain files
+        # and of undecodable content applies.
+        if not Path(config_file).is_file():
+            return None
+        parser.read(config_file)
+        time_zone = parser.get('main', 'timezone', fallback='').strip()
+    except (configparser.Error, OSError, UnicodeDecodeError):
+        return None
+    if not time_zone:
+        return None
+    return time_zone if is_valid_time_zone(time_zone, zoneinfo_root) else None
+
+
+def resolve_time_zone() -> str:
+    """Effective Anthias timezone.
+
+    Precedence: anthias.conf ``[main] timezone`` (the in-UI setting) ->
+    ``TZ`` env var (respects a balena dashboard TZ variable) ->
+    host /etc/timezone -> UTC. Every candidate is validated, so no
+    rung can wedge Django at startup.
+    """
+    configured = get_configured_time_zone()
+    if configured:
+        return configured
+    tz_env = (getenv('TZ') or '').strip()
+    if tz_env and is_valid_time_zone(tz_env):
+        return tz_env
+    return get_host_time_zone()
+
+
+TIME_ZONE = resolve_time_zone()
 
 
 # Static files (CSS, JavaScript, Images)
@@ -300,6 +826,123 @@ if getenv('FORWARDED_ALLOW_IPS'):
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Signage app store — the pointers-only index (indexVersion, apps:
+# [{id, manifest}]) the Add → Apps tab fetches to populate the app
+# catalog. Each app then serves its own manifest at
+# /.well-known/signage-app.json on its own origin. The fetch happens
+# in the operator's browser (the manifests send Access-Control-Allow-
+# Origin: *), so the device itself never needs to reach the store.
+# Overridable via env so a device can be pointed at the staging index
+# (stage.signage-apps.com) or a self-hosted mirror; defaults to the
+# production store index.
+APP_STORE_INDEX_URL = getenv(
+    'APP_STORE_INDEX_URL',
+    'https://signage-apps.com/manifest.json',
+)
+
+# Size of each request a large browser upload is split into, for an
+# operator behind a proxy that caps request bodies. The ceiling keeps a
+# chunk under FILE_UPLOAD_MAX_MEMORY_SIZE above (25 MB), where Django
+# holds it in RAM rather than spooling it to the SD card; below the
+# floor a large video becomes thousands of sequential requests. Mirrored
+# in home/chunking.ts, which a test pins.
+UPLOAD_CHUNK_SIZE_MB_DEFAULT = 16
+UPLOAD_CHUNK_SIZE_MB_MAX = 24
+UPLOAD_CHUNK_SIZE_MB_MIN = 1
+
+
+def get_configured_upload_chunk_size_mb(
+    config_file: str | None = None,
+) -> str:
+    """Raw ``[main] upload_chunk_size_mb`` from anthias.conf, or ''.
+
+    Refuses anything that is not a plain file, and undecodable content:
+    a FIFO here blocks the import forever and the container never
+    starts. Same guards as ``get_configured_time_zone`` above.
+    """
+    if config_file is None:
+        home = getenv('HOME')
+        if not home:
+            return ''
+        config_file = str(Path(home) / CONFIG_DIR / CONFIG_FILE)
+    try:
+        if not Path(config_file).is_file():
+            return ''
+        parser = configparser.ConfigParser()
+        parser.read(config_file)
+        return parser.get('main', 'upload_chunk_size_mb', fallback='').strip()
+    except (configparser.Error, OSError, UnicodeDecodeError):
+        return ''
+
+
+def resolve_upload_chunk_size_mb() -> int:
+    """Effective upload chunk size in MB, clamped to [MIN, MAX].
+
+    anthias.conf first — the rung that survives an upgrade, since
+    docker-compose.yml is regenerated from its template every run —
+    then ANTHIAS_UPLOAD_CHUNK_SIZE_MB, which is how a balena dashboard
+    variable arrives. Resolved once at import; there is no Settings
+    field for it, so changing it already means a restart.
+
+    Read as a decimal and rounded down, because MB is decimal and an
+    operator writing 8.5 to fit a 10 MB cap must not be handed 16.
+    Nothing here may raise: on a headless device a bad value would mean
+    a container that never starts, with no shell to find out why.
+    """
+    raw = get_configured_upload_chunk_size_mb()
+    if not raw:
+        raw = (getenv('ANTHIAS_UPLOAD_CHUNK_SIZE_MB') or '').strip()
+    if not raw:
+        return UPLOAD_CHUNK_SIZE_MB_DEFAULT
+
+    logger = logging.getLogger(__name__)
+    try:
+        # float() then floor: one except covers a stray unit, nan, and
+        # the thousand-digit integer that overflows on the way down.
+        parsed = math.floor(float(raw))
+    except (ValueError, OverflowError):
+        logger.warning(
+            'Ignoring unparseable upload chunk size %r; using %d MB.',
+            raw,
+            UPLOAD_CHUNK_SIZE_MB_DEFAULT,
+        )
+        return UPLOAD_CHUNK_SIZE_MB_DEFAULT
+
+    clamped = max(
+        UPLOAD_CHUNK_SIZE_MB_MIN, min(parsed, UPLOAD_CHUNK_SIZE_MB_MAX)
+    )
+    if clamped != parsed:
+        # Reported as written, not as parsed: 0.5 logged as "0 is
+        # outside [1, 24]" sends the operator hunting for a zero.
+        logger.warning(
+            'Upload chunk size %r is outside [%d, %d]; using %d MB.',
+            raw,
+            UPLOAD_CHUNK_SIZE_MB_MIN,
+            UPLOAD_CHUNK_SIZE_MB_MAX,
+            clamped,
+        )
+    return clamped
+
+
+UPLOAD_CHUNK_SIZE_MB = resolve_upload_chunk_size_mb()
+
+
+# Host suffixes an installed app's launch URL / manifest may live on.
+# The catalog is fetched client-side, so the create endpoint can't
+# re-derive the app's real origin from the store; this allowlist keeps
+# a `metadata.app`-stamped asset honestly pointed at a store app rather
+# than an arbitrary URL dressed up as one. Comma-separated, env-
+# overridable for self-hosted stores. Matched as a dotted-suffix (so
+# `.srly.io` covers `weather.srly.io` but not `evilsrly.io`).
+APP_STORE_ALLOWED_HOST_SUFFIXES = [
+    h.strip()
+    for h in getenv(
+        'APP_STORE_ALLOWED_HOST_SUFFIXES',
+        '.srly.io,.signage-apps.com',
+    ).split(',')
+    if h.strip()
+]
 
 REST_FRAMEWORK = {
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',

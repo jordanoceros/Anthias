@@ -3,14 +3,26 @@
 #include <QWidget>
 #include <QWebEngineView>
 #include <QAuthenticator>
+#include <QByteArray>
+#include <QList>
 #include <QNetworkAccessManager>
 #include <QImage>
 #include <QMovie>
+#include <QPair>
 #include <QTimer>
 #include <QUrl>
 #include <QVariantMap>
 
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
 #include "videoview.h"
+#endif
+
+// Defined in view.cpp. A QWebEngineUrlRequestInterceptor installed on
+// the shared profile that attaches the current webpage asset's custom
+// headers to same-origin requests (#2215). Forward-declared so View can
+// hold a pointer without pulling the QtWebEngineCore interceptor headers
+// into every translation unit that includes view.h.
+class RequestHeaderInterceptor;
 
 class View : public QWidget
 {
@@ -20,19 +32,34 @@ public:
     explicit View(QWidget* parent);
     ~View();
 
-    void loadPage(const QString &uri);
-    void loadImage(const QString &uri);
+    void loadPage(const QString &uri, bool skipSslVerify = false);
+    void loadImage(const QString &uri, bool skipSslVerify = false);
     void setReloadInterval(int seconds);
+    // Per-asset custom HTTP request headers (#2215). ``headersJson`` is
+    // a JSON object of ``{name: value}`` string pairs (an empty object
+    // clears them). The viewer calls this right before loadPage so the
+    // interceptor is armed when the navigation fires; the headers are
+    // scoped to the loaded URL's origin (scheme+host+port) at load time.
+    void setRequestHeaders(const QString &headersJson);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
     // Hands the URI + option dict to VideoView (QtMultimedia
-    // QMediaPlayer + QGraphicsVideoItem) and switches visibility
-    // so the video surface is on top of the QWebEngineView pair /
-    // image canvas. Pauses background URL loads so a parked
-    // QWebEngineView doesn't keep streaming while video plays.
+    // QMediaPlayer rendering into a QML VideoOutput) and switches
+    // visibility so the video surface is on top of the
+    // QWebEngineView pair / image canvas. Pauses background URL
+    // loads so a parked QWebEngineView doesn't keep streaming while
+    // video plays.
+    //
+    // Qt 5 boards (Pi 1 / Pi 2 / Pi 3) route video through GstFbdevMediaPlayer
+    // painting straight to the framebuffer (see
+    // ``MediaPlayerProxy.get_instance`` in
+    // ``src/anthias_viewer/media_player.py``), so the in-process
+    // playback surface and its EOF signal are Qt6-only.
     void playVideo(const QString &uri, const QVariantMap &options);
     void stopVideo();
 
 signals:
     void videoEnded();
+#endif
 
 protected:
     void paintEvent(QPaintEvent* event) override;
@@ -48,24 +75,96 @@ private:
     void loadAsStaticImage(const QByteArray& data);
     void setupAnimation();
     void switchToNextWebView();
+    // Issues a (re)load of ``uri`` into nextWebView: detaches any
+    // stale loadFinished handler, cancels the in-flight navigation,
+    // attaches a fresh one-shot handler tagged with ``requestId``,
+    // and (re)arms the page-load watchdog. Called by loadPage for
+    // the initial attempt and by handlePageLoadTimeout for retries.
+    void startPageLoad(const QString &uri, quint64 requestId);
+    // Issue #2999 — runs when a webpage navigation has neither
+    // finished nor been superseded within the watchdog interval
+    // (e.g. stalled mid-fetch by a network dropout). Cancels the
+    // wedged load and retries the same URI so the device self-heals
+    // once connectivity returns.
+    void handlePageLoadTimeout();
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
     // Hides VideoView and re-enables the web/image surface. Called
     // by loadPage / loadImage so a switch from video back to a web
     // page or image doesn't leave the GL widget on top of the
     // QWebEngineView.
     void hideVideoSurface();
+#endif
 
     QNetworkAccessManager* networkManager;
     QImage currentImage;
     QImage nextImage;
+    // Last successfully decoded raster image (static or first GIF
+    // frame), kept independently of ``currentImage``. When a real
+    // ``loadImage()`` request starts from a blanked state (most
+    // commonly right after a video asset, since playVideo() /
+    // the ``"null"`` sentinel blank ``currentImage``), paintEvent()
+    // shows this instead of a black frame while the new image's
+    // QNetworkReply is in flight. Never used as a fallback for the
+    // video-onset blank itself or for loadPage(): those blanks are
+    // intentional (see playVideo()) and must stay pure black.
+    //
+    // Memory cost: none on the static-image path. ``nextImage``
+    // (above) is assigned once per successful load and never cleared
+    // anywhere in the class, so it already pinned the last decoded
+    // static image for the process's lifetime before this member
+    // existed; ``currentImage`` and ``lastRasterImage`` are
+    // copy-on-write aliases of that same buffer, reassigned together
+    // on the next successful load. The one place this genuinely
+    // retains a frame ``nextImage`` wouldn't have is setupAnimation():
+    // one animated-GIF frame, bounded, freed on the next load.
+    //
+    // Scope: deliberately not limited to the video handover. Any real
+    // loadImage() arms the fallback (see the top of loadImage()), so
+    // it also covers webpage-to-image transitions. lastRasterImage can
+    // therefore be an asset from further back than the one immediately
+    // preceding it (skipped over a webpage, or, rarely, one since
+    // deleted from the playlist) and briefly reappear before the new
+    // fetch lands. Accepted: a short-lived stale frame beats a black
+    // one, and the window is bounded by one network round-trip.
+    QImage lastRasterImage;
+    // True only while a real (non-"null") loadImage() fetch is
+    // outstanding. Set in loadImage() when such a fetch starts, and
+    // cleared on every terminal outcome of that fetch (success,
+    // network error, or decode failure, see the ``finished`` handler
+    // in loadImage()) so a failed fetch goes black rather than leaving
+    // a stale asset on screen, which would be indistinguishable from
+    // a successful rotation. Gates the lastRasterImage fallback in
+    // paintEvent() so it never fires for the video-onset or
+    // loadPage() blanks.
+    bool fallbackToLastImageOnBlank = false;
     QMovie* movie;
     bool isAnimatedImage;
     quint64 loadGenerationId;
 
+    // Manual rotation applied in paintEvent to raster image assets —
+    // still images and animated GIFs, which share the ``currentImage``
+    // draw path — in degrees clockwise (0/90/180/270). Set once at
+    // construction from linuxfbRotationOverride(); non-zero only on
+    // linuxfb boards whose QPA plugin ignores ``rotation=N``.
+    int imageRotation;
+
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
     // QtMultimedia-backed video widget (issue #2904). Sibling of
     // the web / image widgets — visibility is toggled rather than
-    // re-parented so the QMediaPlayer + QGraphicsVideoItem survive
+    // re-parented so the QMediaPlayer + Quick scene survive
     // across plays (no pipeline rebuild per asset).
     VideoView* videoView;
+#endif
+
+    // Request interceptor + the headers staged for the next page load
+    // (#2215). ``pendingHeaders`` is set by setRequestHeaders and applied
+    // — together with the loaded URL's origin (scheme+host+port) — to
+    // ``headerInterceptor`` in startPageLoad. Only touched on the UI
+    // thread; the interceptor's own
+    // copy is mutex-guarded because Chromium may invoke interceptRequest
+    // on a different thread (Qt 5).
+    RequestHeaderInterceptor* headerInterceptor;
+    QList<QPair<QByteArray, QByteArray>> pendingHeaders;
 
     // Dual web view system
     QWebEngineView* webView1;
@@ -78,6 +177,27 @@ private:
     // we can drop it before issuing stop() on the next loadPage and
     // avoid a synchronous loadFinished(false) racing into a stale slot.
     QMetaObject::Connection pageLoadConnection;
+
+    // Issue #2999 — page-load watchdog. QtWebEngine has no built-in
+    // navigation timeout: a fetch interrupted mid-flight (WiFi AP
+    // drop, no FIN/RST) leaves the request pending forever, so
+    // loadFinished never fires, the dual-view swap never happens and
+    // the screen freezes on the previous asset until the container is
+    // restarted. Single-shot; armed by startPageLoad, stopped on a
+    // successful load and by every path that cancels the pending
+    // navigation (loadImage / playVideo). On timeout — or after a
+    // *failed* load, where the handler deliberately leaves it running
+    // as a delayed-retry tick — handlePageLoadTimeout stops the wedged
+    // navigation and re-issues the same URI. The retry matters: the
+    // viewer's view_webpage() only sends loadPage when the URL
+    // *changes*, so with a single-webpage playlist no further D-Bus
+    // call would ever arrive to unwedge a stalled load.
+    QTimer* pageLoadWatchdog;
+
+    // URI of the loadPage navigation currently in flight (empty when
+    // none). Read by handlePageLoadTimeout to retry; cleared whenever
+    // the pending navigation is cancelled in favor of an image/video.
+    QString pendingPageUri;
 
     // Per-asset auto-refresh timer. When non-null and active, fires
     // currentWebView->reload() every ``pendingReloadIntervalS`` seconds.

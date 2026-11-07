@@ -12,6 +12,8 @@ from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APIClient
 
+from anthias_server.settings import settings
+
 # Centralised fixture password for the basic-auth flow tests so Sonar's
 # S2068 fires once per file, not once per test. Avoids dictionary
 # words / breached-password tokens to keep S6437 quiet too. Never
@@ -40,13 +42,20 @@ def test_get_device_settings(
         'default_duration': '15',
         'default_streaming_duration': '100',
         'date_format': 'YYYY-MM-DD',
+        'timezone': 'Europe/Stockholm',
         'auth_backend': '',
         'show_splash': True,
         'default_assets': [],
         'shuffle_playlist': False,
         'use_24_hour_clock': True,
         'debug_logging': False,
+        'prefer_dark_mode': True,
+        'verify_ssl': True,
         'screen_rotation': 90,
+        'display_power_schedule_enabled': False,
+        'display_power_on_time': '08:00',
+        'display_power_off_time': '18:00',
+        'display_power_days': '0,1,2,3,4,5,6',
     }[key]
 
     response = api_client.get(device_settings_url)
@@ -59,12 +68,15 @@ def test_get_device_settings(
         'default_duration': 15,
         'default_streaming_duration': 100,
         'date_format': 'YYYY-MM-DD',
+        'timezone': 'Europe/Stockholm',
         'auth_backend': '',
         'show_splash': True,
         'default_assets': [],
         'shuffle_playlist': False,
         'use_24_hour_clock': True,
         'debug_logging': False,
+        'prefer_dark_mode': True,
+        'verify_ssl': True,
         'screen_rotation': 90,
         'username': '',
     }
@@ -183,6 +195,85 @@ def test_patch_device_settings_validation_error(
 @pytest.mark.django_db
 @mock.patch('anthias_server.api.views.v2.settings')
 @mock.patch('anthias_server.api.views.v2.ViewerPublisher')
+def test_patch_device_settings_timezone_success(
+    publisher_mock: Any,
+    settings_mock: Any,
+    api_client: APIClient,
+    device_settings_url: str,
+) -> None:
+    """A valid IANA zone is persisted and the viewer is told to reload
+    (so the schedule re-evaluates in the new local time)."""
+    settings_mock.load = mock.MagicMock()
+    settings_mock.save = mock.MagicMock()
+    settings_mock.__getitem__.side_effect = lambda key: {
+        'auth_backend': '',
+    }[key]
+    settings_mock.__setitem__ = mock.MagicMock()
+
+    publisher_instance = mock.MagicMock()
+    publisher_mock.get_instance.return_value = publisher_instance
+
+    response = api_client.patch(
+        device_settings_url,
+        data={'timezone': 'Europe/Stockholm'},
+        format='json',
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    settings_mock.save.assert_called_once()
+    settings_mock.__setitem__.assert_any_call('timezone', 'Europe/Stockholm')
+    publisher_instance.send_to_viewer.assert_called_once_with('reload')
+
+
+@pytest.mark.django_db
+@mock.patch('anthias_server.api.views.v2.settings')
+def test_patch_device_settings_invalid_timezone(
+    settings_mock: Any, api_client: APIClient, device_settings_url: str
+) -> None:
+    """An unknown zone is rejected before anything is written, so a bad
+    value can never reach the settings module and crash-loop it."""
+    response = api_client.patch(
+        device_settings_url,
+        data={'timezone': 'Mars/Phobos'},
+        format='json',
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert 'timezone' in response.data
+    settings_mock.load.assert_not_called()
+    settings_mock.save.assert_not_called()
+
+
+@pytest.mark.django_db
+@mock.patch('anthias_server.api.views.v2.settings')
+@mock.patch('anthias_server.api.views.v2.ViewerPublisher')
+def test_patch_device_settings_blank_timezone_allowed(
+    publisher_mock: Any,
+    settings_mock: Any,
+    api_client: APIClient,
+    device_settings_url: str,
+) -> None:
+    """Blank defers to the resolved default; it must validate and
+    persist."""
+    settings_mock.load = mock.MagicMock()
+    settings_mock.save = mock.MagicMock()
+    settings_mock.__getitem__.side_effect = lambda key: {'auth_backend': ''}[
+        key
+    ]
+    settings_mock.__setitem__ = mock.MagicMock()
+    publisher_mock.get_instance.return_value = mock.MagicMock()
+
+    response = api_client.patch(
+        device_settings_url, data={'timezone': ''}, format='json'
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    settings_mock.__setitem__.assert_any_call('timezone', '')
+
+
+@pytest.mark.django_db
+@mock.patch('anthias_server.api.views.v2.settings')
+@mock.patch('anthias_server.api.views.v2.ViewerPublisher')
 def test_enable_basic_auth(
     publisher_mock: Any,
     settings_mock: Any,
@@ -273,12 +364,19 @@ def test_disable_basic_auth(
         'default_duration': '15',
         'default_streaming_duration': '100',
         'date_format': 'YYYY-MM-DD',
+        'timezone': '',
         'show_splash': True,
         'default_assets': [],
         'shuffle_playlist': False,
         'use_24_hour_clock': True,
         'debug_logging': False,
+        'prefer_dark_mode': False,
+        'verify_ssl': True,
         'screen_rotation': 0,
+        'display_power_schedule_enabled': False,
+        'display_power_on_time': '08:00',
+        'display_power_off_time': '18:00',
+        'display_power_days': '0,1,2,3,4,5,6',
     }[key]
     settings_mock.__setitem__ = mock.MagicMock()
 
@@ -600,12 +698,264 @@ def test_display_power_returns_503_when_no_cec_adapter(
     _cec_available_mock: Any,
     api_client: APIClient,
 ) -> None:
-    """The endpoint must fail fast (no 10 s subprocess) when neither
-    /dev/cec0 nor /dev/vchiq exists. 503 telegraphs 'this server lacks
-    the hardware to satisfy the request' more accurately than 502."""
+    """The endpoint must fail fast when the device has no CEC adapter
+    at all. 503 telegraphs 'this server lacks the hardware to satisfy
+    the request' more accurately than 502."""
     response = api_client.post(
         reverse('api:display_power_v2', kwargs={'state': 'on'})
     )
     assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
     set_display_power_mock.assert_not_called()
     assert 'adapter' in response.data['message']
+
+
+@pytest.mark.django_db
+@mock.patch('anthias_server.api.views.v2.settings')
+def test_patch_device_settings_password_mismatch_is_not_logged_as_error(
+    settings_mock: Any,
+    api_client: APIClient,
+    device_settings_url: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A mismatched-password PATCH is operator input validation, not a
+    server bug. It must return 400 with the operator-friendly message
+    AND be logged at WARNING (no traceback) so Sentry's logging
+    integration doesn't turn it into an event (ANTHIAS-3D)."""
+    import logging
+
+    user = _make_operator(username='testuser', pwd=_FIXTURE_PASSWORD)
+    api_client.force_authenticate(user=user)
+
+    settings_mock.load = mock.MagicMock()
+    settings_mock.save = mock.MagicMock()
+    settings_mock.__getitem__.side_effect = lambda key: {
+        'auth_backend': 'auth_basic',
+    }[key]
+    settings_mock.__setitem__ = mock.MagicMock()
+
+    data = {
+        'auth_backend': 'auth_basic',
+        'current_password': _FIXTURE_PASSWORD,
+        'username': 'testuser',
+        'password': 'brand-new-password',  # NOSONAR
+        'password_2': 'does-not-match',  # NOSONAR
+    }
+
+    with caplog.at_level(logging.WARNING):
+        response = api_client.patch(
+            device_settings_url, data=data, format='json'
+        )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    # The operator-friendly message is echoed, not a generic string.
+    assert 'do not match' in response.data['error']
+    # Nothing was persisted — the validation aborted before save().
+    settings_mock.save.assert_not_called()
+
+    save_records = [
+        r for r in caplog.records if 'Settings save' in r.getMessage()
+    ]
+    assert save_records, 'expected a log line for the rejected save'
+    # The rejection logs at WARNING, never ERROR, and carries no
+    # exc_info — an ERROR record (logger.exception) is what becomes a
+    # Sentry event.
+    assert all(r.levelno == logging.WARNING for r in save_records)
+    assert all(r.exc_info is None for r in save_records)
+
+
+# ---------------------------------------------------------------------------
+# Scheduled display power over the v2 settings API
+#
+# The HTML form path and this endpoint are documented mirrors of each
+# other, so the schedule has to be settable from both.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_device_settings_get_exposes_the_display_schedule(
+    api_client: APIClient,
+) -> None:
+    response = api_client.get(reverse('api:device_settings_v2'))
+    assert response.status_code == status.HTTP_200_OK
+    for field in (
+        'display_power_schedule_enabled',
+        'display_power_on_time',
+        'display_power_off_time',
+        'display_power_days',
+    ):
+        assert field in response.data
+
+
+@pytest.mark.django_db
+def test_device_settings_patch_sets_the_display_schedule(
+    api_client: APIClient, _isolated_settings_conf: Any
+) -> None:
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        response = api_client.patch(
+            reverse('api:device_settings_v2'),
+            {
+                'display_power_schedule_enabled': True,
+                'display_power_on_time': '07:30',
+                'display_power_off_time': '19:45',
+                'display_power_days': '4,0,2,0',
+            },
+            format='json',
+        )
+    assert response.status_code == status.HTTP_200_OK
+    settings.load()
+    assert settings['display_power_schedule_enabled'] is True
+    assert settings['display_power_on_time'] == '07:30'
+    assert settings['display_power_off_time'] == '19:45'
+    # Sorted and deduped by the serializer.
+    assert settings['display_power_days'] == '0,2,4'
+
+
+@pytest.mark.django_db
+def test_device_settings_patch_accepts_seconds_in_a_time(
+    api_client: APIClient, _isolated_settings_conf: Any
+) -> None:
+    """An <input type="time"> with a sub-minute step posts HH:MM:SS."""
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        response = api_client.patch(
+            reverse('api:device_settings_v2'),
+            {'display_power_on_time': '07:30:00'},
+            format='json',
+        )
+    assert response.status_code == status.HTTP_200_OK
+    settings.load()
+    assert settings['display_power_on_time'] == '07:30'
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'payload',
+    [
+        {'display_power_on_time': 'not-a-time'},
+        {'display_power_off_time': '25:00'},
+        # Seconds are dropped from the stored value, but a malformed or
+        # out-of-range seconds token must still be a 400 rather than
+        # being read as a valid 07:30 (Copilot).
+        {'display_power_on_time': '07:30:xx'},
+        {'display_power_off_time': '19:45:60'},
+        {'display_power_days': '0,9'},
+        {'display_power_days': 'mon,tue'},
+    ],
+)
+def test_device_settings_patch_rejects_a_bad_schedule(
+    api_client: APIClient,
+    payload: dict[str, Any],
+    _isolated_settings_conf: Any,
+) -> None:
+    """400 rather than silent coercion. The HTML form keeps the previous
+    value and toasts, but an API client that explicitly sent a field
+    deserves to be told it was wrong."""
+    response = api_client.patch(
+        reverse('api:device_settings_v2'), payload, format='json'
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+@pytest.mark.django_db
+def test_device_settings_patch_blank_days_means_every_day(
+    api_client: APIClient, _isolated_settings_conf: Any
+) -> None:
+    with mock.patch(
+        'anthias_server.settings.ViewerPublisher.send_to_viewer',
+        return_value=None,
+    ):
+        response = api_client.patch(
+            reverse('api:device_settings_v2'),
+            {'display_power_days': ''},
+            format='json',
+        )
+    assert response.status_code == status.HTTP_200_OK
+    settings.load()
+    assert settings['display_power_days'] == '0,1,2,3,4,5,6'
+
+
+# ---------------------------------------------------------------------------
+# Auth changes reap open /ws sockets (Copilot review on PR 3324).
+#
+# The DRF surface has to behave exactly like the HTML form here, or a
+# device configured over the API would keep pre-change sockets alive.
+# ---------------------------------------------------------------------------
+
+
+def _device_settings_mock(settings_mock: Any, auth_backend: str = '') -> None:
+    settings_mock.load = mock.MagicMock()
+    settings_mock.save = mock.MagicMock()
+    settings_mock.__getitem__.side_effect = lambda key: {
+        'player_name': 'Old Player',
+        'audio_output': 'local',
+        'default_duration': '10',
+        'default_streaming_duration': '50',
+        'date_format': 'DD-MM-YYYY',
+        'auth_backend': auth_backend,
+        'show_splash': False,
+        'default_assets': [],
+        'shuffle_playlist': True,
+        'use_24_hour_clock': False,
+        'debug_logging': True,
+    }[key]
+    settings_mock.__setitem__ = mock.MagicMock()
+
+
+@pytest.mark.django_db
+@mock.patch('anthias_server.api.views.v2.settings')
+@mock.patch('anthias_server.api.views.v2.ViewerPublisher')
+def test_patch_device_settings_drops_sockets_when_auth_is_enabled(
+    publisher_mock: Any,
+    settings_mock: Any,
+    api_client: APIClient,
+    device_settings_url: str,
+) -> None:
+    _device_settings_mock(settings_mock, auth_backend='')
+    publisher_mock.get_instance.return_value = mock.MagicMock()
+
+    with mock.patch(
+        'anthias_server.app.consumers.disconnect_all'
+    ) as disconnect:
+        response = api_client.patch(
+            device_settings_url,
+            data={
+                'auth_backend': 'auth_basic',
+                'username': 'operator',
+                'password': 'a-str0ng-QA-passphrase',
+                'password_2': 'a-str0ng-QA-passphrase',
+            },
+            format='json',
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+    disconnect.assert_called_once()
+
+
+@pytest.mark.django_db
+@mock.patch('anthias_server.api.views.v2.settings')
+@mock.patch('anthias_server.api.views.v2.ViewerPublisher')
+def test_patch_device_settings_leaves_sockets_alone_when_auth_unchanged(
+    publisher_mock: Any,
+    settings_mock: Any,
+    api_client: APIClient,
+    device_settings_url: str,
+) -> None:
+    _device_settings_mock(settings_mock, auth_backend='')
+    publisher_mock.get_instance.return_value = mock.MagicMock()
+
+    with mock.patch(
+        'anthias_server.app.consumers.disconnect_all'
+    ) as disconnect:
+        response = api_client.patch(
+            device_settings_url,
+            data={'player_name': 'New Player'},
+            format='json',
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+    disconnect.assert_not_called()

@@ -22,6 +22,16 @@ def get_build_parameters(build_target: str) -> dict[str, Any]:
             'base_image': BASE_IMAGE,
             'target_platform': 'linux/arm64/v8',
         }
+    if build_target == 'pi3-64':
+        # 64-bit (arm64) Raspberry Pi 3 stream. Same Qt 6 / eglfs image
+        # shape as pi4-64 — the VideoCore IV is weaker (H.264-only HW
+        # decode, 1080p) but the display + decode plumbing is identical.
+        # The legacy 32-bit `pi3` armhf/Qt5 board is kept separately.
+        return {
+            'board': 'pi3-64',
+            'base_image': BASE_IMAGE,
+            'target_platform': 'linux/arm64/v8',
+        }
     if build_target == 'arm64':
         # Generic 64-bit ARM SBC fallback (Orange Pi, Rock Pi, Banana Pi, …).
         # Effectively a thinner pi5 variant: Qt 6, arm64, no libraspberrypi0
@@ -89,7 +99,6 @@ def get_uv_builder_context(
     builder_extra_apt = []
     if uv_group in groups_needing_native_build_libs:
         builder_extra_apt = [
-            'libcec-dev',
             'libdbus-1-dev',
             'libdbus-glib-1-dev',
         ]
@@ -116,8 +125,7 @@ def get_uv_builder_context(
                 # variants ship the headers compile from source
                 # needs; the runtime ``.so`` files are pulled in
                 # by base_apt_dependencies via libjpeg62-turbo,
-                # libfreetype6, etc., or transitively by
-                # cec-utils / ffmpeg.
+                # libfreetype6, etc., or transitively by ffmpeg.
                 'libjpeg62-turbo-dev',
                 'libfreetype-dev',
                 'liblcms2-dev',
@@ -155,19 +163,25 @@ def get_test_context() -> dict[str, Any]:
 def get_viewer_context(board: str, target_platform: str) -> dict[str, Any]:
     releases_url = f'{GITHUB_REPO_URL}/releases/download'
 
-    is_qt6 = board in ['pi5', 'pi4-64', 'x86', 'arm64']
+    is_qt6 = board in ['pi5', 'pi4-64', 'pi3-64', 'x86', 'arm64']
 
     # Qt version is only relevant for the Qt 5 path: pi2/pi3 pull the
     # cross-built Qt 5 toolchain tarball at build time. Qt 5 is frozen
-    # for these boards, so the toolchain stays pinned to the
-    # WebView-v2026.04.1 release indefinitely. Qt 6 boards install Qt
-    # straight from Debian apt (qt6-*-dev in viewer_extra_apt below).
-    qt_version = '6.4.2' if is_qt6 else '5.15.14'
+    # for these boards, so the toolchain stays pinned to a WebView-v*
+    # release. Bumped from WebView-v2026.07.0 to WebView-v2026.07.1,
+    # which carries the armv7 NEON-alignment fix (arm_use_neon=false +
+    # a -mno-unaligned-access cross-compiler wrap) that stops the Pi 2/3
+    # blank-screen crash-loop: gcc otherwise lowers struct init of
+    # 8-byte-aligned types into a NEON :64 block store that faults on
+    # the 4-byte-aligned pointers QtWebEngine hands it. Qt 6 boards
+    # install Qt straight from Debian apt (qt6-*-dev in viewer_extra_apt
+    # below).
+    qt_version = '6.4.2' if is_qt6 else '5.15.19'
     qt_major_version = qt_version.split('.')[0]
-    qt5_toolchain_url = f'{releases_url}/WebView-v2026.04.1'
+    qt5_toolchain_url = f'{releases_url}/WebView-v2026.07.1'
 
-    # Viewer-only apt deps. The shared runtime set (cec-utils, curl,
-    # ffmpeg, git, libcec7, procps, psmisc, python-is-python3,
+    # Viewer-only apt deps. The shared runtime set (curl,
+    # ffmpeg, git, procps, psmisc, python-is-python3,
     # python3-gi, python3-pip, python3-setuptools, sqlite3, sudo,
     # plus libraspberrypi0 on 32-bit Pi boards) is installed by
     # Dockerfile.base.j2 in a layer that server (and test) also use,
@@ -181,16 +195,21 @@ def get_viewer_context(board: str, target_platform: str) -> dict[str, Any]:
     # from apt at runtime — except on Qt 6 boards where qt6-*-dev
     # below also provides the runtime libs.)
     #
-    # X11/XCB packages are intentionally absent. Two display tracks
-    # for the four image targets (no X code path on either):
+    # X11/XCB packages are intentionally absent. Three display tracks
+    # across the image targets (no X code path on any):
     #
-    # * Pi2 / Pi3 / Pi4-64: Qt linuxfb + mpv straight to KMS. Pi 2 /
-    #   Pi 3 use a custom -no-xcb -no-xcb-xlib -qpa eglfs Qt 5
-    #   WebView build (see src/anthias_webview/build_qt5.sh) with mpv
-    #   --vo=drm. Pi 4 is Qt 6 with the same
-    #   QT_QPA_PLATFORM=linuxfb plus mpv --vo=gpu --gpu-context=drm —
-    #   V3D-accelerated scaling without the cage composite pass the
-    #   V3D 6.0 can't keep up with.
+    # * Pi2 / Pi3 (32-bit, Qt5): Qt linuxfb + a custom -no-xcb
+    #   -no-xcb-xlib -qpa eglfs Qt 5 WebView build (see
+    #   src/anthias_webview/build_qt5.sh) with the GStreamer fbdev
+    #   media player straight to /dev/fb0. The legacy armhf stream.
+    # * Pi3-64 / Pi4-64 (Qt6): Qt eglfs (KMS/EGL), video played
+    #   in-process by AnthiasViewer's QtMultimedia pipeline
+    #   (QMediaPlayer → QML VideoOutput, ffmpeg/libavcodec backend with
+    #   V4L2 HW decode) — no external player and no cage composite pass
+    #   the V3D can't keep up with. eglfs gives the VideoOutput scene
+    #   graph the GL context linuxfb lacks (issue #2904). Pi 3-64 is the
+    #   weaker sibling (VideoCore IV, H.264-only HW decode) on the
+    #   identical image shape.
     # * Pi5 / x86 / arm64: cage (a kiosk wlroots compositor) with
     #   QT_QPA_PLATFORM=wayland and mpv --vo=gpu
     #   --gpu-context=wayland. The cage + qt6-wayland + wlr-randr
@@ -253,15 +272,26 @@ def get_viewer_context(board: str, target_platform: str) -> dict[str, Any]:
         # in production (pre-existing bug, not a regression here).
         # 200 KB, easier to just install everywhere than gate on board.
         'libharfbuzz-subset0',
-        'python3-netifaces',
         'fonts-wqy-zenhei',
     ]
 
     if is_qt6:
-        # Shared Qt 6 runtime for every Qt6 board (pi4-64, pi5, x86,
-        # arm64). VideoView uses QMediaPlayer + QVideoWidget from
-        # qt6-multimedia. Qt 6.8 dropped its gstreamer backend
-        # upstream (only ``libffmpegmediaplugin.so`` ships in
+        # Shared Qt 6 runtime for every Qt6 board (pi3-64, pi4-64, pi5,
+        # x86, arm64). VideoView plays through QMediaPlayer into a QML
+        # ``VideoOutput`` hosted in a QQuickWidget (issue #2967:
+        # frames stay on the GPU as scene-graph textures — the prior
+        # QGraphicsVideoItem raster path presented at 8–12 fps).
+        # That needs the declarative runtime (QQuickWidget links
+        # libQt6QuickWidgets, pulled by qt6-declarative-dev) plus the
+        # two QML *plugin* modules the scene imports at runtime —
+        # qml6-module-qtquick (Rectangle et al.) and
+        # qml6-module-qtmultimedia (VideoOutput). The QML modules
+        # are runtime-only plugins: the build succeeds without them
+        # and the viewer then black-screens with "module not
+        # installed" QML errors in the container log, so they must
+        # ship in the image even though nothing links them.
+        # Qt 6.5 dropped its gstreamer backend upstream (only
+        # ``libffmpegmediaplugin.so`` ships in
         # ``/usr/lib/.../qt6/plugins/multimedia/``); decode goes
         # through libavcodec directly. The +rpt1 ``ffmpeg`` /
         # ``libav*`` packages pinned in _rpt1-ffmpeg-pin.j2 carry
@@ -271,11 +301,26 @@ def get_viewer_context(board: str, target_platform: str) -> dict[str, Any]:
         # gstreamer plugin set needed. VLC is deliberately not
         # installed because MediaPlayerProxy never routes Qt6
         # boards to it.
+        # pulseaudio: Debian's Qt 6 Multimedia is compiled with
+        # PulseAudio as its ONLY audio backend — libQt6Multimedia.so.6
+        # links libpulse and contains no libasound/ALSA code at all —
+        # so without a running PulseAudio server QMediaDevices
+        # enumerates zero audio outputs, QAudioOutput holds a null
+        # device, and every video plays silent (issue #3000; the
+        # pre-#2905 mpv path talked ALSA directly and needed no sound
+        # server). bin/start_viewer.sh starts a minimal per-container
+        # daemon as the viewer user. pulseaudio-utils ships pactl so
+        # a silent-audio field report can be debugged from a shell
+        # (list sinks / sink-inputs) without modifying the image.
         viewer_extra_apt_dependencies.extend(
             [
                 'libqt6multimedia6',
-                'libqt6multimediawidgets6',
+                'pulseaudio',
+                'pulseaudio-utils',
+                'qml6-module-qtmultimedia',
+                'qml6-module-qtquick',
                 'qt6-base-dev',
+                'qt6-declarative-dev',
                 'qt6-image-formats-plugins',
                 'qt6-multimedia-dev',
                 'qt6-webengine-dev',
@@ -307,6 +352,20 @@ def get_viewer_context(board: str, target_platform: str) -> dict[str, Any]:
                 ]
             )
 
+            # smartmontools: these three are the boards that can boot
+            # from a SATA/NVMe device (x86 outright, Rock Pi 4 and a
+            # Pi 5 with an NVMe HAT), and SMART is the only place such
+            # a device reports wear -- there is no sysfs equivalent of
+            # eMMC's life_time. The viewer samples it and publishes a
+            # Redis fact because it is the one container privileged
+            # enough to issue the ioctl; see anthias_common/smart.py.
+            #
+            # Deliberately not on the SD-card-only boards (pi2, pi3,
+            # pi4): an SD card has no SMART at all, so smartctl there
+            # would be ~2 MB of image that can never return an answer,
+            # on exactly the boards whose storage is tightest.
+            viewer_extra_apt_dependencies.append('smartmontools')
+
         if board == 'x86':
             # va-driver-all is a Debian metapackage that pulls in
             # intel-media-va-driver (modern Intel iHD), i965-va-driver
@@ -336,13 +395,36 @@ def get_viewer_context(board: str, target_platform: str) -> dict[str, Any]:
         # libgst-dev / libsqlite0-dev / libsrtp0-dev were dropped in
         # trixie — libsqlite3-dev and libsrtp2-dev are already in the
         # main viewer apt list above; libgstreamer1.0-dev is Qt 5-only
-        # and is added in the extend() below. VLC is Qt5-only because
-        # MediaPlayerProxy only routes pi2/pi3 to VLCMediaPlayer.
+        # and is added in the extend() below.
+        #
+        # GstFbdevMediaPlayer (src/anthias_viewer/media_player.py)
+        # plays pi1/pi2/pi3 video by shelling out to ``gst-launch-1.0
+        # playbin`` with a fully-hardware sink: v4l2h264dec (bcm2835
+        # codec) decodes, v4l2convert (bcm2835 ISP) HW-scales + converts
+        # YUV→framebuffer-format, fbdevsink paints /dev/fb0 (no DRM
+        # master / compositor needed). The +rpt1 GStreamer stack from
+        # archive.raspberrypi.org (added in base for libraspberrypi0)
+        # supplies the runtime pieces:
+        #   * gstreamer1.0-tools — the gst-launch-1.0 binary
+        #   * -plugins-base — playbin, videoconvert
+        #   * -plugins-good — the V4L2 elements (v4l2h264dec /
+        #     v4l2convert) + qtdemux
+        #   * -plugins-bad — fbdevsink
+        #   * -alsa — alsasink (Debian ships the ALSA sink in its own
+        #     package, NOT in -plugins-base; the player's
+        #     ``audio-sink=alsasink device=...`` fails pipeline
+        #     construction without it, black-screening *all* video).
+        # VLC was dropped when GstFbdevMediaPlayer replaced
+        # VLCMediaPlayer — nothing on pi1/pi2/pi3 links it anymore.
         viewer_extra_apt_dependencies.extend(
             [
+                'gstreamer1.0-alsa',
+                'gstreamer1.0-plugins-bad',
+                'gstreamer1.0-plugins-base',
+                'gstreamer1.0-plugins-good',
+                'gstreamer1.0-tools',
                 'libgstreamer1.0-dev',
                 'qt5-image-formats-plugins',
-                'vlc',
             ]
         )
 

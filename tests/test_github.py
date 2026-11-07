@@ -78,14 +78,68 @@ def test_fetch_latest_release_tag_backoff_skips_fetch(
 def test_fetch_latest_release_tag_happy_path(
     github_env: None, redis_data: dict[str, str]
 ) -> None:
-    resp = _resp(200, json_data={'tag_name': 'v2026.6.0', 'name': 'Release'})
+    resp = _resp(200, json_data=[{'tag_name': 'v2026.6.0', 'name': 'Release'}])
     with mock.patch.object(
         github, 'requests_get', return_value=resp
     ) as mock_get:
         assert github._fetch_latest_release_tag() == 'v2026.6.0'
     assert redis_data[github.LATEST_RELEASE_TAG_KEY] == 'v2026.6.0'
     url = mock_get.call_args.args[0]
-    assert url.endswith('/repos/Screenly/Anthias/releases/latest')
+    assert '/repos/Screenly/Anthias/releases' in url
+    assert '/releases/latest' not in url
+
+
+def test_fetch_latest_release_tag_skips_non_app_releases(
+    github_env: None, redis_data: dict[str, str]
+) -> None:
+    """The ANTHIAS-3P scenario: a non-app release (frozen Qt 5
+    toolchain, tagged ``WebView-v2026.07.1``) is the newest release in
+    the repo. ``/releases/latest`` would return it and break the
+    update check fleet-wide; the list-based fetch must skip it and
+    pick the newest parseable CalVer tag instead."""
+    resp = _resp(
+        200,
+        json_data=[
+            {'tag_name': 'WebView-v2026.07.1', 'name': 'WebView toolchain'},
+            {'tag_name': 'v2026.7.0', 'name': 'Anthias'},
+            {'tag_name': 'v2026.6.3', 'name': 'Anthias'},
+        ],
+    )
+    with mock.patch.object(github, 'requests_get', return_value=resp):
+        assert github._fetch_latest_release_tag() == 'v2026.7.0'
+    assert redis_data[github.LATEST_RELEASE_TAG_KEY] == 'v2026.7.0'
+    assert 'github-api-error' not in redis_data
+
+
+def test_fetch_latest_release_tag_picks_highest_version_not_first(
+    github_env: None, redis_data: dict[str, str]
+) -> None:
+    """The list is ordered by creation date, not by version — a
+    hotfix tagged out of order must not mask the real latest."""
+    resp = _resp(
+        200,
+        json_data=[
+            {'tag_name': 'v2026.5.1', 'name': 'Hotfix, created last'},
+            {'tag_name': 'v2026.6.0', 'name': 'Anthias'},
+        ],
+    )
+    with mock.patch.object(github, 'requests_get', return_value=resp):
+        assert github._fetch_latest_release_tag() == 'v2026.6.0'
+
+
+def test_fetch_latest_release_tag_skips_drafts_and_prereleases(
+    github_env: None, redis_data: dict[str, str]
+) -> None:
+    resp = _resp(
+        200,
+        json_data=[
+            {'tag_name': 'v2026.8.0', 'draft': True},
+            {'tag_name': 'v2026.7.1', 'prerelease': True},
+            {'tag_name': 'v2026.7.0'},
+        ],
+    )
+    with mock.patch.object(github, 'requests_get', return_value=resp):
+        assert github._fetch_latest_release_tag() == 'v2026.7.0'
 
 
 def test_fetch_latest_release_tag_request_exception(
@@ -121,35 +175,32 @@ def test_fetch_latest_release_tag_invalid_json(
     assert github.LATEST_RELEASE_TAG_KEY not in redis_data
 
 
-def test_fetch_latest_release_tag_missing_tag_name(
-    github_env: None, redis_data: dict[str, str]
+@pytest.mark.parametrize(
+    'json_data',
+    [
+        [],
+        [{'name': 'Release without tag_name'}],
+        [{'tag_name': 12345}],
+        [{'tag_name': 'nightly'}, {'tag_name': 'WebView-v2026.07.1'}],
+        {'tag_name': 'v2026.6.0'},  # dict (old /latest shape), not a list
+    ],
+    ids=[
+        'empty-list',
+        'missing-tag-name',
+        'non-string-tag-name',
+        'no-parseable-tags',
+        'non-list-payload',
+    ],
+)
+def test_fetch_latest_release_tag_unusable_payload_arms_backoff(
+    github_env: None, redis_data: dict[str, str], json_data: object
 ) -> None:
-    resp = _resp(200, json_data={'name': 'Release without tag_name'})
-    with mock.patch.object(github, 'requests_get', return_value=resp):
-        assert github._fetch_latest_release_tag() is None
-    assert 'github-api-error' in redis_data
-    assert github.LATEST_RELEASE_TAG_KEY not in redis_data
-
-
-def test_fetch_latest_release_tag_non_string_tag_name(
-    github_env: None, redis_data: dict[str, str]
-) -> None:
-    resp = _resp(200, json_data={'tag_name': 12345})
-    with mock.patch.object(github, 'requests_get', return_value=resp):
-        assert github._fetch_latest_release_tag() is None
-    assert 'github-api-error' in redis_data
-    assert github.LATEST_RELEASE_TAG_KEY not in redis_data
-
-
-def test_fetch_latest_release_tag_unparseable_tag_name(
-    github_env: None, redis_data: dict[str, str]
-) -> None:
-    """An upstream tag like ``nightly`` must not be cached: with a
-    24h TTL, caching it would pin is_up_to_date() to the fallback
-    verdict for a day even after upstream corrects the tag. Trip the
-    5-minute backoff instead so the next attempt re-fetches once
-    upstream is fixed."""
-    resp = _resp(200, json_data={'tag_name': 'nightly'})
+    """A payload with no usable tag must not be cached: with a 24h
+    TTL, caching would pin is_up_to_date() to the fallback verdict
+    for a day even after upstream corrects it. Trip the 5-minute
+    backoff instead so the next attempt re-fetches once upstream is
+    fixed."""
+    resp = _resp(200, json_data=json_data)
     with mock.patch.object(github, 'requests_get', return_value=resp):
         assert github._fetch_latest_release_tag() is None
     assert 'github-api-error' in redis_data
@@ -378,3 +429,66 @@ def test_handle_github_error_without_response(
     exc.response = None
     github.handle_github_error(exc, 'no-resp-action')
     assert redis_data['github-api-error'] == 'no-resp-action'
+
+
+def test_handle_github_error_logs_at_warning_not_error(
+    github_env: None,
+) -> None:
+    """An unreachable api.github.com is a routine condition on a
+    signage device (offline installs, locked-down networks) — it must
+    not log at ERROR, which would land in Sentry on every offline
+    device (ANTHIAS-8)."""
+    exc = requests_exceptions.ConnectionError()
+    exc.response = None
+    with (
+        mock.patch('anthias_server.lib.github.logger.warning') as m_warning,
+        mock.patch('anthias_server.lib.github.logger.error') as m_error,
+    ):
+        github.handle_github_error(exc, 'latest release')
+    m_warning.assert_called_once()
+    m_error.assert_not_called()
+
+
+def test_github_module_never_logs_at_error_level() -> None:
+    """Every failure path in this module is degraded through
+    gracefully (backoff + cached verdict), so none of it belongs at
+    ERROR level or above — that's what the Sentry logging integration
+    turns into an event (ANTHIAS-8). Pin that with an AST walk over
+    the module's direct ``logging.error/exception/critical/fatal``
+    calls,
+    so comments and docstrings can't false-positive the check. (The
+    module logs via the root ``logging`` module only; a named-logger
+    refactor would need this test updated.)
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(github))
+    error_level_calls = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in ('error', 'exception', 'critical', 'fatal')
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == 'logging'
+    ]
+    assert not error_level_calls, (
+        f'ERROR-level logging calls found in lib/github.py at lines '
+        f'{error_level_calls} — these become Sentry events on every '
+        f'offline device'
+    )
+
+
+def test_handle_github_error_surfaces_exception_detail(
+    github_env: None,
+) -> None:
+    """The no-response branch must log the exception detail, not a
+    bare 'no data' — Sentry previously showed 'ConnectionError
+    fetching latest release from GitHub: no data', hiding the
+    host/timeout info that str(exc) carries."""
+    exc = requests_exceptions.ReadTimeout('read timed out')
+    exc.response = None
+    with mock.patch('anthias_server.lib.github.logger.warning') as m_warning:
+        github.handle_github_error(exc, 'latest release')
+    assert m_warning.call_args.args[3] == 'read timed out'

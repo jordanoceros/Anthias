@@ -65,28 +65,45 @@ def build_image(
     # Runtime-only base set. Compilers and *-dev headers live in the
     # uv-builder stage (docker/uv-builder.j2); the runtime image gets
     # the venv COPY'd in pre-built, so anything builder-only would just
-    # be dead weight here. `libcec7` is the runtime SONAME the cec
-    # Python wheel (built in uv-builder) dlopens at import time —
-    # debian:trixie shipped libcec 7.0 (Ubuntu still has libcec6, easy
-    # to mix up). `iproute2` is needed by bin/wait.py — debian:trixie's
-    # base image ships neither iproute2 nor net-tools by default, so
-    # we install it explicitly. `python3-gi` stays because pydbus does
-    # `from gi.repository import GLib, Gio` at import — viewer's
-    # `--system-site-packages` venv picks it up from the system
+    # be dead weight here. `iproute2` is needed by bin/wait.py —
+    # debian:trixie's base image ships neither iproute2 nor net-tools by
+    # default, so we install it explicitly. `python3-gi` stays because
+    # pydbus does `from gi.repository import GLib, Gio` at import —
+    # viewer's `--system-site-packages` venv picks it up from the system
     # site-packages.
+    #
+    # `cec-utils` and `libcec7` used to live here for the libcec-based
+    # display-power feature. Both are gone: CEC now talks to the kernel
+    # uABI (`/dev/cec*`) from pure stdlib, so there is no native library
+    # to dlopen and no `cec-client` to shell out to.
     base_apt_dependencies = [
-        'cec-utils',
         'curl',
         'ffmpeg',
         'git',
         'iproute2',
-        'libcec7',
         # Runtime dep for pillow-heif's libheif binding. ~1 MB
         # extracted, in base so anthias-server (image normalisation
         # pipeline) and anthias-celery (the worker that actually runs
         # the conversion) both inherit it. Inert on the viewer
         # process; harmless to ship there too.
         'libheif1',
+        # Runtime libs for Pillow's WebP support (the normalisation
+        # pipeline saves every converted image as lossless WebP).
+        # On 32-bit Pi (armv7) there's no Pillow wheel, so it's built
+        # from source against libwebp-dev and dynamically links the
+        # whole webp family at runtime — libwebp7, libwebpmux3 *and*
+        # libwebpdemux2 (Pillow's _webp uses WebPAnimDecoder). ffmpeg
+        # pulls libwebp7 + libwebpmux3 transitively but NOT
+        # libwebpdemux2, so without it `import PIL._webp` fails, the
+        # WebP plugin registers no save handler, and the conversion
+        # dies with `KeyError: 'WEBP'` (Sentry ANTHIAS-1Y, pi3). List
+        # all three explicitly so the pipeline never depends on
+        # ffmpeg's transitive graph. The 64-bit wheel bundles its own
+        # webp libs, so these are inert there — same harmless-on-all-
+        # boards rationale as libheif1 above.
+        'libwebp7',
+        'libwebpdemux2',
+        'libwebpmux3',
         'lsb-release',
         'procps',
         'psmisc',
@@ -96,6 +113,13 @@ def build_image(
         'python-is-python3',
         'sudo',
         'sqlite3',
+        # The host's /etc/timezone is bind-mounted into the
+        # containers, and hosts in the wild still use legacy aliases
+        # like `US/Central`. Trixie moved those out of tzdata into
+        # tzdata-legacy; without it Django's startup check against
+        # /usr/share/zoneinfo rejects the host's timezone and the
+        # device would fall back to UTC.
+        'tzdata-legacy',
     ]
 
     # The 32-bit Pi boards (pi2, pi3) link against Broadcom's legacy

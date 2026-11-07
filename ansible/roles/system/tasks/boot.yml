@@ -1,8 +1,8 @@
 ---
 - name: Resolve boot config and cmdline paths
   ansible.builtin.set_fact:
-    system_config_path: "{{ '/boot/config.txt' if ansible_distribution_major_version | int <= 11 else '/boot/firmware/config.txt' }}"
-    system_cmdline_path: "{{ '/boot/cmdline.txt' if ansible_distribution_major_version | int <= 11 else '/boot/firmware/cmdline.txt' }}"
+    system_config_path: "{{ '/boot/config.txt' if ansible_facts['distribution_major_version'] | int <= 11 else '/boot/firmware/config.txt' }}"
+    system_cmdline_path: "{{ '/boot/cmdline.txt' if ansible_facts['distribution_major_version'] | int <= 11 else '/boot/firmware/cmdline.txt' }}"
 
 # Render config.txt from a vanilla template that owns the whole file.
 # Pi firmware sections ([cm4], [cm5], etc.) handle per-model variants
@@ -88,16 +88,21 @@
     path: /etc/systemd/system/autologin@.service
   register: system_autologin_template
 
+# NOTE: disable only, do not stop. A local-console install runs on tty1
+# itself (ansible_connection=local), so stopping getty@tty1 here tears down
+# the session the installer is running in — the screen goes blank mid-install
+# and, with the prompt now gone and SSH not enabled, the user is locked out
+# (forums.screenly.io/t/install-leading-to-blank-screen/6754). Disabling is
+# enough: the install ends in a reboot, after which the (disabled) unit does
+# not start, so no login prompt appears on the display.
 - name: Disable getty on tty1 (no login prompt on display)
   ansible.builtin.systemd:
     name: getty@tty1.service
-    state: stopped
     enabled: false
   when: system_getty_template.stat.exists
 
 - name: Disable autologin on tty1 (no auto-login on display)
   ansible.builtin.systemd:
     name: autologin@tty1.service
-    state: stopped
     enabled: false
   when: system_autologin_template.stat.exists

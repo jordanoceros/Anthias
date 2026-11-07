@@ -1,16 +1,20 @@
+import logging
 import uuid
-from os import getenv, path
+from os import getenv, path, remove
 from typing import Any
 
 import yaml
+from django.conf import settings as django_settings
 from django.http import HttpRequest, HttpResponse
 from django.shortcuts import render
 from django.utils import timezone
 
+from anthias_common.utils import get_video_duration
 from anthias_server.app.models import Asset
 from anthias_server.app.page_context import navbar as _navbar_context
-from anthias_common.utils import get_video_duration
-from anthias_server.settings import settings
+from anthias_server.settings import ViewerPublisher, settings
+
+logger = logging.getLogger(__name__)
 
 
 def template(
@@ -36,6 +40,12 @@ def template(
         'default_filters': ['template_handle_unicode'],
     }
     context['use_24_hour_clock'] = settings['use_24_hour_clock']
+    # Store-catalog index URL for the Add → Apps tab (read client-side
+    # off a <meta> tag). Sourced from Django settings so it stays
+    # env-overridable in one place.
+    context['app_store_index_url'] = django_settings.APP_STORE_INDEX_URL
+    # Chunk size for large uploads, read client-side off a <meta> tag.
+    context['upload_chunk_size_mb'] = django_settings.UPLOAD_CHUNK_SIZE_MB
     # Navbar needs is_balena / up_to_date / player_name on every page.
     context.update(_navbar_context())
 
@@ -46,7 +56,7 @@ def prepare_default_asset(**kwargs: Any) -> dict[str, Any] | None:
     if kwargs['mimetype'] not in ['image', 'video', 'webpage']:
         return None
 
-    asset_id = 'default_{}'.format(uuid.uuid4().hex)
+    asset_id = f'default_{uuid.uuid4().hex}'
     if 'video' == kwargs['mimetype']:
         video_duration = get_video_duration(kwargs['uri'])
         if video_duration is None:
@@ -111,3 +121,57 @@ def remove_default_assets() -> None:
     for asset in Asset.objects.all():
         if asset.asset_id.startswith('default_'):
             asset.delete()
+
+
+def delete_asset_with_file(asset: Asset, *, nudge_viewer: bool = True) -> None:
+    """Delete an ``Asset`` row, remove its on-disk file (if owned), and
+    nudge the viewer to advance past it.
+
+    Shared by the v1/v1.1/v1.2/v2 API delete endpoint and the HTML form
+    delete route on the home page. Both must behave identically — GH
+    #2908 was the case where the UI form-post handler dropped the row
+    but left the binary in ``settings['assetdir']`` indefinitely.
+
+    File removal is gated on ``asset.uri`` starting with
+    ``settings['assetdir']`` so rows whose URI is a remote URL
+    (webpage, RTSP, streaming video) are left untouched. Failures are
+    logged and swallowed: the row is the operator's source of truth,
+    and a stray file is eventually cleaned up by the periodic
+    ``cleanup()`` orphan sweep — letting an unlink error block the DB
+    delete would leave the operator unable to remove the row at all.
+
+    ``nudge_viewer=False`` skips the per-row viewer reload so a bulk
+    delete can fire a single reload after the whole batch instead of
+    spamming the pub/sub channel once per asset (#3046).
+
+    **Row first, then the file.** The reverse order leaves a window
+    where the row is still live and ``Asset.uri`` points at nothing,
+    and an in-flight normalisation task landing in that window raises
+    ``FileNotFoundError`` on an asset the operator has already deleted
+    (Sentry ANTHIAS-1G). Dropping the row first means the task's
+    ``processing._row_or_none`` guard — or, once the task is past it,
+    ``processing._run_unless_deleted`` — sees the deletion and no-ops
+    instead. It also matches
+    what this function already documents: the row is the operator's
+    source of truth, and a file left behind by a failed unlink is
+    swept by the periodic ``cleanup()`` orphan pass.
+    """
+    asset.delete()
+
+    # ``delete()`` clears only the pk; the instance keeps its field
+    # values, so ``asset.uri`` still reads the path we just dropped the
+    # row for.
+    if asset.uri and asset.uri.startswith(settings['assetdir']):
+        try:
+            remove(asset.uri)
+        except OSError as exc:
+            logger.warning(
+                'Failed to remove asset file %s: %s', asset.uri, exc
+            )
+
+    # Wake the viewer so it skips a now-deleted asset that's still on
+    # screen instead of finishing its remaining ``duration`` (#2430).
+    # The viewer's reload handler checks whether the currently-shown
+    # asset is still active and advances if not.
+    if nudge_viewer:
+        ViewerPublisher.get_instance().send_to_viewer('reload')

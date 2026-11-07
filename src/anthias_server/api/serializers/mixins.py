@@ -3,18 +3,25 @@ from inspect import cleandoc
 from os import path, rename
 from typing import Any
 
+from rest_framework.exceptions import ValidationError
 from rest_framework.serializers import CharField, Serializer
 
-from anthias_server.api.errors import AssetCreationError
+from anthias_common.remote_video import (
+    is_downloadable_remote_video,
+    remote_video_destination_path,
+)
 from anthias_common.utils import (
     get_video_duration,
     url_fails,
 )
-from anthias_common.youtube import youtube_destination_path
-from anthias_server.processing import needs_image_normalisation
+from anthias_common.youtube import is_youtube_url, youtube_destination_path
+from anthias_server.api.errors import AssetCreationError
+from anthias_server.app.models import DURATION_S_MAX, clamp_duration
+from anthias_server.processing import needs_image_processing
 from anthias_server.settings import settings
 
 from . import (
+    DURATION_RANGE_ERROR,
     get_unique_name,
     validate_uri,
 )
@@ -30,6 +37,17 @@ class CreateAssetSerializerMixin:
     # choking on an unknown column. None means "not a YouTube asset"
     # and the view skips the dispatch.
     _pending_youtube_uri: str | None = None
+
+    # Source URL of an in-flight generic remote-video download, set by
+    # prepare_asset when ``mimetype == 'video'`` and the URI is an
+    # http(s) link whose extension or HEAD-probed Content-Type
+    # identifies it as a downloadable single-file container. Same
+    # hand-off shape as ``_pending_youtube_uri``: the view picks the
+    # field up after persistence and dispatches
+    # ``download_remote_video_asset``. None means "no auto-download
+    # needed" — either the URI is local, is a YouTube link, or is a
+    # live stream (RTSP / HLS / DASH) the viewer plays directly.
+    _pending_remote_video_uri: str | None = None
 
     # Set to ``'image'`` or ``'video'`` by ``prepare_asset`` when the
     # newly created row needs the normalisation pipeline to run before
@@ -89,6 +107,22 @@ class CreateAssetSerializerMixin:
         # missing/None mimetype. Both bugs were inherited from the
         # pre-celery code path.
         is_youtube = asset['mimetype'] == 'youtube_asset'
+        # ``mimetype`` is a free-form CharField, so a client can claim
+        # ``youtube_asset`` for any URI. Confirm the URI is actually a
+        # YouTube link before handing it to yt-dlp, mirroring the
+        # ``is_youtube_url`` gate the HTML create path applies — without
+        # it, an arbitrary http(s) URL (including internal / metadata
+        # hosts) would be fetched server-side through yt-dlp's generic
+        # extractor. The URI already passed ``validate_uri``.
+        if is_youtube and not is_youtube_url(uri):
+            # DRF ``ValidationError`` (not ``AssetCreationError``) so
+            # ``serializer.is_valid()`` catches it and the create view
+            # returns a 400 keyed on ``uri`` — matching the v1.1
+            # serializer. A bare ``AssetCreationError`` from here would
+            # escape ``is_valid()`` and surface as a 500.
+            raise ValidationError(
+                {'uri': 'A youtube_asset URI must point at a YouTube URL.'}
+            )
         if is_youtube:
             # Defer the download to download_youtube_asset (Celery).
             # The row lands with mimetype='video', is_processing set,
@@ -103,6 +137,31 @@ class CreateAssetSerializerMixin:
             self._pending_youtube_uri = uri
             uri = youtube_destination_path(asset['asset_id'], settings)
 
+        # Generic remote-video URLs follow the YouTube lifecycle: the
+        # row lands with the eventual local path on disk, is_processing
+        # is flipped, and a Celery task downloads the file out of band
+        # before chaining into normalize_video_asset for the per-board
+        # codec gate. Live streams (RTSP / HLS / DASH) and any non-
+        # http(s) scheme are filtered out inside
+        # ``is_downloadable_remote_video`` — they reach the viewer as
+        # literal stream URLs the same way they always have, so no
+        # extra scheme check is needed here.
+        is_remote_video_download = False
+        if (
+            not is_youtube
+            and not is_local_upload
+            and 'video' in (asset['mimetype'] or '')
+        ):
+            should_download, source_ext = is_downloadable_remote_video(uri)
+            if should_download:
+                asset['is_processing'] = True if version == 'v2' else 1
+                asset['duration'] = 0
+                self._pending_remote_video_uri = uri
+                uri = remote_video_destination_path(
+                    asset['asset_id'], source_ext, settings
+                )
+                is_remote_video_download = True
+
         asset['uri'] = uri
 
         # Decide whether the new row needs the normalisation pipeline.
@@ -112,16 +171,31 @@ class CreateAssetSerializerMixin:
         # never get rewritten in-place. Anything that goes through the
         # pipeline lands as ``is_processing=True`` so the viewer skips
         # it during rotation until the task clears the flag.
-        needs_image = is_local_upload and needs_image_normalisation(uri)
+        needs_image = is_local_upload and needs_image_processing(uri)
         needs_video = (
             is_local_upload
             and not is_youtube
             and 'video' in (asset['mimetype'] or '')
         )
 
-        if 'video' in asset['mimetype'] and not is_youtube:
+        if (
+            'video' in asset['mimetype']
+            and not is_youtube
+            and not is_remote_video_download
+        ):
             duration_raw = data.get('duration')
-            if duration_raw is not None and int(duration_raw) == 0:
+            # Guarded parse: v1.2 models duration as a CharField, so
+            # ``'abc'`` must 400 keyed on ``duration``, not escape as
+            # an unhandled ValueError (500).
+            try:
+                duration_is_zero = (
+                    duration_raw is not None and int(duration_raw) == 0
+                )
+            except (TypeError, ValueError):
+                raise ValidationError(
+                    {'duration': 'A valid integer is required.'}
+                )
+            if duration_is_zero:
                 if needs_video:
                     # Defer ffprobe to ``normalize_video_asset``: a
                     # passthrough-eligible upload still needs a
@@ -138,22 +212,37 @@ class CreateAssetSerializerMixin:
                         raise AssetCreationError(
                             f'Could not determine duration of video {uri!r}'
                         )
-                    duration = video_duration.total_seconds()
-                    asset['duration'] = (
-                        duration if version == 'v2' else int(duration)
+                    # Clamp (not reject): the file itself is playable,
+                    # only a corrupted container header can advertise
+                    # an out-of-range length — and that must not put
+                    # an over-cap value in the DB (Sentry ANTHIAS-3E).
+                    asset['duration'] = clamp_duration(
+                        video_duration.total_seconds()
                     )
             else:
                 raise AssetCreationError(
                     'Duration must be zero for video assets.'
                 )
-        elif not is_youtube:
-            # Crashes if it's not an int. We want that.
+        elif not is_youtube and not is_remote_video_download:
             duration = data.get('duration', settings['default_duration'])
 
             if version == 'v2':
+                # Already an int bounded by the v2 IntegerField.
                 asset['duration'] = duration
             else:
-                asset['duration'] = int(duration)
+                # v1.2 models duration as a CharField, so parse and
+                # bound the value here — a non-integer must 400 like
+                # the other keyed validation errors (not 500), and an
+                # out-of-range duration would crash-loop the viewer's
+                # Event.wait (Sentry ANTHIAS-3E).
+                try:
+                    asset['duration'] = int(duration)
+                except (TypeError, ValueError):
+                    raise ValidationError(
+                        {'duration': 'A valid integer is required.'}
+                    )
+                if not 0 <= asset['duration'] <= DURATION_S_MAX:
+                    raise ValidationError({'duration': DURATION_RANGE_ERROR})
 
         asset['play_order'] = (
             data.get('play_order') if data.get('play_order') else 0
@@ -166,6 +255,11 @@ class CreateAssetSerializerMixin:
             else 0
         )
 
+        skip_ssl_raw = data.get('skip_ssl_verify')
+        asset['skip_ssl_verify'] = bool(
+            skip_ssl_raw is not None and int(skip_ssl_raw)
+        )
+
         start_date = data['start_date']
         end_date = data['end_date']
         asset['start_date'] = start_date.replace(tzinfo=None)
@@ -175,15 +269,22 @@ class CreateAssetSerializerMixin:
             if field in data:
                 asset[field] = data[field]
 
-        # Skip the reachability probe for in-flight YouTube rows: the
-        # local mp4 path is the *future* destination, the file does
-        # not exist yet, and url_fails on a schemeless path is a
-        # silent no-op anyway. Asserting that explicitly prevents a
-        # future url_fails change from breaking the create flow.
+        # Skip the reachability probe for in-flight YouTube rows and
+        # generic remote-video downloads: in both cases the local
+        # path is the *future* destination, the file does not exist
+        # yet, and url_fails on a schemeless path is a silent no-op
+        # anyway. Asserting both flags explicitly prevents a future
+        # url_fails change from breaking either create flow.
         if (
             not is_youtube
+            and not is_remote_video_download
             and not asset['skip_asset_check']
-            and url_fails(asset['uri'])
+            and url_fails(
+                asset['uri'],
+                verify_ssl=(
+                    settings['verify_ssl'] and not asset['skip_ssl_verify']
+                ),
+            )
         ):
             raise AssetCreationError(
                 'Could not retrieve file. Check the asset URL.'

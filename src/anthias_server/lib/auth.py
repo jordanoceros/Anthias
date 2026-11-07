@@ -68,8 +68,15 @@ from __future__ import annotations
 import logging
 import os.path
 import re
+from collections.abc import Callable
 from functools import wraps
-from typing import TYPE_CHECKING, Any, Callable, ParamSpec, TypeVar, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ParamSpec,
+    TypeVar,
+    cast,
+)
 
 if TYPE_CHECKING:
     from django.contrib.auth.models import User
@@ -82,7 +89,11 @@ if TYPE_CHECKING:
     # Request wraps the underlying Django request and delegates
     # ``.user``, so the body of these helpers handles both shapes
     # the same way; the annotation just needs to admit either one.
-    AnyRequest = HttpRequest | DRFRequest
+    # Spelled as an explicit ``TypeAlias`` so mypy always resolves the
+    # forward-ref ``'AnyRequest'`` as a type rather than a module
+    # variable — the implicit form flipped to "not valid as a type"
+    # once settings.py started importing this module (ANTHIAS-3D).
+    type AnyRequest = HttpRequest | DRFRequest
 
 P = ParamSpec('P')
 R = TypeVar('R')
@@ -308,7 +319,7 @@ def __getattr__(name: str) -> Any:
     return classes[name]
 
 
-def _is_safe_login_next_source(request: 'HttpRequest') -> bool:
+def _is_safe_login_next_source(request: HttpRequest) -> bool:
     """Decide whether a request's path is worth round-tripping through
     the login form's ``?next=`` parameter.
 
@@ -329,12 +340,10 @@ def _is_safe_login_next_source(request: 'HttpRequest') -> bool:
     """
     if request.method != 'GET':
         return False
-    if request.headers.get('HX-Request') is not None:
-        return False
-    return True
+    return request.headers.get('HX-Request') is None
 
 
-def _login_redirect(request: 'HttpRequest') -> 'HttpResponse':
+def _login_redirect(request: HttpRequest) -> HttpResponse:
     """Send an unauthenticated request to the login page, preserving
     the original destination via ``?next=`` when it's safe to do so."""
     from urllib.parse import urlencode
@@ -353,9 +362,9 @@ def _login_redirect(request: 'HttpRequest') -> 'HttpResponse':
     )
 
 
-def authorized(
+def authorized[**P, R](
     orig: Callable[P, R],
-) -> 'Callable[P, R | HttpResponse]':
+) -> Callable[P, R | HttpResponse]:
     """Feature-flagged ``@login_required`` shim.
 
     * When ``settings['auth_backend']`` is empty the call passes
@@ -381,7 +390,7 @@ def authorized(
     from anthias_server.settings import settings
 
     @wraps(orig)
-    def decorated(*args: P.args, **kwargs: P.kwargs) -> 'R | HttpResponse':
+    def decorated(*args: P.args, **kwargs: P.kwargs) -> R | HttpResponse:
         if not settings['auth_backend']:
             return orig(*args, **kwargs)
 
@@ -450,8 +459,8 @@ _VALID_AUTH_BACKENDS = frozenset({'', 'auth_basic'})
 
 
 def _operator_user(
-    request: 'AnyRequest',
-) -> 'User | None':
+    request: AnyRequest,
+) -> User | None:
     """The User row whose credentials gate this device.
 
     When auth is currently enabled the calling view is gated by
@@ -470,7 +479,7 @@ def _operator_user(
     return cast('User', user)
 
 
-def _persisted_operator() -> 'User | None':
+def _persisted_operator() -> User | None:
     """The first persisted operator-account User row, if any.
 
     Used by ``apply_auth_settings`` to detect the case where auth is
@@ -514,7 +523,7 @@ def _require_current_password_correct(
 
 def _validate_password_strength(
     new_pwd: str,
-    user: 'User | None',
+    user: User | None,
 ) -> None:
     """Run the project's ``AUTH_PASSWORD_VALIDATORS`` against the
     proposed password and translate any rejection into
@@ -537,7 +546,7 @@ def _validate_password_strength(
 
 
 def _check_username_available(
-    operator: 'User',
+    operator: User,
     new_username: str,
 ) -> None:
     """Reject a username change that would collide with another row
@@ -556,17 +565,21 @@ def _check_username_available(
 
 
 def _update_existing_operator(
-    operator: 'User',
+    operator: User,
     *,
     new_username: str,
     new_pwd: str,
     new_pwd_confirm: str,
     current_pass_correct: bool | None,
-) -> None:
+) -> bool:
     """Mutate the existing operator row in response to the settings
     form. Each of username / password is independently optional —
     only changes that were actually requested validate the current
     password.
+
+    Returns True when the row actually changed, which the caller uses
+    to decide whether live sessions (and the WebSocket sockets riding
+    on them) have been invalidated.
 
     ``apply_auth_settings`` runs on every settings save (the form
     POSTs the whole page, even unrelated fields like splash-screen
@@ -597,6 +610,7 @@ def _update_existing_operator(
 
     if changed_fields:
         operator.save(update_fields=changed_fields)
+    return bool(changed_fields)
 
 
 def _create_initial_operator(
@@ -636,7 +650,7 @@ def _create_initial_operator(
 
 
 def apply_auth_settings(
-    request: 'AnyRequest',
+    request: AnyRequest,
     *,
     new_auth_backend: str,
     current_pwd: str,
@@ -644,12 +658,22 @@ def apply_auth_settings(
     new_pwd: str,
     new_pwd_confirm: str,
     prev_auth_backend: str,
-) -> None:
+) -> bool:
     """Validate and persist auth-related settings changes.
 
     Raises ``AuthSettingsError`` with an operator-friendly message
     when the input is rejected. On success, mutates the
     ``django.contrib.auth.User`` row backing the operator account.
+
+    Returns True when the change invalidates credentials that are
+    already in use — the backend was switched on or off, or the
+    operator's username/password was rotated. Both settings-save
+    surfaces use that to close open /ws sockets (see
+    :func:`anthias_server.app.consumers.disconnect_all`), because a
+    socket is authorized once at handshake time and would otherwise
+    outlive the credentials it was accepted under. Keeping the
+    decision here rather than at the call sites is what stops the HTML
+    and DRF paths from drifting apart on it.
     The caller is responsible for persisting ``auth_backend`` itself
     (we don't touch the conf file from here so a failed write of one
     setting can't half-apply auth).
@@ -719,24 +743,30 @@ def apply_auth_settings(
         if not current_pass_correct:
             raise AuthSettingsError(_ERR_INCORRECT_CURRENT)
 
+    backend_changed = new_auth_backend != prev_auth_backend
+
     if new_auth_backend != 'auth_basic':
-        return
+        # Turning auth off: nothing to do to the User row (it is kept
+        # so re-enabling doesn't lose the operator), but every open
+        # socket was accepted under the old regime.
+        return backend_changed
 
     if operator is not None:
-        _update_existing_operator(
+        credentials_rotated = _update_existing_operator(
             operator,
             new_username=new_username,
             new_pwd=new_pwd,
             new_pwd_confirm=new_pwd_confirm,
             current_pass_correct=current_pass_correct,
         )
-        return
+        return backend_changed or credentials_rotated
 
     _create_initial_operator(
         new_username=new_username,
         new_pwd=new_pwd,
         new_pwd_confirm=new_pwd_confirm,
     )
+    return True
 
 
 def operator_username() -> str:

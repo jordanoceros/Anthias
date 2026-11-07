@@ -9,6 +9,8 @@ from django.utils import timezone
 from anthias_server.app.models import Asset
 from anthias_server.settings import settings
 
+logger = logging.getLogger(__name__)
+
 # Re-evaluate windowed playlists at most this often. Day-of-week and
 # time-of-day boundaries don't show up in start_date/end_date, so we
 # need a polling cap to ensure transitions are picked up.
@@ -18,12 +20,12 @@ _sysrandom = secrets.SystemRandom()
 
 
 def get_specific_asset(asset_id: str) -> dict[str, Any] | None:
-    logging.info('Getting specific asset')
+    logger.info('Getting specific asset')
     try:
         result: dict[str, Any] = Asset.objects.get(asset_id=asset_id).__dict__
         return result
     except Asset.DoesNotExist:
-        logging.debug('Asset %s not found in database', asset_id)
+        logger.debug('Asset %s not found in database', asset_id)
         return None
 
 
@@ -48,7 +50,7 @@ def generate_asset_list() -> tuple[list[dict[str, Any]], datetime | None]:
       - now + WINDOWED_DEADLINE_CAP_SECONDS, if any asset has a window
         filter (those transitions don't show up in date columns).
     """
-    logging.info('Generating asset-list...')
+    logger.info('Generating asset-list...')
     now = timezone.now()
 
     candidates = list(
@@ -68,7 +70,7 @@ def generate_asset_list() -> tuple[list[dict[str, Any]], datetime | None]:
         _sysrandom.shuffle(playlist)
 
     deadline = _compute_deadline(candidates, active_flags, now)
-    logging.debug(
+    logger.debug(
         'generate_asset_list: %d assets, deadline %s',
         len(playlist),
         deadline,
@@ -117,7 +119,7 @@ def _compute_deadline(
 
 class Scheduler:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        logging.debug('Scheduler init')
+        logger.debug('Scheduler init')
         self.assets: list[dict[str, Any]] = []
         self.counter: int = 0
         self.current_asset_id: str | None = None
@@ -129,7 +131,7 @@ class Scheduler:
         self.update_playlist()
 
     def get_next_asset(self) -> dict[str, Any] | None:
-        logging.debug('get_next_asset')
+        logger.debug('get_next_asset')
 
         if self.extra_asset is not None:
             asset = get_specific_asset(self.extra_asset)
@@ -137,11 +139,19 @@ class Scheduler:
                 self.current_asset_id = self.extra_asset
                 self.extra_asset = None
                 return asset
-            logging.error('Asset not found or processed')
+            # An operator asked to jump to a specific asset that has
+            # since been deleted or is still processing — a benign race
+            # between their action and the asset's state, not a bug.
+            # Warning (not error) so it doesn't page Sentry (ANTHIAS-3V).
+            logger.warning(
+                'Requested asset %s not found or still processing; '
+                'falling back to the playlist',
+                self.extra_asset,
+            )
             self.extra_asset = None
 
         self.refresh_playlist()
-        logging.debug('get_next_asset after refresh')
+        logger.debug('get_next_asset after refresh')
         if not self.assets:
             self.current_asset_id = None
             return None
@@ -153,7 +163,7 @@ class Scheduler:
             idx = self.index
             self.index = (self.index + 1) % len(self.assets)
 
-        logging.debug(
+        logger.debug(
             'get_next_asset counter %s returning asset %s of %s',
             self.counter,
             idx + 1,
@@ -168,10 +178,10 @@ class Scheduler:
         return current_asset
 
     def refresh_playlist(self) -> None:
-        logging.debug('refresh_playlist')
+        logger.debug('refresh_playlist')
         time_cur = timezone.now()
 
-        logging.debug(
+        logger.debug(
             'refresh: counter: (%s) deadline (%s) timecur (%s)',
             self.counter,
             self.deadline,
@@ -179,7 +189,7 @@ class Scheduler:
         )
 
         if self.get_db_mtime() > self.last_update_db_mtime:
-            logging.debug('updating playlist due to database modification')
+            logger.debug('updating playlist due to database modification')
             self.update_playlist()
         elif settings['shuffle_playlist'] and self.counter >= 5:
             # End-of-cycle reshuffle: the current play-through is over,
@@ -189,7 +199,7 @@ class Scheduler:
             self.update_playlist()
 
     def update_playlist(self, *, allow_reshuffle: bool = False) -> None:
-        logging.debug('update_playlist')
+        logger.debug('update_playlist')
         self.last_update_db_mtime = self.get_db_mtime()
         (new_assets, new_deadline) = generate_asset_list()
 
@@ -221,8 +231,8 @@ class Scheduler:
         # is added to the end of the list, we don't want to start over from
         # the beginning.
         self.index = self.index % len(self.assets) if self.assets else 0
-        logging.debug(
-            'update_playlist done, count %s, counter %s, index %s, deadline %s',  # noqa: E501
+        logger.debug(
+            'update_playlist done, count %s, counter %s, index %s, deadline %s',
             len(self.assets),
             self.counter,
             self.index,
@@ -230,8 +240,27 @@ class Scheduler:
         )
 
     def get_db_mtime(self) -> float:
-        # get database file last modification time
-        try:
-            return path.getmtime(settings['database'])
-        except (OSError, TypeError):
+        # Newest mtime across the SQLite database and its WAL sidecars.
+        #
+        # Since the DB is opened with journal_mode=WAL (#3015), commits
+        # are written to ``anthias.db-wal`` and ``anthias.db-shm``; the
+        # main ``anthias.db`` file's mtime stays frozen until a (rare)
+        # checkpoint. Stat'ing only the main file therefore never sees
+        # an asset add/edit, so refresh_playlist() never reloads — most
+        # visibly, the first asset on a fresh install never displays
+        # (its empty playlist has no deadline fallback either). Take the
+        # max over all three so a write bumps the value regardless of
+        # journal mode: WAL commits move ``-wal``/``-shm``, and a
+        # checkpoint moves the main file.
+        database = settings['database']
+        if not database:
             return 0
+
+        newest = 0.0
+        for suffix in ('', '-wal', '-shm'):
+            try:
+                mtime = path.getmtime(database + suffix)
+            except OSError:
+                continue
+            newest = max(newest, mtime)
+        return newest

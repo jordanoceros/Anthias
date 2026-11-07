@@ -1,9 +1,11 @@
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 class AsyncWebsocketConsumer:
     channel_name: str
     channel_layer: Any
     groups: list[str]
+    scope: dict[str, Any]
 
     @classmethod
     def as_asgi(cls, **initkwargs: Any) -> Callable[..., Any]: ...

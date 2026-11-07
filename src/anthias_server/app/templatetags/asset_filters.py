@@ -16,8 +16,8 @@ from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from django.template import Library
-from django.utils.safestring import SafeString, mark_safe
 from django.utils import timezone
+from django.utils.safestring import SafeString, mark_safe
 
 from anthias_server.settings import settings
 
@@ -157,6 +157,16 @@ def _to_dict(obj: Any) -> Any:
                 meta['refresh_interval_s']
             )
             out['metadata'] = meta
+        # Sanitise metadata['headers'] the same way, so a legacy /
+        # hand-edited row can't seed the edit modal's textarea with an
+        # unsafe (CR/LF) value or a non-string blob (#2215).
+        meta = out.get('metadata')
+        if isinstance(meta, dict) and 'headers' in meta:
+            from anthias_server.app.models import normalize_asset_headers
+
+            meta = dict(meta)
+            meta['headers'] = normalize_asset_headers(meta['headers'])
+            out['metadata'] = meta
         return out
     return _coerce(obj)
 
@@ -185,6 +195,28 @@ def to_json(value: Any) -> SafeString:
         .replace('>', '\\u003e')
     )
     return mark_safe(safe)
+
+
+@register.filter
+def asset_ids(assets: Any) -> str:
+    """Render a list of assets as a JSON array of their asset_ids.
+
+    Inlined into the asset-table partial's ``x-init`` so Alpine knows
+    which rows are on screen after every HTMX swap (drives the bulk
+    select-all + selection pruning, #3046).
+
+    Unlike ``to_json`` (which mark_safe's its output because it's
+    embedded in a *single*-quoted Alpine attribute and hand-escapes the
+    apostrophe), this value lands in a *double*-quoted ``x-init="…"``
+    attribute. The JSON's own ``"`` would prematurely close that
+    attribute, so we deliberately return a plain ``str`` and let
+    Django's template autoescaping HTML-encode ``"``/``&``/``<``/``>``
+    to entities — the browser decodes them back to valid JSON before
+    Alpine evaluates the expression. Returning a SafeString here would
+    suppress that escaping and break the markup.
+    """
+    ids = [getattr(a, 'asset_id', '') for a in (assets or [])]
+    return json.dumps(ids, separators=(',', ':'))
 
 
 @register.filter

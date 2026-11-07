@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=84.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "anthias"
-version = "2026.05.1"
+version = "2026.10.0"
 description = "The world's most popular open source digital signage project."
 readme = "README.md"
 requires-python = ">=3.13"
@@ -20,41 +20,41 @@ namespaces = false
 
 [dependency-groups]
 dev-host = [
-    "ansible-lint==26.4.0",
+    "ansible-lint==26.9.0",
     "celery-types==0.26.0",
-    "django-stubs==6.0.3",
-    "djangorestframework-stubs==3.16.9",
-    "mypy==1.18.2",
-    "ruff==0.14.10",
+    "django-stubs==6.1.1",
+    "djangorestframework-stubs==3.18.1",
+    "mypy==2.4.0",
+    "ruff==0.16.10",
     "tenacity==9.1.4",
-    "types-gunicorn==25.3.0.20260408",
-    "types-netifaces==0.11.0.20260408",
-    "types-python-dateutil==2.9.0.20260408",
-    "types-pytz==2026.2.0.20260506",
-    "types-PyYAML==6.0.12.20260408",
-    "types-requests==2.33.0.20260408",
+    "types-gunicorn==26.2.0.20260827",
+    # Direct dev dep: types-psutil used to arrive transitively via
+    # djangorestframework-stubs, which dropped it in 3.17.1 — pin it
+    # directly so the psutil import in the server keeps its stubs.
+    "types-psutil==7.2.2.20260906",
+    "types-python-dateutil==2.9.0.20260807",
+    "types-pytz==2026.4.0.20260926",
+    "types-PyYAML==6.0.12.20260518",
 ]
 docker-image-builder = [
-    "click==8.1.7",
+    "click==8.5.0",
     "jinja2==3.1.6",
-    "pygit2==1.19.1",
-    "requests==2.33.1",
+    "pygit2==1.20.1",
+    "requests==2.34.2",
     "python-on-whales==0.81.0",
 ]
 server = [
-    "cec==0.2.8",
     "celery==5.6.3",
-    "certifi==2026.4.22",
-    "channels==4.3.1",
+    "certifi==2026.7.22",
+    "channels==4.3.2",
     "channels-redis==4.3.0",
-    "Django==5.2.14",
-    "djangorestframework==3.17.1",
-    "django-dbbackup==5.3.0",
-    "django-stubs-ext==6.0.3",
-    "drf-spectacular==0.29.0",
+    "Django==5.2.17",
+    "djangorestframework==3.18.1",
+    "django-dbbackup==5.3.1",
+    "django-stubs-ext==6.1.1",
+    "drf-spectacular==0.30.0",
     "Jinja2==3.1.6",
-    "netifaces==0.11.0",
-    "packaging==26.1",
+    "packaging==26.3",
     # Pillow + pillow-heif power the upload-time image normalisation
     # pipeline (HEIC / HEIF / TIFF → lossless WebP). pillow-heif
     # registers a libheif-backed Pillow plugin at import time; the
@@ -62,63 +62,70 @@ server = [
     # docker/Dockerfile.server.j2). Pillow itself is otherwise unused
     # — adding it here instead of relying on a transitive import keeps
     # the dependency explicit.
-    "Pillow==12.2.0",
-    "pillow-heif==1.3.0",
-    "psutil==7.2.1",
+    #
+    # Pinned to 1.4.0: 1.5.0 requires libheif >= 1.23.1 to build from
+    # source, but Debian trixie ships libheif 1.19.8. arm64/x86 install
+    # a prebuilt wheel so they don't compile and were unaffected, but
+    # armhf (pi2/pi3) has no wheel — uv builds from source and the
+    # compile fails ("pillow_heif requires libheif >= 1.23.1"), breaking
+    # the 32-bit board images and the whole master build matrix. Hold at
+    # 1.4.0 until trixie carries libheif >= 1.23.1 (or a 1.5.x with armhf
+    # wheels lands). Do not let dependabot bump this past 1.4.0.
+    "Pillow==12.3.0",
+    "pillow-heif==1.4.0",
+    "psutil==7.2.2",
     "pydbus==0.6.0",
     "python-dateutil==2.9.0.post0",
-    "pytz==2026.2",
-    "PyYAML==6.0.2",
-    "redis==7.4.0",
-    "requests==2.33.1",
+    "pytz==2026.5",
+    "PyYAML==6.0.3",
+    "redis==8.1.0",
+    "requests==2.34.2",
+    "sentry-sdk==2.71.0",
     "tenacity==9.1.4",
-    "sh==2.2.2",
-    "urllib3==2.7.0",
-    "uvicorn[standard]==0.32.1",
+    "sh==2.4.0",
+    "urllib3==2.8.0",
+    "uvicorn[standard]==0.54.0",
     "whitenoise==6.12.0",
-    "yt-dlp>=2026.3.17",
+    "yt-dlp>=2026.7.4",
 ]
 viewer = [
-    "cec==0.2.8",
-    "certifi==2026.4.22",
-    "Django==5.2.14",
+    "certifi==2026.7.22",
+    "Django==5.2.17",
     "Jinja2==3.1.6",
-    "netifaces==0.11.0",
     "pydbus==0.6.0",
     "python-dateutil==2.9.0.post0",
-    "python-vlc==3.0.21203",
-    "pytz==2026.2",
-    "redis==7.4.0",
-    "requests==2.33.1",
+    "pytz==2026.5",
+    "redis==8.1.0",
+    "requests==2.34.2",
+    "sentry-sdk==2.71.0",
     "tenacity==9.1.4",
-    "sh==2.2.2",
-    "urllib3==2.7.0",
+    "sh==2.4.0",
+    "urllib3==2.8.0",
 ]
 dev = [
-    "pytest==9.0.3",
-    "pytest-cov==6.0.0",
-    "pytest-django==4.12.0",
-    "pytest-mock==3.15.1",
-    "pytest-xdist==3.6.1",
-    "playwright==1.59.0; platform_machine != 'armv7l'",
-    "pytest-playwright==0.7.2; platform_machine != 'armv7l'",
-    "time-machine==2.15.0",
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "pytest-django==4.14.0",
+    "pytest-mock==3.16.0",
+    "pytest-xdist==3.8.0",
+    "playwright==1.63.0; platform_machine != 'armv7l'",
+    "pytest-playwright==0.9.0; platform_machine != 'armv7l'",
+    "time-machine==3.5.1",
 ]
 host = [
-    "ansible-core==2.20.5",
-    "netifaces2==0.0.22",
-    "redis==7.4.0",
-    "requests==2.33.1",
+    "ansible-core==2.21.4",
+    "redis==8.1.0",
+    "requests==2.34.2",
     "tenacity==9.1.4",
 ]
 local = [
-    "click==8.1.7",
-    "requests==2.33.1",
+    "click==8.5.0",
+    "requests==2.34.2",
     "tenacity==9.1.4",
 ]
 website = [
-    "pytest==9.0.3",
-    "requests==2.33.1",
+    "pytest==9.1.1",
+    "requests==2.34.2",
 ]
 test = [
     { include-group = "server" },
@@ -128,26 +135,27 @@ test = [
 # Used by the python-mypy CI job. The django-stubs plugin imports
 # anthias_server.django_project.settings to introspect the app registry, so we need the
 # runtime deps that settings touches — but not the heavy native-extension
-# deps from the server group (cec, netifaces, etc.). We also include
+# deps from the server group (pydbus, psutil, etc.). We also include
 # docker-image-builder so its tools (pygit2, python_on_whales) resolve.
 mypy = [
     { include-group = "dev-host" },
     { include-group = "docker-image-builder" },
-    "channels==4.3.1",
+    "channels==4.3.2",
     "channels-redis==4.3.0",
-    "Django==5.2.14",
-    "django-dbbackup==5.3.0",
-    "django-stubs-ext==6.0.3",
-    "djangorestframework==3.17.1",
-    "drf-spectacular==0.29.0",
+    "Django==5.2.17",
+    "django-dbbackup==5.3.1",
+    "django-stubs-ext==6.1.1",
+    "djangorestframework==3.18.1",
+    "drf-spectacular==0.30.0",
     # Pillow ships PEP 561 stubs (py.typed). The processing module
     # imports PIL at top level, so mypy needs the package resolvable
     # to type-check the upload-time normalisation pipeline.
     # pillow-heif is intentionally not pinned here — it's listed in
     # tool.mypy.overrides above so its missing-import error is
-    # ignored, mirroring the cec / pydbus / sh / vlc pattern.
-    "Pillow==12.2.0",
-    "pytz==2026.2",
+    # ignored, mirroring the pydbus / sh pattern.
+    "Pillow==12.3.0",
+    "pytz==2026.5",
+    "sentry-sdk==2.71.0",
     "whitenoise==6.12.0",
 ]
 
@@ -227,22 +235,28 @@ exclude = [
     # the file header. Adding type annotations would put the file
     # off-pin and silently break the provenance comment.
     "^src/anthias_webview/sysroot-relativelinks\\.py$",
+    # Build-time-only stdlib shims (imp/pipes/cgi) for Chromium 87's
+    # Python-2-era build tooling; not app code, emulate removed stdlib.
+    "^src/anthias_webview/pyshim/",
 ]
 
 [[tool.mypy.overrides]]
 # Third-party libs without type stubs. Listed explicitly so a future stub
 # release is noticed (and the override removed) instead of silently ignored.
-# `channels` itself is covered by partial PEP 561 stubs in stubs/channels-stubs/;
-# only the helpers we actually call are typed there.
+# `channels` and asgiref's untyped `testing` module are covered by partial
+# PEP 561 stubs in stubs/channels-stubs/ and stubs/asgiref-stubs/; only the
+# helpers we actually call are typed there. (asgiref ships py.typed itself,
+# but not for asgiref.testing — the partial marker keeps the real stubs for
+# every other asgiref module.)
 module = [
-    "cec",
+    # Dev-only: emails/render_logo.py, run through `uv run --no-project`.
+    "cairosvg",
     "channels_redis.*",
     "gi",
     "gi.*",
     "pillow_heif",
     "pydbus",
     "sh",
-    "vlc",
     "yt_dlp",
     "yt_dlp.*",
 ]

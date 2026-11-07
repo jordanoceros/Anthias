@@ -4,21 +4,40 @@
 device (``pi4-64``, ``pi5``, ``x86``, or the catch-all ``arm64`` /
 ``generic-arm64`` for every aarch64 SBC it doesn't recognise as a
 Pi). For SoCs whose silicon offers HW decode that the catch-all
-image can address (Rock Pi 4 → RK3399 via v4l2_request), the
-``anthias_host_agent`` process publishes a more specific subtype to
-Redis at ``host:board_subtype`` (e.g. ``'rockpi4'``) by reading
-``/proc/device-tree/model`` on the host.
+image can address (Rock Pi 4 → RK3399 via v4l2_request), a more
+specific subtype (e.g. ``'rockpi4'``) upgrades the key. Two sources,
+in order:
+
+* the ``anthias_host_agent`` process (docker-compose installs)
+  publishes it to Redis at ``host:board_subtype`` by reading
+  ``/proc/device-tree/model`` on the host;
+* when Redis has no value — the agent is down, or never ran —
+  ``get_board_subtype`` falls back to reading the device tree
+  directly via the shared
+  ``anthias_common.device_helper.detect_board_subtype``.
+
+That fallback is weaker than it looks, and the same limit applies to
+the board model below: ``/proc/device-tree`` resolves to
+``/sys/firmware/devicetree/base``, which Docker masks in
+*unprivileged* containers. The server and celery services are
+unprivileged on both docker-compose and balena, so their local read
+yields nothing on every board; only the host and the privileged
+viewer can read it. Redis is therefore the load-bearing path here,
+and balena fleets — which ship no host_agent — have no source at all
+(the ``screenly_ose/anthias-rockpi4`` fleet's codec gate needs one;
+see the device-model note in ``get_device_model``).
 
 Both the server's asset processor (deciding whether to accept a
-codec) and the viewer's hwdec dispatch (deciding which mpv
-``--hwdec=`` value to ask for) need the same upgraded key. This
-module owns the resolution so the two sides don't drift.
+codec) and the viewer need the same upgraded key. This module owns
+the resolution so the two sides don't drift.
 """
 
 from __future__ import annotations
 
 import os
 
+from anthias_common import device_helper
+from anthias_common.device_helper import detect_board_subtype
 from anthias_common.utils import connect_to_redis
 
 # DEVICE_TYPE values that trigger the host_agent subtype lookup.
@@ -28,26 +47,132 @@ from anthias_common.utils import connect_to_redis
 ARM64_DEVICE_TYPES = frozenset({'arm64', 'generic-arm64'})
 
 
-def get_board_subtype() -> str | None:
-    """Return the host_agent-published board subtype, or ``None``.
+def _read_host_key(key: str) -> str:
+    """Return a ``host:*`` fact from Redis as text, ``''`` when absent.
 
-    Any failure (Redis down, key missing, decode error) returns
-    ``None`` so the caller falls back to the raw DEVICE_TYPE.
+    Every failure mode collapses to the empty string — key missing,
+    Redis down, a value that isn't valid UTF-8 — because each caller
+    treats "no value" and "unusable value" the same way: fall through
+    to its own local source.
     """
+    value: object = None
     try:
         r = connect_to_redis()
-        value = r.get('host:board_subtype')
+        value = r.get(key)
     except Exception:
-        return None
+        return ''
     if isinstance(value, bytes):
         try:
-            decoded = value.decode('utf-8')
+            value = value.decode('utf-8')
         except UnicodeDecodeError:
-            return None
-        return decoded.strip().lower() or None
-    if isinstance(value, str):
-        return value.strip().lower() or None
-    return None
+            return ''
+    return value.strip() if isinstance(value, str) else ''
+
+
+def get_board_subtype() -> str | None:
+    """Return the board subtype, or ``None``.
+
+    Redis (the host_agent-published value) is authoritative when
+    present. When it yields nothing — key missing or empty, Redis
+    down, decode error — fall back to reading the device tree
+    directly via ``detect_board_subtype``, which covers the host and
+    the privileged viewer; an unprivileged container gets ``None``
+    from that fallback whatever the board (see the module docstring).
+    Both sources share the same model-string table, so they can't
+    disagree; an unknown board returns ``None`` from both and the
+    caller falls back to the raw DEVICE_TYPE.
+    """
+    return _read_host_key('host:board_subtype').lower() or (
+        detect_board_subtype()
+    )
+
+
+def get_device_model() -> str:
+    """Return the host's device-tree board model, ``''`` when unknown.
+
+    ``anthias_host_agent`` publishes ``host:device_model`` at startup
+    from the host's ``/proc/device-tree/model``. The server has to
+    read it from there rather than opening the file itself: Docker
+    masks ``/sys/firmware`` in unprivileged containers, so the
+    in-container read returns nothing on every SBC. The local read is
+    kept as the fallback for the contexts that *can* do it — the host
+    itself and the privileged viewer.
+
+    ``''`` on x86 (no device tree), on an unrecognised host, and on
+    balena, whose fleets run no host_agent and whose server container
+    is unprivileged — those devices keep the old generic label until
+    balena grows a host-side publisher.
+
+    Sanitised on the way out even though the host_agent already
+    sanitises on the way in: this side can't verify who wrote the key,
+    and the value goes straight to a rendered page and an API
+    response. Cheap, and it keeps the guarantee local to the reader.
+    """
+    published = device_helper.sanitize_firmware_string(
+        _read_host_key('host:device_model')
+    )
+    return published or device_helper.read_device_tree_model()
+
+
+def get_device_model_parts() -> tuple[str, str]:
+    """(primary, secondary) device label for the System Info card.
+
+    Wraps ``device_helper.get_device_model_parts`` with the board name
+    resolved through Redis, so an unprivileged container labels an SBC
+    'FriendlyElec NanoPi R3S LTS' instead of falling all the way
+    through to 'Generic aarch64 Device'. Pi and x86 hosts are
+    unaffected: both name themselves through sources the container can
+    already read (cpuinfo ``Model``, DMI).
+    """
+    return device_helper.get_device_model_parts(get_device_model() or None)
+
+
+def get_total_mem_kb() -> int | None:
+    """Return the host's MemTotal in kibibytes from Redis, or ``None``.
+
+    ``anthias_host_agent`` publishes ``host:total_mem_kb`` at startup
+    by reading ``/proc/meminfo`` on the host. The server reads this
+    instead of opening ``/proc/meminfo`` itself so the value is
+    consistent across server and viewer (both observe whatever the
+    host_agent measured).
+
+    ``None`` means "unknown" — host_agent never ran, redis is down,
+    or the key was written empty because /proc/meminfo couldn't be
+    read. Callers treat unknown as "don't restrict" rather than
+    locking the operator out from uploads on a measurement gap.
+    """
+    value = _read_host_key('host:total_mem_kb')
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+# Boards with less than this much MemTotal can't keep two QtWebEngine
+# renderers resident *and* play 1080p+ video without OOM-thrashing
+# through swap (measured 1 GB Rock Pi 4: ~440 MB idle viewer RSS, OOM
+# loop on 4K HEVC load). 1.5 GiB is the cleanest cut between 1 GB and
+# 2 GB SKUs in the supported fleet — Pi 2/Pi 3 1GB, Pi 4 1GB, Rock Pi
+# 4 1GB fall below; every 2 GB+ SKU sits above. Tests can compare
+# against this directly rather than re-hardcoding the threshold.
+LOW_RAM_THRESHOLD_KB = 1_572_864  # 1.5 GiB in kibibytes
+
+
+def is_low_ram_device() -> bool:
+    """``True`` when the host has less than ``LOW_RAM_THRESHOLD_KB``.
+
+    Returns ``False`` when total RAM is unknown — uploading is the
+    operator action we'd rather over-accept than block on a missing
+    measurement. The codec gate keeps its existing per-codec
+    rejection regardless of this flag, so an "unknown RAM" device
+    still gets the codec safety net.
+    """
+    total = get_total_mem_kb()
+    if total is None:
+        return False
+    return total < LOW_RAM_THRESHOLD_KB
 
 
 def resolve_device_key() -> str:

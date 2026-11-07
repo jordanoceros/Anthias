@@ -1,11 +1,11 @@
-import ipaddress
+import errno
 import json
 import logging
 import os
 import random
 import re
-import socket
 import string
+import warnings
 from datetime import datetime, timedelta
 from os import getenv, utime
 from platform import machine
@@ -18,6 +18,7 @@ import pytz
 import redis
 import requests
 import sh
+import urllib3
 from tenacity import (
     RetryError,
     Retrying,
@@ -26,6 +27,8 @@ from tenacity import (
 )
 
 from anthias_server.settings import settings
+
+logger = logging.getLogger(__name__)
 
 arch = machine()
 
@@ -53,6 +56,46 @@ def clamp_screen_rotation(value: Any) -> int:
     return rotation if rotation in SCREEN_ROTATION_CHOICES else 0
 
 
+# Where chunked browser uploads stage their partial file, under the
+# asset dir. Shared with the cleanup sweep and the backup filter so the
+# name cannot drift from the code writing into it.
+#
+# It has to be the asset dir, tempting as ~/.anthias looks for
+# something never meant to be served: docker-compose.yml.tmpl
+# bind-mounts .anthias and anthias_assets separately, and rename(2)
+# across two mounts is EXDEV even on one filesystem — the commit would
+# become a full copy of a multi-GB file onto an SD card, needing twice
+# the free space. views_files closes the fetchability that costs us,
+# for this and for the API and import staging files already here.
+STAGED_UPLOAD_DIR = '.uploads'
+
+# How long a partial survives without being written to. An abandoned
+# upload cannot be resumed, so holding it longer only occupies the
+# card, and the hour every other stray file in the asset dir gets
+# covers a slow upload still in progress. One swept mid-upload trips
+# the offset guard in _stage_upload_chunk: loud, not corrupt.
+STAGED_UPLOAD_MAX_AGE_MIN = 60
+
+
+# Operator-facing message for ENOSPC during an upload — shared by the
+# HTML upload toast and the API's 507 response so the wording can't
+# drift between surfaces (Sentry ANTHIAS-3K).
+DISK_FULL_ERROR = (
+    'The device disk is full. Free up space — for example by deleting '
+    'unused assets — and try again.'
+)
+
+
+def is_disk_full(exc: OSError) -> bool:
+    """True when ``exc`` is ENOSPC — the device disk is full.
+
+    Upload paths turn this into an actionable operator message
+    instead of a 500: a full disk is a device-capacity condition,
+    not a code bug (Sentry ANTHIAS-3K).
+    """
+    return exc.errno == errno.ENOSPC
+
+
 def string_to_bool(string: Any) -> bool:
     # Direct port of distutils.util.strtobool (removed in Python 3.12)
     # so existing callers keep accepting the same y/yes/t/true/on/1 set.
@@ -73,7 +116,7 @@ def is_ci() -> bool:
     """
     Returns True when run on CI.
     """
-    return string_to_bool(os.getenv('CI', False))
+    return string_to_bool(os.getenv('CI', 'false'))
 
 
 def validate_url(string: str) -> bool:
@@ -88,12 +131,18 @@ def validate_url(string: str) -> bool:
     True
     >>> validate_url("https://wireload.net/logo.png")
     True
+    >>> validate_url("rtsp://camera.local/stream")
+    True
+    >>> validate_url("rtmp://media.example.com/live")
+    False
     """
 
     checker = urlparse(string)
-    return bool(
-        checker.scheme in ('http', 'https', 'rtsp', 'rtmp') and checker.netloc
-    )
+    # rtmp is intentionally excluded: Qt6's QMediaPlayer (FFmpeg
+    # backend) can't open it — see remote_video._STREAM_SCHEMES — so
+    # accepting it would only let an operator add a stream that renders
+    # black on the screen.
+    return bool(checker.scheme in ('http', 'https', 'rtsp') and checker.netloc)
 
 
 def get_balena_supervisor_api_response(
@@ -139,12 +188,22 @@ def get_balena_device_info(
     )
 
 
-def shutdown_via_balena_supervisor() -> requests.Response:
-    return get_balena_supervisor_api_response(method='post', action='shutdown')
+def shutdown_via_balena_supervisor(
+    *,
+    timeout: float | tuple[float, float] | None = None,
+) -> requests.Response:
+    return get_balena_supervisor_api_response(
+        method='post', action='shutdown', timeout=timeout
+    )
 
 
-def reboot_via_balena_supervisor() -> requests.Response:
-    return get_balena_supervisor_api_response(method='post', action='reboot')
+def reboot_via_balena_supervisor(
+    *,
+    timeout: float | tuple[float, float] | None = None,
+) -> requests.Response:
+    return get_balena_supervisor_api_response(
+        method='post', action='reboot', timeout=timeout
+    )
 
 
 def get_balena_supervisor_version() -> str:
@@ -167,7 +226,7 @@ def get_node_ip() -> str:
 
     * **Balena:** one API call to the local supervisor.
     * **Bare metal:** the ``anthias-host-agent`` systemd unit runs on the
-      host, enumerates real interfaces with netifaces, and writes the
+      host, enumerates real interfaces over rtnetlink, and writes the
       results to Redis. This function publishes ``hostcmd:
       set_ip_addresses`` to trigger a refresh, waits up to ~80s
       (60s ``host_agent_ready`` + 20s ``ip_addresses_ready``) for
@@ -195,7 +254,7 @@ def get_node_ip() -> str:
                 break
 
             if retries >= max_retries:
-                logging.info(
+                logger.info(
                     'host_agent_service is not ready after %d retries',
                     max_retries,
                 )
@@ -220,11 +279,11 @@ def get_node_ip() -> str:
                     if json.loads(ip_addresses_ready):
                         break
                     else:
-                        raise Exception(
+                        raise RuntimeError(
                             'Internet connection is not available.'
                         )
         except RetryError:
-            logging.warning('Internet connection is not available. ')
+            logger.warning('Internet connection is not available. ')
 
         ip_addresses = r.get('ip_addresses')
 
@@ -305,9 +364,7 @@ def get_node_mac_address() -> str:
         headers = {'Content-Type': 'application/json'}
 
         r = requests.get(
-            '{}/v1/device?apikey={}'.format(
-                balena_supervisor_address, balena_supervisor_api_key
-            ),
+            f'{balena_supervisor_address}/v1/device?apikey={balena_supervisor_api_key}',
             headers=headers,
         )
 
@@ -413,7 +470,7 @@ def get_active_connections(
     if not fields:
         fields = ['Id', 'Uuid', 'Type', 'Devices']
 
-    connections = list()
+    connections = []
 
     try:
         nm_proxy = bus.get(
@@ -435,14 +492,14 @@ def get_active_connections(
             'org.freedesktop.DBus.Properties'
         ]
 
-        connection = dict()
+        connection = {}
         for field in fields:
             field_value = active_connection_properties.Get(
                 'org.freedesktop.NetworkManager.Connection.Active', field
             )
 
             if field == 'Devices':
-                devices = list()
+                devices = []
                 for device_path in field_value:
                     device_proxy = bus.get(
                         'org.freedesktop.NetworkManager', device_path
@@ -505,10 +562,10 @@ def get_video_duration(file: str) -> timedelta | None:
     try:
         run_player = sh.Command('ffprobe')('-i', file, _err_to_out=True)
     except sh.CommandNotFound:
-        logging.warning('ffprobe is not installed; cannot determine duration')
+        logger.warning('ffprobe is not installed; cannot determine duration')
         return None
     except sh.ErrorReturnCode_1 as err:
-        raise Exception('Bad video format') from err
+        raise RuntimeError('Bad video format') from err
 
     for line in run_player.split('\n'):
         if 'Duration' in line:
@@ -532,7 +589,7 @@ def handler(obj: Any) -> str:
         return with_tz.isoformat()
     else:
         raise TypeError(
-            f'Object of type {type(obj)} with value of {repr(obj)} '
+            f'Object of type {type(obj)} with value of {obj!r} '
             'is not JSON serializable'
         )
 
@@ -541,63 +598,21 @@ def json_dump(obj: Any) -> str:
     return json.dumps(obj, default=handler)
 
 
-def _is_private_address(host: str) -> bool:
-    """True when the resolved host points at a private/loopback range.
-
-    SSRF defence — the asset-revalidation sweep is a celery task that
-    fetches operator-supplied URIs. Without this guard, an authenticated
-    operator could store http://192.168.x.x/internal-admin and use the
-    sweep as a probe of the host's LAN, leaking reachable services.
-
-    Operators on a trusted intranet (signage running entirely against
-    LAN content) can opt back in with the ANTHIAS_ALLOW_PRIVATE_FETCH
-    env var; defaults to off.
-    """
-    if os.getenv('ANTHIAS_ALLOW_PRIVATE_FETCH', '').lower() in (
-        '1',
-        'true',
-        'yes',
-    ):
-        return False
-    if not host:
-        return False
-    try:
-        # AF_UNSPEC so we cover both IPv4 and IPv6 results from DNS.
-        infos = socket.getaddrinfo(host, None)
-    except (socket.gaierror, UnicodeError):
-        return False
-    for info in infos:
-        try:
-            addr = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            continue
-        if (
-            addr.is_private
-            or addr.is_loopback
-            or addr.is_link_local
-            or addr.is_multicast
-            or addr.is_reserved
-        ):
-            return True
-    return False
-
-
-def url_fails(url: str) -> bool:
+def url_fails(url: str, verify_ssl: bool | None = None) -> bool:
     """
     If it is streaming
+
+    ``verify_ssl`` controls TLS certificate verification for the HTTP(S)
+    reachability probe. ``None`` (the default) reads the device-wide
+    ``verify_ssl`` setting, preserving the behaviour of existing
+    callers. Callers that know a per-asset override (``Asset.
+    skip_ssl_verify``) pass the already-composed effective flag so a
+    trusted self-signed host isn't wrongly marked unreachable.
     """
-    parsed = urlparse(url)
-    # Reject URLs whose host resolves into a private / loopback /
-    # link-local / multicast / reserved range. Treats failure-to-fetch
-    # as `True` (the sweep marks the asset un-reachable) — safe-failing
-    # behaviour: a URL we won't fetch shouldn't be flagged 'reachable'.
-    if parsed.scheme in (
-        'http',
-        'https',
-        'rtsp',
-        'rtmp',
-    ) and _is_private_address(parsed.hostname or ''):
-        return True
+    # Note: no private/LAN-address filtering here. Serving signage from
+    # a LAN host (an intranet dashboard, a sibling Docker container, a
+    # NAS on 192.168.x.x) is a first-class Anthias use case, so the
+    # reachability probe treats private ranges exactly like any other.
     if urlparse(url).scheme in ('rtsp', 'rtmp'):
         # ffprobe ships with ffmpeg, which is already in the base
         # image. Exit code 0 means libavformat could open the stream
@@ -616,7 +631,7 @@ def url_fails(url: str) -> bool:
                 _timeout=15,
             )
         except sh.CommandNotFound:
-            logging.warning(
+            logger.warning(
                 'ffprobe is not installed; skipping streaming URL probe'
             )
             return False
@@ -628,40 +643,70 @@ def url_fails(url: str) -> bool:
     Try HEAD and GET for URL availability check.
     """
 
-    # Use Certifi module and set to True as default so users stop
-    # seeing InsecureRequestWarning in logs.
+    verify_flag = settings['verify_ssl'] if verify_ssl is None else verify_ssl
     verify: str | bool
-    if settings['verify_ssl']:
+    if verify_flag:
+        # Pin verification to the certifi CA bundle so a stale system
+        # trust store can't spuriously fail an otherwise-valid origin.
         verify = certifi.where()
     else:
-        verify = True
+        # verify_ssl is off — the operator has opted into trusting
+        # self-signed / untrusted-CA hosts (e.g. an intranet media
+        # server). Pass verify=False so requests skips certificate
+        # validation; anything else (True, or a certifi bundle path)
+        # still validates and would wrongly mark such a host
+        # unreachable, defeating the setting. Regressed to `True` in
+        # 2019 (commit c1dd61ce); restored here.
+        verify = False
 
     headers = {
-        'User-Agent': 'Mozilla/5.0 (X11; Linux armv7l) AppleWebKit/538.15 (KHTML, like Gecko) Version/8.0 Safari/538.15'  # noqa: E501
+        'User-Agent': 'Mozilla/5.0 (X11; Linux armv7l) AppleWebKit/538.15 (KHTML, like Gecko) Version/8.0 Safari/538.15'
     }
     try:
         if not validate_url(url):
             return False
 
-        if requests.head(
-            url,
-            allow_redirects=True,
-            headers=headers,
-            timeout=10,
-            verify=verify,
-        ).ok:
-            return False
+        with warnings.catch_warnings():
+            if verify is False:
+                # The operator explicitly disabled verification; silence
+                # the InsecureRequestWarning urllib3 raises per request so
+                # a reachability sweep doesn't spam the logs. Scoped to
+                # this block rather than a process-global
+                # disable_warnings() so it can't leak to other requests
+                # elsewhere in the process — catch_warnings restores the
+                # prior filter state on exit.
+                warnings.simplefilter(
+                    'ignore', urllib3.exceptions.InsecureRequestWarning
+                )
 
-        if requests.get(
-            url,
-            allow_redirects=True,
-            headers=headers,
-            timeout=10,
-            verify=verify,
-        ).ok:
-            return False
+            if requests.head(
+                url,
+                allow_redirects=True,
+                headers=headers,
+                timeout=10,
+                verify=verify,
+            ).ok:
+                return False
 
-    except (requests.ConnectionError, requests.exceptions.Timeout):
+            if requests.get(
+                url,
+                allow_redirects=True,
+                headers=headers,
+                timeout=10,
+                verify=verify,
+            ).ok:
+                return False
+
+    except requests.exceptions.RequestException:
+        # Any requests-level failure means we could not confirm the URL
+        # is reachable, so fall through to the ``True`` (unreachable)
+        # verdict rather than letting the exception escape and 500 a
+        # caller like asset creation — the probe's contract is a boolean.
+        # Covers DNS / refused connections (ConnectionError), TLS
+        # handshake / untrusted-cert failures (SSLError, a
+        # ConnectionError subclass), slow origins (Timeout), and redirect
+        # loops (TooManyRedirects, which ``allow_redirects=True`` can hit
+        # and which is *not* a ConnectionError) alike.
         pass
 
     return True
@@ -676,7 +721,7 @@ def is_demo_node() -> bool:
     Check if the environment variable IS_DEMO_NODE is set to 1
     :return: bool
     """
-    return string_to_bool(os.getenv('IS_DEMO_NODE', False))
+    return string_to_bool(os.getenv('IS_DEMO_NODE', 'false'))
 
 
 def generate_perfect_paper_password(
@@ -692,7 +737,7 @@ def generate_perfect_paper_password(
     :return: string
     """
     ppp_letters = (
-        '!#%+23456789:=?@ABCDEFGHJKLMNPRSTUVWXYZabcdefghjkmnopqrstuvwxyz'  # noqa: E501
+        '!#%+23456789:=?@ABCDEFGHJKLMNPRSTUVWXYZabcdefghjkmnopqrstuvwxyz'
     )
     if not has_symbols:
         ppp_letters = ''.join(set(ppp_letters) - set(string.punctuation))
@@ -714,4 +759,4 @@ def is_balena_app() -> bool:
     Checks the application is running on Balena Cloud
     :return: bool
     """
-    return bool(getenv('BALENA', False))
+    return bool(getenv('BALENA', ''))

@@ -6,9 +6,9 @@ stack, or `src/anthias_viewer/media_player.py`.
 
 The viewer is tuned per-board (see `media_player.py` and `bin/start_viewer.sh`):
 
-| Device   | Qt platform | Compositor | mpv VO                          |
-|----------|-------------|-----------|---------------------------------|
-| Pi 2 / 3 | Qt5 linuxfb | none       | VLC                              |
+| Device   | Qt platform | Compositor | video output                     |
+|----------|-------------|-----------|----------------------------------|
+| Pi 1/2/3 | Qt5 linuxfb | none       | GStreamer `v4l2h264dec ! v4l2convert ! fbdevsink` |
 | Pi 4-64  | Qt6 linuxfb | none       | `--vo=gpu --gpu-context=drm`     |
 | Pi 5     | Qt6 wayland | cage       | `--vo=gpu --gpu-context=wayland` |
 | arm64    | Qt6 wayland | cage       | `--vo=gpu --gpu-context=wayland` |
@@ -17,6 +17,83 @@ The viewer is tuned per-board (see `media_player.py` and `bin/start_viewer.sh`):
 Each combination has different hwdec, scaling, and compositing characteristics,
 so a regression on one board can hide behind a clean run on another. Run the
 same asset rotation everywhere and compare drop counts.
+
+### Pi 1 / 2 / 3 video: GStreamer V4L2 → fbdev (`GstFbdevMediaPlayer`)
+
+The Qt5 linuxfb boards play video by spawning the
+`anthias_viewer/gst_fbdev_player.py` helper, which runs a GStreamer `playbin`
+with a fully-hardware sink: `v4l2h264dec` (auto-plugged by decodebin at PRIMARY
+rank) decodes on the `bcm2835-codec` (`/dev/video10`), `v4l2convert`
+hardware-scales and color-converts (YUV→framebuffer format) on the bcm2835 ISP,
+and `fbdevsink` paints frames straight to the framebuffer (`/dev/fb0`). The
+helper loops the clip gaplessly in-process (playbin `about-to-finish` — issue
+#2987: the original `gst-launch` relaunch-on-EOS loop froze the last frame for
+seconds of pipeline rebuild per iteration), pins aspect-fit output caps
+discovered from the decoder's CAPS event so portrait/4:3 content letterboxes
+instead of stretching (`fbdevsink` ignores pixel-aspect-ratio and centers
+smaller-than-fb frames), and caps the sink-side frame rate at 30 fps
+(`videorate drop-only=true` — the decode→ISP→memcpy chain sustains ~40 fps at
+1080p, so 50/60 fps sources drop to an even half-cadence instead of juddering
+on irregular late-frame drops). This is deliberate: on a
+bare linuxfb console with no compositor, a uid-1000 process **cannot acquire DRM
+master** (the viewer's python process already holds `card0`), so every
+DRM/KMS-master video output fails — VLC's `kms` vout and mpv's `--vo=drm` both
+return `EBUSY`/`EPERM`, and the rpidistro VLC `drm_vout` only knows how to lease
+a connector from a Wayland/X compositor (`Failed to get xlease`). fbdev needs
+none of that.
+
+History: these boards used to play video with VLC's Broadcom `--vout=mmal_vout`
+(HW decode **and** HW scale/convert/scanout, no DRM master). The Bookworm
+upgrade (#1980) dropped `mmal`, and nothing replaced the vout, so VLC silently
+rendered to nowhere — `Showing asset … (video)` was logged but the screen
+stayed black on *every* OS version. `GstFbdevMediaPlayer` is the modern
+equivalent and drives the **same VPU + ISP silicon** mmal used: decode, scale,
+and color-convert all stay in hardware, only the final fbdev write is a CPU
+memcpy. On a Pi 3 it sustains 1080p30 → rgb565 at ~40 fps with zero dropped
+frames. (An interim `ffmpeg → fbdev` attempt was abandoned: the bcm2835 HW
+*decode* worked, but doing the YUV→RGB convert + scale on the ARM CPU via
+swscale managed only ~6 fps to rgb565 — swscale has no NEON rgb565 path and CPU
+scaling is unaccelerated. `v4l2convert` moves that work back onto the ISP.)
+`playbin` is used so demux is container-agnostic, the HW decoder is auto-plugged,
+and a clip with no audio track degrades gracefully. Validate with the BBB sample
+pack below and confirm `dropped: 0` at the source framerate.
+
+> **Note:** validated on a Pi 3 (the only linuxfb board in the testbed pool).
+> Pi 1 / Pi 2 share the same VideoCore IV decode + ISP block, so the hardware
+> path is identical; their slower ARM cores only affect demux/parse + the fb
+> memcpy, not the offloaded decode/scale/convert.
+
+#### Screen rotation and video on Pi 1 / 2 / 3
+
+`screen_rotation` interacts badly with video on these boards, and the outcome
+depends on the angle — because VideoCore IV has **no rotate control at all**.
+`v4l2-ctl -l` on the ISP (`/dev/video12`) exposes only `horizontal_flip` and
+`vertical_flip`; no bcm2835 video device exposes `V4L2_CID_ROTATE`. (The same
+limit shows up on the pi3-64 vc4 DRM plane, which offers 0°/180° + reflect
+only — forum 6730.)
+
+| `screen_rotation` | path | Pi 2, 1080p30 |
+|---|---|---|
+| 0 | all hardware | ~27 fps |
+| 180 | ISP `horizontal_flip` + `vertical_flip` | ~27 fps |
+| 90 / 270 | software `videoflip` (no HW path) | **~2 fps** |
+
+* **180 is free.** hflip + vflip compose to a 180 rotation and ride along on
+  the `v4l2convert` pass that already does the aspect-fit scale, so the
+  pipeline stays fully hardware and the result is pixel-identical to the
+  software rotation.
+* **90 / 270 are effectively unsupported for video on Pi 1 / 2 / 3** (issue
+  #3198). The quarter turns need a transpose, which no VideoCore IV block can
+  do, so `videoflip` rotates each full-resolution frame on a single CPU core
+  and 1080p collapses to ~2 fps. The picture is *correct*, just far too slow to
+  use. Rotating still images and web pages costs nothing per frame and is
+  unaffected — this limit is video-only. **Use a Pi 4 / Pi 5 for
+  portrait-mounted video**, where the platform layer rotates instead.
+
+Note that reordering to scale-before-flip does not rescue 90/270: the case that
+actually matters — portrait content on a portrait-mounted panel — rotates to
+exactly fill the framebuffer, so there is no downscale to exploit ahead of the
+flip (measured slightly *worse*, 1.9 vs 2.1 fps).
 
 ## Goal: hardware-accelerated playback on every board
 
@@ -78,22 +155,229 @@ upstream of the upload.
 ## Rock Pi 4 / arm64
 
 `bin/install.sh` sets `DEVICE_TYPE=arm64` for every aarch64 SBC it doesn't
-recognise as a Pi. `anthias_host_agent` runs on the host and reads
-`/proc/device-tree/model`; when it sees "Radxa ROCK Pi 4" it writes
-`host:board_subtype = 'rockpi4'` to Redis. The viewer reads that key to
-upgrade its `--hwdec=` choice from the catch-all `arm64` default to the
-RK3399-specific `--hwdec=drm-copy` (v4l2_request, served by `rkvdec` for HEVC
-and the Hantro VPU for H.264).
+recognise as a Pi. The board subtype that upgrades that catch-all comes
+from `anthias_common.device_helper.detect_board_subtype` (the single
+source of the model-string table — "Radxa ROCK Pi 4" → `'rockpi4'`),
+consumed through two paths:
+
+* on docker-compose installs, `anthias_host_agent` runs on the host,
+  detects the subtype, and publishes `host:board_subtype` to Redis;
+* when Redis has no value — the agent is down, or never ran —
+  `anthias_common.board` falls back to reading `/proc/device-tree/model`
+  directly from inside the container.
+
+**That fallback does not work in the server/celery containers.**
+`/proc/device-tree` is a symlink to `/sys/firmware/devicetree/base`, and
+`/sys/firmware` is on Docker's default masked-paths list, so an
+unprivileged container reads an empty directory on every board. Measured on
+a NanoPi R3S LTS: readable on the host and in the privileged `anthias-viewer`
+container, empty in `anthias-server` / `anthias-celery`. A bind mount onto
+the masked path stays empty too. The practical consequences: on
+docker-compose installs the host_agent's Redis value is the only working
+source, and on balena — no host_agent, unprivileged server container — the
+subtype has no source at all, so the `screenly_ose/anthias-rockpi4` fleet's
+codec gate does not actually get upgraded there. Fixing balena needs a
+host-side publisher (or `io.balena.features.sysfs` plus a path change);
+untested so far.
+
+The server uses the resolved key to pick the right entry in
+`processing._HW_DECODE_VIDEO_CODECS` — Rock Pi 4 accepts H.264 + HEVC
+uploads, the catch-all `arm64` accepts nothing (because we can't certify
+a decoder on an unknown SBC).
+
+The balena fleet (`screenly_ose/anthias-rockpi4`, device type
+`rockpi-4b-rk3399`) deploys the generic **arm64** container images — there
+is no rockpi4-specific image build; only the balenaOS device type and the
+fleet are board-specific. `bin/balena_ota_deploy.sh` owns that mapping.
 
 The arm64 viewer image pulls `ffmpeg` and the libav* family from
 `archive.raspberrypi.com` (the `+rpt1` build), which adds
 `--enable-v4l2-request --enable-libudev --enable-vout-drm` — the same package
-family Pi 4 / Pi 5 use, so the RK3399's stateless decoders are reachable via
-the same mpv flag. The `start_viewer.sh` entrypoint creates the `/dev/video-dec*`
-symlinks the v4l2_request decoder discovery code expects (privileged docker
-mounts its own /dev tmpfs without udev's symlinks). The `+rpt1` repo is pinned
-to only override ffmpeg + libav* + mpv on arm64; Pi userspace baseline is
-unaffected on every board.
+family Pi 4 / Pi 5 use. The `start_viewer.sh` entrypoint creates the
+`/dev/video-dec*` symlinks the v4l2_request decoder discovery code expects
+(privileged docker mounts its own /dev tmpfs without udev's symlinks). The
+`+rpt1` repo is pinned to only override ffmpeg + libav* on arm64; Pi
+userspace baseline is unaffected on every board.
+
+### Decode path (post-#2905)
+
+Playback runs through QtMultimedia (`QMediaPlayer` rendering into a QML
+`VideoOutput` hosted in a `QQuickWidget` — issue #2967 replaced the original
+`QGraphicsVideoItem` substrate, whose per-frame `toImage()` GPU→CPU readback
+capped presentation at 8–12 fps) embedded in `AnthiasViewer`. Qt 6.5 dropped
+the upstream gstreamer media backend, so Debian Trixie ships only the
+ffmpeg-backed `libffmpegmediaplugin.so`, which calls libavcodec internally.
+The libmpv subprocess and the per-codec `--hwdec=` dispatch the prior viewer
+revisions relied on are both gone — Anthias no longer hand-selects a decoder.
+**As a consequence: libavcodec's default decoder choice is what runs on this
+board.**
+
+### Known hardware-decode limitation on RK3399
+
+On-device validation against Armbian community 6.18 (`rkvdec` mainline driver)
+confirmed that QtMultimedia's libavcodec backend does **not** request a
+hwaccel — `ffmpeg -i sample.mp4 -f null -` picks `h264 (native)` / `hevc
+(native)` (software). Forcing `-hwaccel drm` engages rkvdec via
+`/dev/media0,/dev/video2` (the stateless v4l2_request entry point), but the
+Armbian 6.18 driver produces `frame_post_process: Decode fail` errors at
+0.77× real-time. The H.264 path (`rk3399-vpu-dec` / Hantro VPU) has no
+libavcodec `v4l2_request` binding in the `+rpt1` 7.1.3 build — it would have
+to ship through `h264_v4l2m2m`, but that wrapper is stateful and the RK3399
+nodes are stateless, so the M2M discovery fails with "Could not find a valid
+device".
+
+Practical state on Rock Pi 4 today:
+
+* H.264 1080p30 SW-decode delivers ~99 % of frames on the A72 (measured: 1
+  dropped per 14 s); below the threshold where HW would matter.
+* HEVC 1080p30 SW-decode drops ~22 % even with 5 idle cores — single-thread
+  libavcodec stall + paging on 1 GB SKUs.
+* 4K HEVC OOM-kills the viewer container on 1 GB SKUs and is rejected at
+  upload by the low-RAM resolution gate (see "Low-RAM mode" below).
+
+Fixing this requires either an upstream `rkvdec` driver fix landing in
+Debian-shipped Armbian kernels, or a v4l2_request H.264 binding in libavcodec
+that targets Hantro's stateless API. Both are outside the Anthias repo;
+Anthias does not maintain a custom kernel or distro
+(["we don't want to maintain our own Yocto distro"]). When that day comes,
+the QtMultimedia side will also need a hwaccel-selection hook — Qt 6.5+ has
+no public knob today.
+
+### RK3566 (NanoPi R3S LTS) — measured playback envelope
+
+Same image as the device-tree section above. Decode is software throughout:
+the arm64 viewer image's Qt 6 multimedia backend is `libffmpegmediaplugin.so`,
+and that libavcodec exposes only the stateful `*_v4l2m2m` wrappers, which
+cannot drive RK3566's stateless rkvdec (the RK3399 mismatch again).
+
+Decode throughput, measured in the viewer image against 20 s noise-heavy
+1080p30 clips:
+
+```
+$ ffmpeg -hide_banner -benchmark -i clip.mp4 -f null -
+...
+bench: utime=25.197s stime=0.714s rtime=7.802s
+```
+
+`rtime` is the wall clock for the whole decode, so 20 s of video in 7.8 s is
+2.56x real time:
+
+| codec | rtime for 20 s | speed |
+| --- | --- | --- |
+| H.264 | 7.8 s | 2.56x real time |
+| HEVC | 17.5 s | 1.15x real time |
+
+End-to-end playback on the attached 4K panel (cage/wayland, viewer
+rendering to the display, 30 s H.264 clips at 8 Mbit/s 1080p and 4 Mbit/s
+720p):
+
+| clip | viewer container CPU | host idle | viewer RSS |
+| --- | --- | --- | --- |
+| 1080p30 | 200-240 % of 400 % | ~28 % | ~990 MiB |
+| 720p30 | 100-130 % of 400 % | ~58 % | ~890 MiB |
+
+Frames advance in both cases (successive `grim` captures differ). The
+numbers are the argument for the envelope in
+`processing._HW_DECODE_VIDEO_CODECS`: H.264 only, capped at 1080p by
+`_SW_DECODE_MAX_PIXELS`. HEVC at 1.15x leaves nothing for the compositor,
+and 4K H.264 is ~4x the 1080p work, which lands under real time.
+
+Note the RSS column against the container's 1.54 GiB cap: at 1080p the
+viewer sits around 990 MiB before anything else runs, so memory is as
+close to the limit as CPU is on this 2 GB board.
+
+Caveat on the drop question: neither the Qt path nor this board exposes a
+frame-drop counter — `ANTHIAS_DEBUG_DROPS` and `~/.anthias/mpv.log` in the
+sections above belong to the retired mpv subprocess player and do nothing
+here. Drops on real content are an operator observation, not something
+these measurements quantify. Wiring a drop counter into the QtMultimedia
+path is the missing instrument.
+
+### Low-RAM mode
+
+Boards with less than 1.5 GiB MemTotal (Pi 2/Pi 3 1GB, Pi 4 1GB, Rock Pi 4
+1GB, generic-arm64 1GB SKUs) run in a degraded "low-RAM" mode:
+
+* `anthias_host_agent` publishes `host:total_mem_kb` to Redis;
+  `anthias_server.processing` rejects uploads above 1920×1080 with the
+  existing recipe machinery (`-vf scale=1920:1080:force_original_aspect_ratio=decrease`).
+* The diagnostics page's Memory card surfaces a "Low-RAM mode" banner so
+  operators can see *why* the device degraded.
+
+The single-`QWebEngineView` renderer is **not** low-RAM-specific — every
+board runs it. The viewer used to instantiate a second, off-screen
+`QWebEngineView` to preload the next URL asset and swap it in, gated on
+`ANTHIAS_LOW_RAM` so 1 GB boards skipped the ~100 MB extra renderer. That
+preload path is gone (issue #2954): on the single fullscreen surface the Qt6
+boards use (Wayland/cage on Pi 5 / x86, eglfs on pi4-64) a hidden
+`QWebEngineView` is frame-throttled by Chromium and never composited the
+preloaded page, so revealing it flashed the *stale* page it had last shown
+two rotations earlier for ~1 frame on every webpage transition. Collapsing
+to one view fixed the flash and reclaimed the ~100 MB on all 2 GB+ boards
+too.
+
+The 1.5 GiB threshold cleanly separates 1 GB SKUs from 2 GB+ SKUs in the
+supported fleet. The upload cap was sized against on-device measurements:
+idle viewer + one QtWebEngine renderer + zygotes leave roughly 500 MB on
+Rock Pi 4 1GB for the kernel, host services, and decode pipeline. A 4K HEVC
+capture-buffer allocation pushes the container past the cgroup limit; the
+kernel logs `global_oom` and the container restart-loops.
+
+### armv7 (Pi 2 / Pi 3) WebEngine-init crash + spawn retry
+
+On the 32-bit (armv7) Qt5 viewer build — Pi 2 and Pi 3 — `AnthiasViewer`
+intermittently aborts during Qt/WebEngine initialization with
+`malloc(): unaligned tcache chunk detected`, dying before it emits the
+`Anthias service start` D-Bus handshake. Reproduced and root-caused on a
+loaned 64-bit Pi 3B+ running the armv7 `anthias-viewer:*-pi3` image:
+
+* It is **genuine heap corruption in Chromium/WebEngine init**, not a font
+  bug. The font-database enumeration is only where the corruption *surfaces*
+  (the heaviest main-thread `malloc` activity at that instant — the abort
+  always trails the synthetic `Monospace … StyleOblique` line). A build that
+  stops before WebEngine actually initializes enumerates the same fonts
+  cleanly every time; only letting WebEngine init proceed triggers the
+  corruption.
+* It is **heap-layout dependent**, firing on ~75–90 % of launches — so a
+  *fresh* launch clears it ~10–25 % of the time. No userspace mitigation
+  fixes it: trimming the CJK fonts, `--single-process`, `--no-zygote`, the
+  single `QWebEngineView`, a jemalloc preload, and
+  disabling glibc's tcache check (which just turns the abort into a raw
+  `SIGSEGV`) all still crash.
+
+Because each spawn is a fresh process and a retry usually succeeds within a
+handful of attempts, `load_browser()` in `src/anthias_viewer/__init__.py`
+**retries the spawn in-process with capped exponential backoff** (one throttled
+log line per attempt) instead of letting the exception escape `main()` into a
+tight container restart loop (which floods journald and makes no faster
+progress). The budget differs by where it runs:
+
+* **At startup** (`setup()`): a generous budget
+  (`BROWSER_SPAWN_MAX_ATTEMPTS` / `BROWSER_SPAWN_BACKOFF_CAP_SECONDS`) — nothing
+  is on screen yet, so it's worth spending time to bring the webview up.
+* **Mid-playback** (`view_image` / `view_webpage` respawn): a small, short
+  budget (`BROWSER_SPAWN_INLINE_*`). These run on the single `asset_loop`
+  thread, so a long retry here would freeze the whole viewer — no rotations,
+  no skips, no standby, and `watchdog()` starved. A persistent failure raises
+  instead, and the container restart re-rolls from a clean process.
+
+A missing/unlinkable binary raises `WebviewBinaryMissingError` and
+short-circuits the retry (it's permanent, so burning the backoff budget would
+only hide a packaging regression). Operator-visible status is the throttled
+`logging.warning` output (`balena logs` / journald). This is a **stop-gap** —
+the clean fix is to run 64-bit-capable Pi 3 hardware on a 64-bit OS + the
+arm64/Qt6 viewer, which sidesteps the entire 32-bit Qt5 stack.
+
+That clean fix now ships as its own board target: **`pi3-64`** — the arm64
+Qt 6 image stream for Pi 3 hardware booted on a 64-bit OS. It folds into the
+same Qt 6 / eglfs_kms display path as `pi4-64` (the VideoCore IV is weaker, so
+hardware decode is H.264-only — see the per-board codec set in
+`src/anthias_server/processing.py`), and has its own balena fleet
+(`screenly_ose/anthias-pi3-64`, device type `raspberrypi3-64`) and disk image.
+`bin/install.sh` and `bin/upgrade_containers.sh` select it automatically when a
+Pi 3 is running a 64-bit (`aarch64`) OS; the legacy 32-bit armhf/Qt5 `pi3`
+stream stays for devices still on a 32-bit OS and is flagged as maintenance/
+legacy in the Raspberry Pi Imager listing.
 
 ## Sample pack
 

@@ -1,20 +1,60 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
+import contextlib
+import errno
 import logging
 import os
+import socket
 from collections.abc import Iterator
-from time import sleep
+from signal import SIGKILL, SIGTERM
+from time import monotonic, sleep
 from typing import Any
 from unittest import mock
 
 import pytest
+import requests
 
 import anthias_viewer as viewer
+from anthias_server.app.models import DURATION_S_MAX
 from anthias_server.settings import settings
+from anthias_viewer import utils as viewer_utils
 from anthias_viewer.scheduling import Scheduler
+from anthias_viewer.utils import get_skip_event
 
 logging.disable(logging.CRITICAL)
+
+
+def _scripted_clock(*readings: float, then: float) -> Any:
+    """A ``monotonic`` stand-in: ``readings`` in order, ``then`` forever.
+
+    Needed wherever a test asserts on *where* a deadline falls relative
+    to the polls around it. Mocking ``sleep`` out collapses the real
+    clock, so every poll lands inside the window and a boundary bug
+    passes unnoticed; driving the clock explicitly puts the deadline
+    exactly where the test means it to be.
+    """
+    remaining = list(readings)
+
+    def clock() -> float:
+        return remaining.pop(0) if remaining else then
+
+    return clock
+
+
+def _listen_on(socket_path: Any) -> Any:
+    """Bind + listen a unix socket at ``socket_path`` (the shape the
+    Wayland readiness probe connects to). Caller closes it."""
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    return listener
+
+
+@contextlib.contextmanager
+def _listening_unix_socket(socket_path: Any) -> Iterator[Any]:
+    listener = _listen_on(socket_path)
+    try:
+        yield listener
+    finally:
+        listener.close()
 
 
 class _ViewerFixtures:
@@ -34,7 +74,37 @@ class _ViewerFixtures:
 
 
 @pytest.fixture
-def viewer_fixtures() -> Iterator[_ViewerFixtures]:
+def viewer_fixtures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[_ViewerFixtures]:
+    # Keep every spawn/handshake test hermetic against the host's Wayland
+    # env. _spawn_webview_once calls _wait_for_wayland_socket before the
+    # mocked command runs; with sleep mocked, a set-but-dangling
+    # WAYLAND_DISPLAY (some CI/dev containers, or a Wayland desktop whose
+    # socket path doesn't resolve here) would make that wait busy-loop for
+    # the whole startup budget or fire a sleep side effect before the
+    # spawn. Clearing it makes _wayland_socket_path() return None so the
+    # wait is a no-op. The dedicated _wait_for_wayland_socket tests set
+    # their own env and don't use this fixture.
+    monkeypatch.delenv('WAYLAND_DISPLAY', raising=False)
+    # Same hermeticity for the other precondition _spawn_webview_once
+    # checks: whoever owns anthias.viewer on whatever session bus the
+    # test host happens to have is none of these tests' business, and
+    # on a host running a real Anthias it would be a live process.
+    # The dedicated reclaim tests patch this themselves.
+    monkeypatch.setattr(viewer, '_webview_name_owner_pid', lambda: None)
+    # Reclaim signalling prefers a pidfd and falls back to the numeric
+    # pid only where the kernel has none. The tests below assert on
+    # os.kill, so simulate that kernel rather than letting the path
+    # depend on whether the fake pid happens to exist on the host: if
+    # something really were running as pid 4242 here, pidfd_open would
+    # succeed and those asserts would go quiet. ENOSYS specifically --
+    # ProcessLookupError means "already gone", which sends nothing at
+    # all. The dedicated pidfd tests patch this themselves.
+    monkeypatch.setattr(
+        'anthias_viewer.os.pidfd_open',
+        mock.Mock(side_effect=OSError(errno.ENOSYS, 'not implemented')),
+    )
     fixtures = _ViewerFixtures()
     original_splash_delay = viewer.SPLASH_DELAY
     viewer.SPLASH_DELAY = 0
@@ -87,7 +157,7 @@ def test_empty(viewer_fixtures: _ViewerFixtures) -> None:
     with mock.patch(
         'anthias_viewer.scheduling.generate_asset_list', m_asset_list
     ):
-        setattr(viewer_fixtures.u, 'scheduler', Scheduler())
+        viewer_fixtures.u.scheduler = Scheduler()
 
         m_asset_list.assert_called_once()
 
@@ -101,40 +171,119 @@ def test_setup(viewer_fixtures: _ViewerFixtures) -> None:
         viewer_fixtures.p_loadb.stop()
 
 
-def _stub_browser_stdout_static(
-    browser_proc: mock.Mock,
-    value: bytes,
+def test_setup_respawns_webview_when_busget_finds_name_gone(
+    viewer_fixtures: _ViewerFixtures,
 ) -> None:
-    """
-    sh.RunningCommand.process.stdout is a @property that returns the
-    latest accumulated buffer on each access. Use PropertyMock so
-    the test exercises the same poll-and-decode pattern as the
-    production loop. Static variant: every read returns the same
-    bytes value, suitable for cases where the loop doesn't depend
-    on stdout changing across iterations (early-exit, timeout).
-    """
-    type(browser_proc.process).stdout = mock.PropertyMock(return_value=value)
+    """The armv7 init crash can strike between the D-Bus handshake
+    (which made load_browser() return) and setup()'s bus.get — the
+    name is released again and pydbus raises ServiceUnknown. setup()
+    must reap, respawn, and retry the bus.get instead of letting the
+    error escape main() (Sentry ANTHIAS-3)."""
+    proxy = mock.Mock(name='browser_bus_proxy')
+    fake_bus = mock.Mock()
+    fake_bus.get.side_effect = [
+        RuntimeError(
+            'GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The '
+            'name anthias.viewer was not provided by any .service files'
+        ),
+        proxy,
+    ]
+    dead_browser = mock.Mock(name='dead_browser')
+    dead_browser.is_alive.return_value = False
+
+    viewer_fixtures.p_loadb.start()
+    try:
+        with (
+            mock.patch('pydbus.SessionBus', mock.Mock(return_value=fake_bus)),
+            mock.patch.object(viewer_fixtures.u, 'browser', dead_browser),
+        ):
+            viewer_fixtures.u.setup()
+    finally:
+        viewer_fixtures.p_loadb.stop()
+
+    assert fake_bus.get.call_count == 2
+    dead_browser.terminate.assert_called_once()
+    # Once before bus.get, once for the respawn — both with the
+    # generous startup budget (no inline kwargs).
+    assert viewer_fixtures.m_loadb.call_count == 2
+    assert viewer_fixtures.m_loadb.call_args_list[1] == mock.call()
+    assert viewer_fixtures.u.browser_bus is proxy
 
 
-def _stub_browser_stdout_chunks(
-    browser_proc: mock.Mock,
-    chunks: list[bytes],
+def test_setup_reraises_unrelated_busget_error(
+    viewer_fixtures: _ViewerFixtures,
 ) -> None:
-    """As above, but advance through `chunks` across reads — for
-    the success case where the handshake appears in a later poll."""
-    type(browser_proc.process).stdout = mock.PropertyMock(side_effect=chunks)
+    """A dead session bus (Disconnected) is not respawn-worthy — the
+    container restart has to bring up a whole fresh bus."""
+    fake_bus = mock.Mock()
+    fake_bus.get.side_effect = RuntimeError(
+        'GDBus.Error:org.freedesktop.DBus.Error.Disconnected: '
+        'The connection is closed'
+    )
+
+    viewer_fixtures.p_loadb.start()
+    try:
+        with (
+            mock.patch('pydbus.SessionBus', mock.Mock(return_value=fake_bus)),
+            mock.patch.object(viewer_fixtures.u, 'browser', None),
+            pytest.raises(RuntimeError, match='Disconnected'),
+        ):
+            viewer_fixtures.u.setup()
+    finally:
+        viewer_fixtures.p_loadb.stop()
+
+    assert fake_bus.get.call_count == 1
+    assert viewer_fixtures.m_loadb.call_count == 1
+
+
+def _capture_out_sink(
+    viewer_fixtures: _ViewerFixtures,
+    browser_proc: mock.Mock,
+    seed: str = '',
+) -> dict[str, Any]:
+    """Wire the mocked sh command so the ``_BoundedWebviewOutput`` it is
+    handed as ``_out`` is captured for the test to drive.
+
+    Production no longer reads ``.process.stdout`` (sh stops aggregating
+    it once an ``_out`` handler is set — that's the issue #3138 fix);
+    instead the handshake scan and failure message read the bounded sink.
+    When ``seed`` is given it is fed into the sink as the command is
+    invoked, so the handshake is present on the first poll. Returns a
+    holder dict whose ``'sink'`` key is populated when the command runs.
+    """
+    holder: dict[str, Any] = {}
+
+    def capture(*args: Any, **kwargs: Any) -> mock.Mock:
+        holder['sink'] = kwargs['_out']
+        if seed:
+            kwargs['_out'](seed)
+        return browser_proc
+
+    viewer_fixtures.m_cmd.return_value.side_effect = capture
+    return holder
 
 
 def test_load_browser(viewer_fixtures: _ViewerFixtures) -> None:
     browser_proc = viewer_fixtures.m_cmd.return_value.return_value
-    # Two stdout reads: an empty buffer on the first poll, then the
-    # handshake line appended on the second. Verifies that the
-    # polling loop actually re-reads stdout each iteration.
-    _stub_browser_stdout_chunks(
-        browser_proc,
-        [b'starting up\n', b'starting up\nAnthias service start\n'],
-    )
     browser_proc.is_alive.return_value = True
+
+    # (viewer_fixtures clears WAYLAND_DISPLAY, so the pre-spawn
+    # _wait_for_wayland_socket is a no-op and sleep is exercised only by
+    # the handshake poll loop below.)
+    # The handshake line must arrive across polls, not before the first:
+    # capture the _out sink, leave it empty for the first poll, then feed
+    # the handshake on the first mocked sleep so the second poll finds it
+    # — verifying the loop re-reads the sink each iteration.
+    holder = _capture_out_sink(viewer_fixtures, browser_proc)
+
+    def feed_handshake(*args: Any, **kwargs: Any) -> None:
+        # Only the post-spawn poll loop should drive this; guard so a
+        # stray pre-spawn sleep can never KeyError on an uncaptured sink.
+        if 'sink' in holder:
+            holder['sink']('starting up\nAnthias service start\n')
+
+    viewer_fixtures.m_sleep.side_effect = feed_handshake
+
     viewer_fixtures.p_cmd.start()
     viewer_fixtures.p_sleep.start()
     try:
@@ -142,48 +291,993 @@ def test_load_browser(viewer_fixtures: _ViewerFixtures) -> None:
     finally:
         viewer_fixtures.p_sleep.stop()
         viewer_fixtures.p_cmd.stop()
-    viewer_fixtures.m_cmd.assert_called_once_with('AnthiasWebview')
+    viewer_fixtures.m_cmd.assert_called_once_with('AnthiasViewer')
+    # _bg_exc must stay False: with sh's default (True), a webview crash
+    # (or our own SIGTERM on teardown) re-raises the exit error inside
+    # sh's daemon monitor thread, where nothing can catch it — every
+    # crash the retry loop already handles would still surface as an
+    # unhandled-in-thread error in Sentry.
+    launch_kwargs = viewer_fixtures.m_cmd.return_value.call_args.kwargs
+    assert launch_kwargs['_bg'] is True
+    assert launch_kwargs['_bg_exc'] is False
+    # _out must be the bounded sink, not sh's default unbounded stdout
+    # aggregation that leaks the viewer's RAM on a chatty decoder
+    # (issue #3138).
+    assert isinstance(
+        launch_kwargs['_out'], viewer_fixtures.u._BoundedWebviewOutput
+    )
 
 
-def test_load_browser_raises_when_process_exits_before_handshake(
+def test_spawn_webview_once_raises_on_early_exit(
     viewer_fixtures: _ViewerFixtures,
 ) -> None:
+    """A process that exits before the handshake surfaces as a
+    WebviewLaunchError (a RuntimeError subclass) and does NOT terminate
+    (it's already dead)."""
     browser_proc = viewer_fixtures.m_cmd.return_value.return_value
-    # The error message also reads stdout, so use the static stub
-    # that returns the same value on every access rather than a
-    # one-shot side_effect.
-    _stub_browser_stdout_static(browser_proc, b'')
+    # No output is fed, so the bounded _out sink stays empty and the
+    # failure message reads it as such.
     browser_proc.is_alive.return_value = False
-    viewer_fixtures.p_cmd.start()
-    try:
-        with pytest.raises(RuntimeError):
-            viewer_fixtures.u.load_browser()
-    finally:
-        viewer_fixtures.p_cmd.stop()
-
-
-def test_load_browser_times_out_when_handshake_never_arrives(
-    viewer_fixtures: _ViewerFixtures,
-) -> None:
-    browser_proc = viewer_fixtures.m_cmd.return_value.return_value
-    _stub_browser_stdout_static(browser_proc, b'irrelevant noise')
-    browser_proc.is_alive.return_value = True
-    # Three monotonic() reads: deadline init, one loop iteration
-    # below the deadline, one above it.
-    monotonic_values = iter([0.0, 0.0, 100.0])
     viewer_fixtures.p_cmd.start()
     viewer_fixtures.p_sleep.start()
     try:
-        with mock.patch.object(
-            viewer_fixtures.u,
-            'monotonic',
-            side_effect=lambda: next(monotonic_values),
-        ):
-            with pytest.raises(TimeoutError):
-                viewer_fixtures.u.load_browser()
+        with pytest.raises(viewer_fixtures.u.WebviewLaunchError):
+            viewer_fixtures.u._spawn_webview_once(30)
     finally:
         viewer_fixtures.p_sleep.stop()
         viewer_fixtures.p_cmd.stop()
+    browser_proc.terminate.assert_not_called()
+
+
+def test_spawn_webview_once_reports_a_survivor_of_the_teardown(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """A half-started webview that outlives SIGKILL must say so.
+
+    It never registered the bus name, so the reclaim probe on the next
+    attempt cannot see it and would spawn straight over the top. In
+    Sentry "two viewers are fighting over the framebuffer" and "the
+    viewer will not start" then look identical; the message is the only
+    place that distinction can live.
+    """
+    browser_proc = viewer_fixtures.m_cmd.return_value.return_value
+    # Never handshakes and never dies, through both signals.
+    browser_proc.is_alive.return_value = True
+    viewer_fixtures.p_cmd.start()
+    viewer_fixtures.p_sleep.start()
+    try:
+        # Grace is wall-clock and sleep is mocked out, so leaving it at
+        # the real value busy-spins through both signal windows.
+        with (
+            mock.patch.object(viewer, 'BROWSER_TERMINATE_GRACE_SECONDS', 0),
+            pytest.raises(
+                viewer_fixtures.u.WebviewLaunchError,
+                match='outlasted an attempted SIGKILL',
+            ),
+        ):
+            viewer_fixtures.u._spawn_webview_once(0)
+    finally:
+        viewer_fixtures.p_sleep.stop()
+        viewer_fixtures.p_cmd.stop()
+    browser_proc.kill.assert_called()
+
+
+def test_spawn_webview_once_stays_quiet_when_the_teardown_works(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """The ordinary timeout message gains nothing when the process does
+    go away — the annotation has to mean something when it appears."""
+    browser_proc = viewer_fixtures.m_cmd.return_value.return_value
+    # Alive through the handshake wait, gone once signalled.
+    browser_proc.is_alive.side_effect = lambda: (
+        not browser_proc.terminate.called
+    )
+    viewer_fixtures.p_cmd.start()
+    viewer_fixtures.p_sleep.start()
+    try:
+        with (
+            mock.patch.object(viewer, 'BROWSER_TERMINATE_GRACE_SECONDS', 0),
+            pytest.raises(viewer_fixtures.u.WebviewLaunchError) as excinfo,
+        ):
+            viewer_fixtures.u._spawn_webview_once(0)
+    finally:
+        viewer_fixtures.p_sleep.stop()
+        viewer_fixtures.p_cmd.stop()
+    assert 'outlasted an attempted SIGKILL' not in str(excinfo.value)
+
+
+def test_spawn_webview_once_drains_output_before_reporting(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """Sentry ANTHIAS-D: the crash tail must reach the error message.
+
+    ``is_alive()`` flips the moment the child is reaped, but sh feeds
+    the ``_out`` sink from a separate reader thread — so the fatal line
+    can still be in flight. Reading the sink at that instant produced
+    1318 reports that end on benign Qt locale/Vulkan chatter and never
+    say what killed the process. Model that here: the process is
+    already dead on the first poll and the real reason only lands
+    afterwards; the raised message must carry it.
+    """
+    browser_proc = viewer_fixtures.m_cmd.return_value.return_value
+    browser_proc.is_alive.return_value = False
+    holder = _capture_out_sink(
+        viewer_fixtures, browser_proc, seed='early warning\n'
+    )
+
+    # sh delivers the tail on the first drain poll, i.e. strictly after
+    # the process was observed dead.
+    def flush_tail(*args: Any, **kwargs: Any) -> None:
+        if holder.get('flushed') or 'sink' not in holder:
+            return
+        holder['flushed'] = True
+        holder['sink']('FATAL: could not create platform window\n')
+
+    viewer_fixtures.m_sleep.side_effect = flush_tail
+
+    viewer_fixtures.p_cmd.start()
+    viewer_fixtures.p_sleep.start()
+    try:
+        with pytest.raises(viewer_fixtures.u.WebviewLaunchError) as excinfo:
+            viewer_fixtures.u._spawn_webview_once(30)
+    finally:
+        viewer_fixtures.p_sleep.stop()
+        viewer_fixtures.p_cmd.stop()
+
+    message = str(excinfo.value)
+    assert 'FATAL: could not create platform window' in message
+    # The earlier, less useful output is still there — the drain adds
+    # the tail, it does not replace what came before.
+    assert 'early warning' in message
+
+
+def test_drain_webview_output_is_bounded_when_output_never_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A still-streaming orphan must not stall the drain — the inline
+    respawn path runs on the asset_loop thread."""
+    sink = viewer._BoundedWebviewOutput()
+    sink('start')
+
+    # Never settles: every poll appends more.
+    def keep_streaming(_seconds: float) -> None:
+        sink('more')
+
+    monkeypatch.setattr(viewer, 'sleep', keep_streaming)
+    monkeypatch.setattr(viewer, 'WEBVIEW_OUTPUT_DRAIN_TIMEOUT_SECONDS', 0.05)
+    started = monotonic()
+    text = viewer._drain_webview_output(sink)
+    elapsed = monotonic() - started
+    assert 'start' in text
+    assert elapsed < 2
+
+
+@pytest.mark.parametrize(
+    ('exit_code', 'expected'),
+    [
+        (-11, 'killed by SIGSEGV (-11)'),
+        (-6, 'killed by SIGABRT (-6)'),
+        (-9, 'killed by SIGKILL (-9)'),
+        (0, 'exit code 0'),
+        (1, 'exit code 1'),
+    ],
+)
+def test_describe_webview_exit_names_how_the_process_died(
+    exit_code: int, expected: str
+) -> None:
+    """Sentry ANTHIAS-D: a signal death is the only evidence there is.
+
+    Verified against the shipped sh 2.4.0 on a Pi 5 — ``process.exit_code``
+    is populated the instant ``is_alive()`` flips, and carries the signal
+    as a negative value.
+    """
+    candidate = mock.Mock()
+    candidate.process.exit_code = exit_code
+    assert viewer._describe_webview_exit(candidate) == expected
+
+
+def test_describe_webview_exit_avoids_shs_raising_exit_code_property() -> None:
+    """Regression guard: read ``.process.exit_code``, never ``.exit_code``.
+
+    sh re-raises the exit as ``SignalException_SIGSEGV`` from the
+    ``candidate.exit_code`` property even under ``_bg_exc=False``
+    (confirmed on sh 2.4.0). Reading that one here would throw a fresh
+    exception out of the path that exists to report the launch failure.
+    """
+
+    class _Candidate:
+        def __init__(self) -> None:
+            self.process = mock.Mock(exit_code=-11)
+
+        @property
+        def exit_code(self) -> int:
+            raise RuntimeError('SignalException_SIGSEGV')
+
+    assert viewer._describe_webview_exit(_Candidate()) == (
+        'killed by SIGSEGV (-11)'
+    )
+
+
+def test_describe_webview_exit_survives_a_missing_status() -> None:
+    """A launch failure must stay reportable even with no status to read."""
+    assert viewer._describe_webview_exit(object()) == 'exit status unavailable'
+    unknown_signal = mock.Mock()
+    unknown_signal.process.exit_code = -250
+    assert viewer._describe_webview_exit(unknown_signal) == (
+        'killed by signal 250 (-250)'
+    )
+
+
+def test_spawn_webview_once_reports_exit_status_on_a_silent_death(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """Sentry ANTHIAS-D's actual shape: no crash tail exists to drain.
+
+    A webview killed by a signal writes nothing on its way out, so the
+    captured stdout just stops after the last benign warning —
+    byte-identical to all 1318 reports. Draining cannot conjure a reason
+    that was never written; the exit status must name it instead.
+    """
+    browser_proc = viewer_fixtures.m_cmd.return_value.return_value
+    browser_proc.is_alive.return_value = False
+    browser_proc.process.exit_code = -11
+    _capture_out_sink(
+        viewer_fixtures,
+        browser_proc,
+        seed='Failed to create Vulkan instance: -9\nUnable to detect GPU '
+        'vendor.\n',
+    )
+
+    viewer_fixtures.p_cmd.start()
+    viewer_fixtures.p_sleep.start()
+    try:
+        with pytest.raises(viewer_fixtures.u.WebviewLaunchError) as excinfo:
+            viewer_fixtures.u._spawn_webview_once(30)
+    finally:
+        viewer_fixtures.p_sleep.stop()
+        viewer_fixtures.p_cmd.stop()
+
+    message = str(excinfo.value)
+    assert 'killed by SIGSEGV (-11)' in message
+    # The benign chatter is still quoted — the status is added to it, and
+    # the operator still sees how far Qt got before it died.
+    assert 'Unable to detect GPU vendor.' in message
+
+
+def test_spawn_webview_once_terminates_on_timeout(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """When the handshake never arrives, the half-started process is
+    torn down (terminate) before the error is raised — otherwise a retry
+    would leak a second AnthiasViewer contending for the framebuffer /
+    D-Bus name."""
+    browser_proc = viewer_fixtures.m_cmd.return_value.return_value
+    # is_alive False so _terminate_webview reaps immediately without a
+    # busy-wait; the 0s timeout drives the deadline straight past.
+    browser_proc.is_alive.return_value = False
+    viewer_fixtures.p_cmd.start()
+    viewer_fixtures.p_sleep.start()
+    try:
+        with pytest.raises(viewer_fixtures.u.WebviewLaunchError):
+            viewer_fixtures.u._spawn_webview_once(0)
+    finally:
+        viewer_fixtures.p_sleep.stop()
+        viewer_fixtures.p_cmd.stop()
+    browser_proc.terminate.assert_called_once()
+
+
+def test_terminate_webview_sigkills_when_sigterm_raises(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """A SIGTERM that does not land must not skip the SIGKILL.
+
+    ``sh`` signals with a bare ``os.kill``, so terminate() raises on
+    anything from a permission failure to a bad file descriptor. Short
+    of ProcessLookupError (covered below) none of those prove the
+    process is gone, and the old code returned there, leaving a live
+    AnthiasViewer still owning anthias.viewer for the next spawn to
+    collide with."""
+    proc = mock.Mock()
+    proc.terminate.side_effect = PermissionError('operation not permitted')
+    # Still running: escalation is the whole point here.
+    proc.is_alive.side_effect = lambda: not proc.kill.called
+
+    with mock.patch.object(viewer, 'sleep'):
+        assert viewer._terminate_webview(proc) is True
+
+    proc.terminate.assert_called_once()
+    proc.kill.assert_called_once()
+
+
+def test_terminate_webview_skips_sigkill_if_the_child_went_anyway(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """A failed SIGTERM over a child that is already gone must not
+    escalate.
+
+    sh signals the saved numeric pid, so a SIGKILL aimed at a reaped
+    child is aimed at a number the kernel may have reissued. The raise
+    says the signal did not land, not that the process is still there --
+    those are separate questions, and only the second one justifies
+    escalating."""
+    proc = mock.Mock()
+    proc.terminate.side_effect = PermissionError('operation not permitted')
+    proc.is_alive.return_value = False
+
+    with mock.patch.object(viewer, 'sleep'):
+        assert viewer._terminate_webview(proc) is True
+
+    proc.terminate.assert_called_once()
+    proc.kill.assert_not_called()
+
+
+def test_terminate_webview_does_not_resignal_an_already_reaped_pid(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """ProcessLookupError proves the pid is gone, so report success
+    rather than escalating.
+
+    Escalating would re-signal a numeric pid this process no longer
+    owns; the kernel is free to have reused it, and SIGKILL to an
+    unrelated process is not a risk worth running for one already
+    confirmed dead."""
+    proc = mock.Mock()
+    proc.terminate.side_effect = ProcessLookupError('no such process')
+
+    with mock.patch.object(viewer, 'sleep'):
+        assert viewer._terminate_webview(proc) is True
+
+    proc.terminate.assert_called_once()
+    proc.kill.assert_not_called()
+
+
+def test_terminate_webview_waits_for_the_reap_after_sigkill(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """SIGKILL is immediate for the kernel but the bus name is not
+    released until the process is torn down and reaped, and the caller
+    spawns the next AnthiasViewer the instant we return — so wait."""
+    proc = mock.Mock()
+    # Ignores SIGTERM for the whole grace window; dies on SIGKILL.
+    proc.is_alive.side_effect = lambda: not proc.kill.called
+
+    with (
+        mock.patch.object(viewer, 'BROWSER_TERMINATE_GRACE_SECONDS', 0.05),
+        mock.patch.object(viewer, 'sleep'),
+    ):
+        assert viewer._terminate_webview(proc) is True
+
+    proc.kill.assert_called_once()
+    # Polled again *after* kill() rather than returning straight away.
+    calls = [call[0] for call in proc.mock_calls]
+    assert 'is_alive' in calls[calls.index('kill') :]
+
+
+def test_terminate_webview_reports_a_survivor(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """A process that outlives SIGKILL is reported, not assumed dead."""
+    proc = mock.Mock()
+    proc.is_alive.return_value = True
+
+    with (
+        mock.patch.object(viewer, 'BROWSER_TERMINATE_GRACE_SECONDS', 0.05),
+        mock.patch.object(viewer, 'sleep'),
+    ):
+        assert viewer._terminate_webview(proc) is False
+
+    proc.terminate.assert_called_once()
+    proc.kill.assert_called_once()
+
+
+def test_terminate_webview_skips_sigkill_for_a_late_sigterm_exit(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """A process that goes away during the grace window's *last* polling
+    interval is still noticed, so it is not SIGKILLed for nothing.
+
+    The clock is scripted so the deadline passes *during* that final
+    sleep: the first reading sets the deadline, the second is still
+    inside the window, and every later one is past it. A loop that read
+    the clock before the status would exit there and escalate.
+    """
+    proc = mock.Mock()
+    proc.is_alive.side_effect = [True, False]
+
+    with (
+        mock.patch.object(viewer, 'BROWSER_TERMINATE_GRACE_SECONDS', 0.05),
+        mock.patch.object(
+            viewer, 'monotonic', _scripted_clock(0.0, 0.0, then=10.0)
+        ),
+        mock.patch.object(viewer, 'sleep'),
+    ):
+        assert viewer._terminate_webview(proc) is True
+
+    proc.terminate.assert_called_once()
+    proc.kill.assert_not_called()
+
+
+def test_reclaim_does_not_escalate_when_the_name_frees_late(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """An owner that lets go during the SIGTERM phase's last polling
+    interval is detected there, rather than being SIGKILLed anyway.
+
+    Scripted clock again: the first two readings build the budgets, the
+    third is still inside the SIGTERM window, and everything after is
+    past it. Reading the clock before the owner would break out of the
+    phase at that point and escalate to SIGKILL for nothing.
+    """
+    killed: list[tuple[int, int]] = []
+    # The initial check and the first in-window poll see the owner; by
+    # the poll the phase makes at its deadline the name is free.
+    # Owner lookups: the initial resolve, the revalidation after the
+    # pid is pinned, then one per poll.
+    owners = iter([4242, 4242, 4242, None])
+
+    with (
+        mock.patch.object(
+            viewer, '_webview_name_owner_pid', lambda: next(owners, None)
+        ),
+        mock.patch(
+            'anthias_viewer.os.kill',
+            lambda pid, sig: killed.append((pid, sig)),
+        ),
+        mock.patch.object(
+            viewer, 'monotonic', _scripted_clock(0.0, 0.0, 0.0, then=10.0)
+        ),
+        mock.patch.object(viewer, 'sleep'),
+        mock.patch.object(viewer, 'BROWSER_TERMINATE_GRACE_SECONDS', 0.05),
+        mock.patch.object(viewer, 'WEBVIEW_NAME_RECLAIM_TIMEOUT_SECONDS', 0.1),
+    ):
+        assert viewer._reclaim_webview_dbus_name(monotonic() + 30) is True
+
+    assert killed == [(4242, SIGTERM)]
+
+
+def test_reclaim_signals_through_a_pidfd_when_the_kernel_has_one(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """Both signals go through the pidfd, never the bare pid.
+
+    SIGKILL can follow SIGTERM by seconds here. Once the original
+    process is reaped the kernel may reissue its number, and this
+    container's other Python processes are what a stale numeric signal
+    would then hit. The fd is closed on the way out either way.
+    """
+    sent: list[tuple[int, int]] = []
+    # Owner lookups: the initial resolve, the revalidation after the
+    # pid is pinned, then one per poll.
+    owners = iter([4242, 4242, 4242, None])
+
+    with (
+        mock.patch.object(
+            viewer, '_webview_name_owner_pid', lambda: next(owners, None)
+        ),
+        mock.patch('anthias_viewer.os.pidfd_open', return_value=77) as m_open,
+        mock.patch('anthias_viewer.os.close') as m_close,
+        mock.patch(
+            'anthias_viewer.pidfd_send_signal',
+            lambda fd, sig: sent.append((fd, sig)),
+        ),
+        mock.patch('anthias_viewer.os.kill') as m_kill,
+        mock.patch.object(viewer, 'sleep'),
+        mock.patch.object(viewer, 'BROWSER_TERMINATE_GRACE_SECONDS', 0),
+        mock.patch.object(viewer, 'WEBVIEW_NAME_RECLAIM_TIMEOUT_SECONDS', 0),
+    ):
+        assert viewer._reclaim_webview_dbus_name(monotonic() + 30) is True
+
+    m_open.assert_called_once_with(4242)
+    # Both phases ran (zero budgets), and both went through the fd.
+    assert sent == [(77, SIGTERM), (77, SIGKILL)]
+    m_kill.assert_not_called()
+    m_close.assert_called_once_with(77)
+
+
+def test_reclaim_closes_the_pidfd_even_when_the_name_survives(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """The fd must not leak on the give-up path either — this runs on
+    every spawn attempt, so a leak here would exhaust the viewer's
+    descriptors over a long restart loop."""
+    with (
+        mock.patch.object(viewer, '_webview_name_owner_pid', lambda: 4242),
+        mock.patch('anthias_viewer.os.pidfd_open', return_value=77),
+        mock.patch('anthias_viewer.os.close') as m_close,
+        mock.patch('anthias_viewer.pidfd_send_signal'),
+        mock.patch.object(viewer, 'sleep'),
+        mock.patch.object(viewer, 'BROWSER_TERMINATE_GRACE_SECONDS', 0),
+        mock.patch.object(viewer, 'WEBVIEW_NAME_RECLAIM_TIMEOUT_SECONDS', 0),
+    ):
+        assert viewer._reclaim_webview_dbus_name(monotonic() + 30) is False
+
+    m_close.assert_called_once_with(77)
+
+
+def test_reclaim_sends_nothing_when_the_owner_is_already_gone(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """ESRCH from pidfd_open means the pid is gone, so signal nothing.
+
+    Falling back to the numeric pid here would reintroduce exactly the
+    reuse race the fd exists to close: between the failed open and the
+    signal, another process in this container can be handed that number.
+    The bus name is still polled, since it can lag the exit.
+    """
+    # Owner lookups: the initial resolve, the revalidation after the
+    # pid is pinned, then one per poll.
+    owners = iter([4242, 4242, None])
+
+    with (
+        mock.patch.object(
+            viewer, '_webview_name_owner_pid', lambda: next(owners, None)
+        ),
+        mock.patch(
+            'anthias_viewer.os.pidfd_open',
+            side_effect=ProcessLookupError('no such process'),
+        ),
+        mock.patch('anthias_viewer.os.kill') as m_kill,
+        mock.patch('anthias_viewer.pidfd_send_signal') as m_send,
+        mock.patch.object(viewer, 'sleep'),
+    ):
+        assert viewer._reclaim_webview_dbus_name(monotonic() + 30) is True
+
+    m_kill.assert_not_called()
+    m_send.assert_not_called()
+
+
+def test_reclaim_does_not_signal_a_pid_that_changed_hands(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """If the owner changed between resolving the pid and pinning it,
+    signal nothing.
+
+    The fd would be pinning whichever process inherited the number, and
+    the SIGTERM would kill a bystander. Reported as "not reclaimed" so
+    the caller can retry against the owner that is actually there.
+    """
+    with (
+        mock.patch.object(
+            viewer,
+            '_webview_name_owner_pid',
+            mock.Mock(side_effect=[4242, 9999]),
+        ),
+        mock.patch('anthias_viewer.os.pidfd_open', return_value=77),
+        mock.patch('anthias_viewer.os.close'),
+        mock.patch('anthias_viewer.os.kill') as m_kill,
+        mock.patch('anthias_viewer.pidfd_send_signal') as m_send,
+        mock.patch.object(viewer, 'sleep'),
+    ):
+        assert viewer._reclaim_webview_dbus_name(monotonic() + 30) is False
+
+    m_kill.assert_not_called()
+    m_send.assert_not_called()
+
+
+def test_reclaim_declines_to_signal_when_the_pid_cannot_be_pinned(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """A resource failure opening the pidfd is not a kernel-capability
+    signal, so it must not drop to the bare pid.
+
+    EMFILE and friends say "could not pin", not "no pidfd here" — the
+    process is most likely alive, and signalling its number anyway is
+    the reuse race this helper exists to close. Only ENOSYS (and a
+    missing API) select the numeric path.
+    """
+    with (
+        mock.patch.object(viewer, '_webview_name_owner_pid', lambda: 4242),
+        mock.patch(
+            'anthias_viewer.os.pidfd_open',
+            side_effect=OSError(errno.EMFILE, 'too many open files'),
+        ),
+        mock.patch('anthias_viewer.os.kill') as m_kill,
+        mock.patch('anthias_viewer.pidfd_send_signal') as m_send,
+        mock.patch.object(viewer, 'sleep'),
+        mock.patch.object(viewer, 'BROWSER_TERMINATE_GRACE_SECONDS', 0),
+        mock.patch.object(viewer, 'WEBVIEW_NAME_RECLAIM_TIMEOUT_SECONDS', 0),
+    ):
+        assert viewer._reclaim_webview_dbus_name(monotonic() + 30) is False
+
+    m_kill.assert_not_called()
+    m_send.assert_not_called()
+
+
+def test_reclaim_uses_the_numeric_pid_when_the_kernel_lacks_pidfd(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """ENOSYS is the one case that still takes the bare pid — on such a
+    kernel it is the only option, and it is what this code did before."""
+    killed: list[tuple[int, int]] = []
+    # Owner lookups: the initial resolve, the revalidation, then a poll.
+    owners = iter([4242, 4242, None])
+
+    with (
+        mock.patch.object(
+            viewer, '_webview_name_owner_pid', lambda: next(owners, None)
+        ),
+        mock.patch(
+            'anthias_viewer.os.pidfd_open',
+            side_effect=OSError(errno.ENOSYS, 'not implemented'),
+        ),
+        mock.patch(
+            'anthias_viewer.os.kill',
+            lambda pid, sig: killed.append((pid, sig)),
+        ),
+        mock.patch.object(viewer, 'sleep'),
+    ):
+        assert viewer._reclaim_webview_dbus_name(monotonic() + 30) is True
+
+    assert killed == [(4242, SIGTERM)]
+
+
+def test_webview_name_owner_pid_returns_none_when_the_name_is_free() -> None:
+    """The common case: nobody owns the name, so no PID lookup happens."""
+    dbus = mock.Mock()
+    dbus.NameHasOwner.return_value = False
+
+    with mock.patch('anthias_viewer.pydbus.SessionBus') as m_bus:
+        m_bus.return_value.get.return_value = dbus
+        assert viewer._webview_name_owner_pid() is None
+
+    dbus.NameHasOwner.assert_called_once_with('anthias.viewer')
+    dbus.GetNameOwner.assert_not_called()
+
+
+def test_webview_name_owner_pid_reads_the_owning_pid() -> None:
+    """A live owner is resolved to its PID through the bus daemon.
+
+    Exercising the real call chain matters because the helper swallows
+    every exception: a typo or an incompatible method name would
+    silently disable the whole reclaim feature while every test that
+    stubs this function out kept passing.
+    """
+    dbus = mock.Mock()
+    dbus.NameHasOwner.return_value = True
+    dbus.GetNameOwner.return_value = ':1.42'
+    dbus.GetConnectionUnixProcessID.return_value = 4242
+
+    with mock.patch('anthias_viewer.pydbus.SessionBus') as m_bus:
+        m_bus.return_value.get.return_value = dbus
+        assert viewer._webview_name_owner_pid() == 4242
+
+    m_bus.return_value.get.assert_called_once_with('.DBus')
+    dbus.GetNameOwner.assert_called_once_with('anthias.viewer')
+    dbus.GetConnectionUnixProcessID.assert_called_once_with(':1.42')
+
+
+def test_webview_name_owner_pid_is_none_when_the_bus_lookup_fails() -> None:
+    """An unreachable bus degrades to "no owner", keeping the reclaim a
+    pure optimisation: a viewer that cannot introspect the bus spawns
+    exactly as it did before the feature existed."""
+    with mock.patch(
+        'anthias_viewer.pydbus.SessionBus',
+        side_effect=OSError('no session bus'),
+    ):
+        assert viewer._webview_name_owner_pid() is None
+
+
+def test_spawn_reclaims_a_stale_dbus_name_owner(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """An orphaned AnthiasViewer holding anthias.viewer must be cleared
+    before the spawn, not retried past.
+
+    Qt's registerService fails the instant the name is taken, so every
+    one of the 30 startup attempts dies identically ~0.5s in (measured
+    on a Pi 5) — ~6.5min of black screen against a condition one bus
+    call detects."""
+    # Owner lookups: the initial resolve, the revalidation after the
+    # pid is pinned, then one per poll.
+    owner_pids = [4242, 4242, 4242, None]
+    killed: list[tuple[int, int]] = []
+
+    def next_owner() -> Any:
+        return owner_pids.pop(0) if owner_pids else None
+
+    with (
+        mock.patch.object(viewer, '_webview_name_owner_pid', next_owner),
+        mock.patch(
+            'anthias_viewer.os.kill',
+            lambda pid, sig: killed.append((pid, sig)),
+        ),
+        mock.patch.object(viewer, 'sleep'),
+    ):
+        assert viewer._reclaim_webview_dbus_name(monotonic() + 30) is True
+
+    # Cleared on the polite signal — no SIGKILL needed.
+    assert killed == [(4242, SIGTERM)]
+
+
+def test_reclaim_escalates_to_sigkill_then_gives_up(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """A name owner that ignores SIGTERM gets SIGKILL; one that survives
+    both is reported rather than silently spawned over."""
+    killed: list[tuple[int, int]] = []
+
+    with (
+        mock.patch.object(viewer, '_webview_name_owner_pid', lambda: 4242),
+        mock.patch(
+            'anthias_viewer.os.kill',
+            lambda pid, sig: killed.append((pid, sig)),
+        ),
+        mock.patch.object(viewer, 'sleep'),
+        # Both budgets are wall-clock and `sleep` is mocked out, so
+        # without these the loop busy-spins for the real 5s reclaim
+        # timeout on every run of the suite.
+        mock.patch.object(viewer, 'BROWSER_TERMINATE_GRACE_SECONDS', 0.05),
+        mock.patch.object(viewer, 'WEBVIEW_NAME_RECLAIM_TIMEOUT_SECONDS', 0.1),
+    ):
+        assert viewer._reclaim_webview_dbus_name(monotonic() + 30) is False
+
+    assert killed == [(4242, SIGTERM), (4242, SIGKILL)]
+
+
+def test_reclaim_is_a_noop_when_the_name_is_free(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """The common case — one bus call, no signals, no sleeps."""
+    with (
+        mock.patch.object(viewer, '_webview_name_owner_pid', lambda: None),
+        mock.patch('anthias_viewer.os.kill') as m_kill,
+        mock.patch.object(viewer, 'sleep') as m_sleep,
+    ):
+        assert viewer._reclaim_webview_dbus_name(monotonic() + 30) is True
+
+    m_kill.assert_not_called()
+    m_sleep.assert_not_called()
+
+
+def test_reclaim_stays_inside_the_attempt_deadline(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """The inline respawn runs on the asset_loop thread, so an
+    unkillable owner must not stretch the attempt past its budget."""
+    with (
+        mock.patch.object(viewer, '_webview_name_owner_pid', lambda: 4242),
+        mock.patch('anthias_viewer.os.kill'),
+    ):
+        started = monotonic()
+        # Deadline already past: both signal waits collapse immediately.
+        assert viewer._reclaim_webview_dbus_name(monotonic() - 1) is False
+        assert monotonic() - started < 1
+
+
+def test_spawn_webview_once_refuses_an_unreclaimable_name(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """When the name cannot be freed, say so — an empty QDBusError and
+    Qt boilerplate is what made Sentry ANTHIAS-D undiagnosable."""
+    viewer_fixtures.p_cmd.start()
+    try:
+        with (
+            mock.patch.object(
+                viewer_fixtures.u,
+                '_reclaim_webview_dbus_name',
+                return_value=False,
+            ),
+            pytest.raises(viewer_fixtures.u.WebviewLaunchError) as excinfo,
+        ):
+            viewer_fixtures.u._spawn_webview_once(30)
+    finally:
+        viewer_fixtures.p_cmd.stop()
+
+    assert 'anthias.viewer' in str(excinfo.value)
+    # Refused before the spawn: no process was started.
+    viewer_fixtures.m_cmd.return_value.assert_not_called()
+
+
+def test_spawn_webview_once_missing_binary(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """A missing AnthiasViewer binary raises WebviewBinaryMissingError
+    (permanent), which the retry loop must short-circuit on."""
+    viewer_fixtures.m_cmd.side_effect = viewer_fixtures.u.sh.CommandNotFound(
+        'AnthiasViewer'
+    )
+    viewer_fixtures.p_cmd.start()
+    try:
+        with pytest.raises(viewer_fixtures.u.WebviewBinaryMissingError):
+            viewer_fixtures.u._spawn_webview_once(30)
+    finally:
+        viewer_fixtures.p_cmd.stop()
+
+
+def test_bounded_webview_output_discards_old_data(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """The _out sink retains only the most recent maxlen chars, so a
+    chatty AnthiasViewer (e.g. ffmpeg spamming 'channel element 0.0
+    duplicate' every frame) can't grow the viewer's RSS without bound —
+    the root cause of issue #3138."""
+    sink = viewer_fixtures.u._BoundedWebviewOutput(maxlen=100)
+    for _ in range(1000):
+        sink('channel element 0.0 duplicate\n')
+    text = sink.text()
+    assert len(text) <= 100
+    # What survives is the tail of the stream, not the head.
+    assert text.endswith('duplicate\n')
+
+
+def test_bounded_webview_output_write_is_amortized_cheap(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """Once the window is full, a new chunk must not re-copy the retained
+    data: retention is a deque of chunks, not a grow-then-slice string, so
+    a per-frame chatty decoder doesn't burn CPU recopying ~maxlen chars on
+    every call. Assert the write path stores whole chunks (bounded count)
+    and never materializes maxlen-sized strings on append."""
+    sink = viewer_fixtures.u._BoundedWebviewOutput(maxlen=100)
+    # 10k tiny writes; if each recopied the buffer this would be O(n*maxlen).
+    for i in range(10000):
+        sink(f'line {i}\n')
+    # The kept data is bounded, holds the most recent lines, and the
+    # number of retained chunks is small (only enough to cover the window,
+    # not one per write).
+    text = sink.text()
+    assert len(text) <= 100
+    assert text.endswith('line 9999\n')
+    assert len(sink._chunks) < 50
+
+
+def test_bounded_webview_output_slices_oversized_chunk(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """A single chunk larger than the window is sliced to its tail before
+    being buffered, so a big unbuffered write from the child can't spike a
+    ``buf + chunk`` allocation far past maxlen — the retained buffer never
+    exceeds maxlen and keeps the most recent bytes."""
+    sink = viewer_fixtures.u._BoundedWebviewOutput(maxlen=100)
+    sink('x' * 10000 + 'TAIL')
+    text = sink.text()
+    assert len(text) <= 100
+    assert text.endswith('TAIL')
+
+
+def test_bounded_webview_output_coerces_bytes(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """sh hands the _out callback str under the default encoding, but the
+    sink coerces bytes defensively so an _encoding=None / raw-bytes
+    configuration can't turn ``str + bytes`` into a TypeError that would
+    silently break the handshake scan."""
+    sink = viewer_fixtures.u._BoundedWebviewOutput(maxlen=1024)
+    sink(b'booting\n')
+    sink('Anthias service start\n')
+    text = sink.text()
+    assert viewer_fixtures.u.BROWSER_HANDSHAKE_LINE in text
+    assert isinstance(text, str)
+
+
+def test_bounded_webview_output_preserves_handshake_in_window(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """The handshake line is emitted early, within the retained window,
+    so it stays visible to the startup scan even after later output and
+    across chunk boundaries."""
+    sink = viewer_fixtures.u._BoundedWebviewOutput(maxlen=1024)
+    sink('booting\nAnthias service ')
+    sink('start\n')
+    sink('more logs after handshake\n')
+    assert viewer_fixtures.u.BROWSER_HANDSHAKE_LINE in sink.text()
+
+
+def test_load_browser_retries_then_succeeds(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """A board that crashes the webview on the first launches but comes
+    up on a later one must self-heal in-process — the whole point of the
+    spawn retry (the pi3 Qt5/WebEngine heap-corruption crash). Also
+    asserts the backoff actually grows (1s then 2s) rather than hammering."""
+    attempts = {'n': 0}
+
+    def fake_spawn(_startup_timeout: float) -> mock.Mock:
+        attempts['n'] += 1
+        if attempts['n'] < 3:
+            raise viewer_fixtures.u.WebviewLaunchError('init crash')
+        return mock.Mock(name='browser')
+
+    viewer_fixtures.p_sleep.start()
+    try:
+        with mock.patch.object(
+            viewer_fixtures.u, '_spawn_webview_once', side_effect=fake_spawn
+        ):
+            viewer_fixtures.u.load_browser()
+    finally:
+        viewer_fixtures.p_sleep.stop()
+
+    assert attempts['n'] == 3
+    assert viewer_fixtures.u.browser is not None
+    # The two failed attempts must have slept with growing backoff —
+    # guards against a regression that drops the sleep (tight loop).
+    backoff_sleeps = [
+        c.args[0] for c in viewer_fixtures.m_sleep.call_args_list if c.args
+    ]
+    assert backoff_sleeps == [1, 2]
+
+
+def test_load_browser_raises_after_exhausting_retries(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """When every attempt fails, load_browser still raises — but only
+    after spending the retry budget, so the fall-through to a container
+    restart is slow, not a tight loop."""
+    viewer_fixtures.p_sleep.start()
+    try:
+        with (
+            mock.patch.object(
+                viewer_fixtures.u,
+                '_spawn_webview_once',
+                side_effect=viewer_fixtures.u.WebviewLaunchError('crash'),
+            ),
+            mock.patch.object(
+                viewer_fixtures.u, 'BROWSER_SPAWN_MAX_ATTEMPTS', 4
+            ),
+            pytest.raises(viewer_fixtures.u.WebviewLaunchError),
+        ):
+            viewer_fixtures.u.load_browser()
+    finally:
+        viewer_fixtures.p_sleep.stop()
+
+
+def test_load_browser_missing_binary_short_circuits(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """A permanent failure (missing binary) must NOT consume the retry
+    budget — it raises on the first attempt with no backoff."""
+    calls = {'n': 0}
+
+    def fake_spawn(_startup_timeout: float) -> mock.Mock:
+        calls['n'] += 1
+        raise viewer_fixtures.u.WebviewBinaryMissingError('nope')
+
+    viewer_fixtures.p_sleep.start()
+    try:
+        with (
+            mock.patch.object(
+                viewer_fixtures.u,
+                '_spawn_webview_once',
+                side_effect=fake_spawn,
+            ),
+            pytest.raises(viewer_fixtures.u.WebviewBinaryMissingError),
+        ):
+            viewer_fixtures.u.load_browser()
+    finally:
+        viewer_fixtures.p_sleep.stop()
+
+    assert calls['n'] == 1
+
+
+def test_load_browser_inline_budget_limits_attempts(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """The mid-playback respawn path passes a small budget so a
+    persistent failure can't freeze the asset_loop for minutes — the
+    explicit max_attempts caps the spawn count."""
+    calls = {'n': 0}
+
+    def fake_spawn(_startup_timeout: float) -> mock.Mock:
+        calls['n'] += 1
+        raise viewer_fixtures.u.WebviewLaunchError('crash')
+
+    viewer_fixtures.p_sleep.start()
+    try:
+        with (
+            mock.patch.object(
+                viewer_fixtures.u,
+                '_spawn_webview_once',
+                side_effect=fake_spawn,
+            ),
+            pytest.raises(viewer_fixtures.u.WebviewLaunchError),
+        ):
+            viewer_fixtures.u.load_browser(
+                max_attempts=2, backoff_cap=2, startup_timeout=5
+            )
+    finally:
+        viewer_fixtures.p_sleep.stop()
+
+    assert calls['n'] == 2
 
 
 def test_view_webpage_arms_reload_interval(
@@ -205,8 +1299,210 @@ def test_view_webpage_arms_reload_interval(
     ):
         viewer_fixtures.u.view_webpage('https://example.com', 30)
 
-    fake_bus.loadPage.assert_called_once_with('https://example.com')
+    fake_bus.loadPage.assert_called_once_with('https://example.com', False)
     fake_bus.setReloadInterval.assert_called_once_with(30)
+
+
+@pytest.mark.parametrize('skip_ssl', [True, False])
+def test_view_image_passes_skip_ssl_verify(
+    viewer_fixtures: _ViewerFixtures, skip_ssl: bool
+) -> None:
+    """The per-asset SSL policy must reach the C++ webview's loadImage
+    D-Bus slot so a self-signed HTTPS image can be trusted per-asset."""
+    fake_bus = mock.Mock()
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', None),
+        mock.patch.object(
+            viewer_fixtures.u, 'current_browser_skip_ssl', False
+        ),
+    ):
+        viewer_fixtures.u.view_image(
+            'https://example.com/x.jpg', skip_ssl_verify=skip_ssl
+        )
+
+    fake_bus.loadImage.assert_called_once_with(
+        'https://example.com/x.jpg', skip_ssl
+    )
+
+
+@pytest.mark.parametrize('skip_ssl', [True, False])
+def test_view_webpage_passes_skip_ssl_verify(
+    viewer_fixtures: _ViewerFixtures, skip_ssl: bool
+) -> None:
+    """Same per-asset SSL policy must reach loadPage for webpage
+    assets (QWebEngine certificate-error handling on the C++ side)."""
+    fake_bus = mock.Mock()
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', None),
+        mock.patch.object(
+            viewer_fixtures.u, 'current_browser_skip_ssl', False
+        ),
+    ):
+        viewer_fixtures.u.view_webpage(
+            'https://example.com', 0, skip_ssl_verify=skip_ssl
+        )
+
+    fake_bus.loadPage.assert_called_once_with('https://example.com', skip_ssl)
+
+
+def test_view_image_reissues_when_skip_ssl_flips(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """Toggling skip_ssl_verify on the currently-displayed asset (URI
+    unchanged) must re-issue loadImage — the URI-only dedup would
+    otherwise swallow it and leave a blank self-signed image."""
+    fake_bus = mock.Mock()
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(
+            viewer_fixtures.u, 'current_browser_url', 'https://h/x.jpg'
+        ),
+        mock.patch.object(
+            viewer_fixtures.u, 'current_browser_skip_ssl', False
+        ),
+    ):
+        # Same URI, flag flipped on — must re-send.
+        viewer_fixtures.u.view_image('https://h/x.jpg', skip_ssl_verify=True)
+
+    fake_bus.loadImage.assert_called_once_with('https://h/x.jpg', True)
+
+
+def test_view_webpage_falls_back_to_1arg_loadpage_on_version_skew(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """A webview still running the previous binary exposes only the
+    1-arg ``loadPage(s)`` slot. The 2-arg call must not blank the
+    screen: the viewer falls back to the legacy 1-arg call so the page
+    still loads (losing only the per-asset SSL skip that older webview
+    couldn't honour anyway) and latches the capability off so the next
+    tick skips the doomed 2-arg attempt."""
+    fake_bus = mock.Mock()
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+
+    def load_page(*args: object) -> None:
+        if len(args) == 2:
+            raise RuntimeError(
+                'org.freedesktop.DBus.Error.UnknownMethod: no such method'
+            )
+
+    fake_bus.loadPage.side_effect = load_page
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', None),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_headers', {}),
+        mock.patch.object(
+            viewer_fixtures.u, 'current_browser_skip_ssl', False
+        ),
+        mock.patch.object(
+            viewer_fixtures.u, '_webview_supports_ssl_arg', True
+        ),
+    ):
+        viewer_fixtures.u.view_webpage(
+            'https://example.com', skip_ssl_verify=True
+        )
+        # 2-arg attempt, then the 1-arg fallback that kept the screen up.
+        assert fake_bus.loadPage.call_args_list == [
+            mock.call('https://example.com', True),
+            mock.call('https://example.com'),
+        ]
+        # Latched off so the next rotation goes straight to 1-arg.
+        assert viewer_fixtures.u._webview_supports_ssl_arg is False
+        # The URL cache advanced despite the skew (asset displayed).
+        assert viewer_fixtures.u.current_browser_url == 'https://example.com'
+
+
+def test_view_image_falls_back_to_1arg_loadimage_on_version_skew(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """Same version-skew fallback for the image path: a 1-arg-only
+    webview must still get ``loadImage(uri)`` so a self-signed image
+    isn't left blank on a mismatched viewer/webview pair."""
+    fake_bus = mock.Mock()
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+
+    def load_image(*args: object) -> None:
+        if len(args) == 2:
+            raise RuntimeError(
+                'org.freedesktop.DBus.Error.UnknownMethod: no such method'
+            )
+
+    fake_bus.loadImage.side_effect = load_image
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', None),
+        mock.patch.object(
+            viewer_fixtures.u, 'current_browser_skip_ssl', False
+        ),
+        mock.patch.object(
+            viewer_fixtures.u, '_webview_supports_ssl_arg', True
+        ),
+    ):
+        viewer_fixtures.u.view_image('https://h/x.jpg', skip_ssl_verify=True)
+        assert fake_bus.loadImage.call_args_list == [
+            mock.call('https://h/x.jpg', True),
+            mock.call('https://h/x.jpg'),
+        ]
+        assert viewer_fixtures.u._webview_supports_ssl_arg is False
+        assert viewer_fixtures.u.current_browser_url == 'https://h/x.jpg'
+
+
+def test_view_webpage_skew_fallback_reraises_when_1arg_also_fails(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """If the 1-arg fallback also fails, the extra argument wasn't the
+    problem — the original error propagates and the capability is NOT
+    latched off, so a genuinely-supported webview isn't downgraded by a
+    transient failure."""
+    fake_bus = mock.Mock()
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+    # Every call fails with a non-"gone" error (so _send_to_webview
+    # doesn't respawn) — both the 2-arg and the 1-arg fallback.
+    fake_bus.loadPage.side_effect = RuntimeError(
+        'GDBus.Error:org.freedesktop.DBus.Error.Disconnected: closed'
+    )
+    m_load_browser = mock.Mock(name='load_browser')
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', None),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_headers', {}),
+        mock.patch.object(
+            viewer_fixtures.u, 'current_browser_skip_ssl', False
+        ),
+        mock.patch.object(
+            viewer_fixtures.u, '_webview_supports_ssl_arg', True
+        ),
+        mock.patch.object(viewer_fixtures.u, 'load_browser', m_load_browser),
+    ):
+        with pytest.raises(RuntimeError, match='Disconnected'):
+            viewer_fixtures.u.view_webpage(
+                'https://example.com', skip_ssl_verify=True
+            )
+        # Not a signature skew — capability stays on, URL not latched.
+        assert viewer_fixtures.u._webview_supports_ssl_arg is True
+        assert viewer_fixtures.u.current_browser_url is None
 
 
 def test_view_webpage_default_zero_interval(
@@ -229,16 +1525,317 @@ def test_view_webpage_default_zero_interval(
     fake_bus.setReloadInterval.assert_called_once_with(0)
 
 
+def test_view_webpage_sends_custom_headers(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """``view_webpage`` pushes the asset's custom headers to the webview
+    as a JSON string via ``setRequestHeaders`` before ``loadPage``, so
+    the C++ interceptor is armed when the navigation fires (#2215)."""
+    import json
+
+    fake_bus = mock.Mock()
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+    headers = {'Authorization': 'Bearer abc'}
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', None),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_headers', {}),
+    ):
+        viewer_fixtures.u.view_webpage('https://example.com', headers=headers)
+
+    fake_bus.setRequestHeaders.assert_called_once_with(json.dumps(headers))
+    fake_bus.loadPage.assert_called_once_with('https://example.com', False)
+
+
+def test_view_webpage_no_headers_sends_empty_object(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """A header-less webpage still calls ``setRequestHeaders('{}')`` so
+    the webview clears any headers left by a previous asset."""
+    fake_bus = mock.Mock()
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', None),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_headers', {}),
+    ):
+        viewer_fixtures.u.view_webpage('https://example.com')
+
+    fake_bus.setRequestHeaders.assert_called_once_with('{}')
+
+
+def test_view_webpage_reloads_when_only_headers_change(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """An edit that changes the headers but not the URL must still
+    re-issue ``loadPage`` so the new headers reach the main document,
+    not just later same-host XHR."""
+    fake_bus = mock.Mock()
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+    url = 'https://example.com'
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', url),
+        mock.patch.object(
+            viewer_fixtures.u, 'current_browser_headers', {'X-Old': '1'}
+        ),
+    ):
+        viewer_fixtures.u.view_webpage(url, headers={'X-New': '2'})
+
+    fake_bus.loadPage.assert_called_once_with(url, False)
+
+
+def test_view_webpage_no_reload_when_url_and_headers_unchanged(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """The unchanged-URL short-circuit still holds when the headers are
+    also unchanged: no ``loadPage``, but ``setRequestHeaders`` is still
+    (idempotently) sent."""
+    fake_bus = mock.Mock()
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+    url = 'https://example.com'
+    headers = {'X-Same': '1'}
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', url),
+        mock.patch.object(
+            viewer_fixtures.u, 'current_browser_headers', dict(headers)
+        ),
+    ):
+        viewer_fixtures.u.view_webpage(url, headers=headers)
+
+    fake_bus.loadPage.assert_not_called()
+    fake_bus.setRequestHeaders.assert_called_once()
+
+
+def test_view_webpage_setrequestheaders_version_skew_latches_off(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """An older AnthiasViewer without the ``setRequestHeaders`` slot
+    raises UnknownMethod; the capability latches off so we stop calling
+    it, and the asset still loads (no screen-down)."""
+    fake_bus = mock.Mock()
+    fake_bus.setRequestHeaders.side_effect = Exception(
+        'org.freedesktop.DBus.Error.UnknownMethod: no such method'
+    )
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', None),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_headers', {}),
+        mock.patch.object(
+            viewer_fixtures.u,
+            '_webview_supports_set_request_headers',
+            True,
+        ),
+    ):
+        viewer_fixtures.u.view_webpage(
+            'https://example.com', headers={'X': '1'}
+        )
+        # First call attempted the slot, hit UnknownMethod, latched off.
+        assert viewer_fixtures.u._webview_supports_set_request_headers is False
+        fake_bus.setRequestHeaders.assert_called_once()
+        # Page still loaded despite the missing slot.
+        fake_bus.loadPage.assert_called_once_with('https://example.com', False)
+
+        # A second webpage tick no longer calls the slot at all.
+        viewer_fixtures.u.view_webpage(
+            'https://example.org', headers={'X': '2'}
+        )
+        fake_bus.setRequestHeaders.assert_called_once()
+
+
+def test_view_webpage_transient_header_failure_defers_navigation(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """A *transient* setRequestHeaders failure (not UnknownMethod) must
+    DEFER loadPage entirely. The C++ side still holds the previous
+    asset's staged headers, so navigating now would scope those stale
+    headers to the new asset's origin — a cross-asset credential leak.
+    The URL/header cache is left stale so the next tick retries once the
+    D-Bus call succeeds. Regression guard (#2215, Copilot review)."""
+    fake_bus = mock.Mock()
+    fake_bus.setRequestHeaders.side_effect = Exception(
+        'org.freedesktop.DBus.Error.NoReply: bus busy'
+    )
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+    # Transitioning from a prior asset (different origin) to this one.
+    prev_url = 'https://prev.example.com'
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', prev_url),
+        mock.patch.object(
+            viewer_fixtures.u, 'current_browser_headers', {'Old': '1'}
+        ),
+        mock.patch.object(
+            viewer_fixtures.u,
+            '_webview_supports_set_request_headers',
+            True,
+        ),
+    ):
+        viewer_fixtures.u.view_webpage(
+            'https://new.example.com', headers={'X': '1'}
+        )
+
+        # Transient failure did not latch the capability off (retryable).
+        assert viewer_fixtures.u._webview_supports_set_request_headers is True
+        # Navigation is deferred: no loadPage, and the cache stays on the
+        # previous asset so the next tick retries.
+        fake_bus.loadPage.assert_not_called()
+        assert viewer_fixtures.u.current_browser_url == prev_url
+        assert viewer_fixtures.u.current_browser_headers == {'Old': '1'}
+
+
+def test_view_webpage_nocache_busts_url(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """A ``nocache`` webpage is loaded with a unique query token so it's
+    fetched fresh instead of served from QtWebEngine's HTTP cache
+    (#3137, restoring refs #11). setReloadInterval still fires."""
+    fake_bus = mock.Mock()
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', None),
+        mock.patch.object(viewer_fixtures.u, 'time', return_value=1234.567),
+    ):
+        viewer_fixtures.u.view_webpage('https://example.com', 30, nocache=True)
+
+    fake_bus.loadPage.assert_called_once_with(
+        'https://example.com?_anthias_nc=1234567', False
+    )
+    fake_bus.setReloadInterval.assert_called_once_with(30)
+
+
+def test_view_webpage_nocache_preserves_existing_query(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """Cache-busting must merge into an existing query string, not
+    replace it — a dashboard URL's own parameters have to survive."""
+    fake_bus = mock.Mock()
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', None),
+        mock.patch.object(viewer_fixtures.u, 'time', return_value=2.0),
+    ):
+        viewer_fixtures.u.view_webpage(
+            'https://example.com/dash?tab=sales&x=1', nocache=True
+        )
+
+    (loaded, _skip), _ = fake_bus.loadPage.call_args
+    assert loaded.startswith('https://example.com/dash?')
+    assert 'tab=sales' in loaded
+    assert 'x=1' in loaded
+    assert '_anthias_nc=2000' in loaded
+
+
+def test_view_webpage_nocache_preserves_encoded_query_verbatim(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """The existing query string must reach the origin byte-for-byte —
+    a signed/pre-encoded URL breaks if %20/+ or percent-encoding is
+    normalised. The buster appends, it must not decode/re-encode."""
+    fake_bus = mock.Mock()
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+
+    signed = 'https://s3.example/o?X-Sig=a%2Bb%2Fc%3D&name=q%20r'
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', None),
+        mock.patch.object(viewer_fixtures.u, 'time', return_value=3.0),
+    ):
+        viewer_fixtures.u.view_webpage(signed, nocache=True)
+
+    (loaded, _skip), _ = fake_bus.loadPage.call_args
+    assert loaded == signed + '&_anthias_nc=3000'
+
+
+def test_view_webpage_nocache_reloads_each_display(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """The unique token per display defeats the unchanged-URL
+    short-circuit: showing the same nocache asset twice must issue two
+    distinct loadPage calls (a fresh fetch each rotation), unlike a
+    cached webpage which would skip the second load."""
+    fake_bus = mock.Mock()
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', None),
+        mock.patch.object(viewer_fixtures.u, 'time', side_effect=[10.0, 20.0]),
+    ):
+        viewer_fixtures.u.view_webpage('https://example.com', nocache=True)
+        viewer_fixtures.u.view_webpage('https://example.com', nocache=True)
+
+    assert fake_bus.loadPage.call_count == 2
+    first = fake_bus.loadPage.call_args_list[0].args[0]
+    second = fake_bus.loadPage.call_args_list[1].args[0]
+    assert first != second
+
+
+def test_view_webpage_without_nocache_leaves_url_untouched(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """The default (nocache=False) path must load the exact URL — no
+    stray cache-busting parameter for ordinary webpage assets."""
+    fake_bus = mock.Mock()
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', None),
+    ):
+        viewer_fixtures.u.view_webpage('https://example.com/dash?tab=1')
+
+    fake_bus.loadPage.assert_called_once_with(
+        'https://example.com/dash?tab=1', False
+    )
+
+
 @pytest.mark.parametrize(
     'error_message,expected_call_count',
     [
-        # An older AnthiasWebview without setReloadInterval raises
+        # An older AnthiasViewer without setReloadInterval raises
         # UnknownMethod — viewer must latch the capability flag off
         # so the next rotation skips the D-Bus hop instead of
         # refilling journald.
         (
-            'GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: '
-            "No such method 'setReloadInterval'",
+            (
+                'GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: '
+                "No such method 'setReloadInterval'"
+            ),
             1,
         ),
         # Transient D-Bus error (bus disconnect, timeout, race during
@@ -285,9 +1882,8 @@ def test_load_browser_resets_set_reload_interval_capability(
     and we shouldn't leave auto-refresh permanently disabled because
     the *old* process didn't have it."""
     browser_proc = viewer_fixtures.m_cmd.return_value.return_value
-    _stub_browser_stdout_chunks(
-        browser_proc,
-        [b'Anthias service start\n'],
+    _capture_out_sink(
+        viewer_fixtures, browser_proc, seed='Anthias service start\n'
     )
     browser_proc.is_alive.return_value = True
     viewer_fixtures.p_cmd.start()
@@ -328,6 +1924,165 @@ def test_view_webpage_resets_interval_on_unchanged_url(
 
     fake_bus.loadPage.assert_not_called()
     fake_bus.setReloadInterval.assert_called_once_with(90)
+
+
+# What pydbus raises when the webview dies while a call is in flight
+# (Sentry 58040ab3 — the post-handshake armv7 heap-corruption crash)
+# and when it died before the call and released the bus name.
+_NOREPLY_ERROR = (
+    'GDBus.Error:org.freedesktop.DBus.Error.NoReply: Message recipient '
+    'disconnected from message bus without replying'
+)
+_SERVICE_UNKNOWN_ERROR = (
+    'GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The name '
+    'anthias.viewer was not provided by any .service files'
+)
+
+_INLINE_BUDGET_KWARGS = {
+    'max_attempts': viewer.BROWSER_SPAWN_INLINE_MAX_ATTEMPTS,
+    'backoff_cap': viewer.BROWSER_SPAWN_INLINE_BACKOFF_CAP_SECONDS,
+    'startup_timeout': viewer.BROWSER_SPAWN_INLINE_TIMEOUT_SECONDS,
+}
+
+
+@pytest.mark.parametrize(
+    'error_message',
+    [_NOREPLY_ERROR, _SERVICE_UNKNOWN_ERROR],
+    ids=['noreply-mid-call', 'service-unknown'],
+)
+def test_view_image_respawns_webview_on_mid_call_death(
+    viewer_fixtures: _ViewerFixtures,
+    error_message: str,
+) -> None:
+    """A webview that survives the handshake but dies during the
+    ``loadImage`` D-Bus call must be reaped, respawned with the inline
+    budget, and sent the image again — not crash the viewer process
+    (Sentry 58040ab3)."""
+    uri = 'https://example.com/a.png'
+    fake_bus = mock.Mock()
+    fake_bus.loadImage.side_effect = [RuntimeError(error_message), None]
+    fake_browser = mock.Mock()
+    # Alive for view_image's liveness check, gone once
+    # _terminate_webview polls it after SIGTERM.
+    fake_browser.is_alive.side_effect = [True, False]
+    m_load_browser = mock.Mock(name='load_browser')
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', None),
+        mock.patch.object(viewer_fixtures.u, 'load_browser', m_load_browser),
+    ):
+        viewer_fixtures.u.view_image(uri)
+        # The retried send succeeded, so the latch must reflect it.
+        assert viewer_fixtures.u.current_browser_url == uri
+
+    assert fake_bus.loadImage.call_count == 2
+    fake_browser.terminate.assert_called_once()
+    m_load_browser.assert_called_once_with(**_INLINE_BUDGET_KWARGS)
+
+
+def test_view_webpage_respawns_webview_on_mid_call_death(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """Same recovery contract for the ``loadPage`` path — and the
+    auto-refresh timer must still be armed on the respawned process."""
+    uri = 'https://example.com'
+    fake_bus = mock.Mock()
+    fake_bus.loadPage.side_effect = [RuntimeError(_NOREPLY_ERROR), None]
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.side_effect = [True, False]
+    m_load_browser = mock.Mock(name='load_browser')
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', None),
+        mock.patch.object(viewer_fixtures.u, 'load_browser', m_load_browser),
+    ):
+        viewer_fixtures.u.view_webpage(uri, 30)
+        assert viewer_fixtures.u.current_browser_url == uri
+
+    assert fake_bus.loadPage.call_count == 2
+    m_load_browser.assert_called_once_with(**_INLINE_BUDGET_KWARGS)
+    fake_bus.setReloadInterval.assert_called_once_with(30)
+
+
+def test_view_image_reraises_unrelated_dbus_error(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """Method-level failures from a live webview (or a dead session
+    bus) are not respawn-worthy — they must propagate so the container
+    restart handles what a webview respawn can't fix."""
+    fake_bus = mock.Mock()
+    fake_bus.loadImage.side_effect = RuntimeError(
+        'GDBus.Error:org.freedesktop.DBus.Error.Disconnected: '
+        'The connection is closed'
+    )
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+    m_load_browser = mock.Mock(name='load_browser')
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser_bus', fake_bus),
+        mock.patch.object(viewer_fixtures.u, 'browser', fake_browser),
+        mock.patch.object(viewer_fixtures.u, 'current_browser_url', None),
+        mock.patch.object(viewer_fixtures.u, 'load_browser', m_load_browser),
+    ):
+        with pytest.raises(RuntimeError, match='Disconnected'):
+            viewer_fixtures.u.view_image('https://example.com/a.png')
+        # The failed send must not latch the URL or trigger a respawn.
+        assert viewer_fixtures.u.current_browser_url is None
+
+    m_load_browser.assert_not_called()
+    fake_browser.terminate.assert_not_called()
+
+
+def test_send_to_webview_raises_when_retry_also_fails(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """One respawn-and-retry, then give up: if the freshly spawned
+    webview dies mid-call too, the error escapes so the container
+    restart remains the last resort."""
+    send = mock.Mock(side_effect=RuntimeError(_NOREPLY_ERROR))
+    m_load_browser = mock.Mock(name='load_browser')
+
+    with (
+        mock.patch.object(viewer_fixtures.u, 'browser', None),
+        mock.patch.object(viewer_fixtures.u, 'load_browser', m_load_browser),
+        pytest.raises(RuntimeError, match='NoReply'),
+    ):
+        viewer_fixtures.u._send_to_webview(send)
+
+    assert send.call_count == 2
+    m_load_browser.assert_called_once_with(**_INLINE_BUDGET_KWARGS)
+
+
+def test_load_browser_resets_current_browser_url(
+    viewer_fixtures: _ViewerFixtures,
+) -> None:
+    """A fresh webview displays nothing, so the previous process's URL
+    must not short-circuit the next view_* value comparison — with an
+    unchanged URL (single-asset playlist) the respawned webview would
+    otherwise stay blank forever."""
+    browser_proc = viewer_fixtures.m_cmd.return_value.return_value
+    _capture_out_sink(
+        viewer_fixtures, browser_proc, seed='Anthias service start\n'
+    )
+    browser_proc.is_alive.return_value = True
+    viewer_fixtures.p_cmd.start()
+    viewer_fixtures.p_sleep.start()
+    try:
+        with mock.patch.object(
+            viewer_fixtures.u,
+            'current_browser_url',
+            'https://example.com/stale.png',
+        ):
+            viewer_fixtures.u.load_browser()
+            assert viewer_fixtures.u.current_browser_url is None
+    finally:
+        viewer_fixtures.p_sleep.stop()
+        viewer_fixtures.p_cmd.stop()
 
 
 def test_watchdog_should_create_file_if_not_exists(
@@ -534,6 +2289,134 @@ def test_asset_loop_rechecks_unreachable_remote_asset() -> None:
     trigger.assert_called_once_with('remote')
 
 
+def test_asset_loop_passes_nocache_flag_to_view_webpage() -> None:
+    """A webpage asset with ``nocache`` set must reach view_webpage with
+    nocache=True so the URL is fetched fresh (#3137). The default-False
+    case is guarded by the non-nocache webpage path."""
+    scheduler = mock.Mock()
+    scheduler.get_next_asset.return_value = {
+        'asset_id': 'web',
+        'name': 'dashboard',
+        'uri': 'https://example.com/dash',
+        'mimetype': 'webpage',
+        'duration': 10,
+        'skip_asset_check': True,
+        'is_reachable': True,
+        'nocache': True,
+        'metadata': {},
+    }
+    skip_event = mock.Mock()
+    skip_event.wait.return_value = False
+    with (
+        mock.patch('anthias_viewer.view_webpage') as view_webpage,
+        mock.patch('anthias_viewer.get_skip_event', return_value=skip_event),
+    ):
+        viewer.asset_loop(scheduler)
+    _, kwargs = view_webpage.call_args
+    assert kwargs['nocache'] is True
+
+
+def test_asset_loop_clamps_out_of_range_duration() -> None:
+    """A stored duration past C ``PyTime_t`` range must not crash the
+    loop (Sentry ANTHIAS-3E) — ``threading.Event.wait`` raises
+    OverflowError on such a timeout and the whole viewer crash-loops.
+    The API rejects these on write; this is the read-side guard for
+    pre-existing rows. 9999999999999 is the real value from the
+    incident."""
+    scheduler = mock.Mock()
+    scheduler.get_next_asset.return_value = {
+        'asset_id': 'huge',
+        'name': 'huge',
+        'uri': 'https://example.com/pinned.png',
+        'mimetype': 'image',
+        'duration': 9999999999999,
+        'skip_asset_check': True,
+        'is_reachable': True,
+    }
+    skip_event = mock.Mock()
+    skip_event.wait.return_value = False
+    with (
+        mock.patch('anthias_viewer.view_image'),
+        mock.patch('anthias_viewer.watchdog'),
+        mock.patch('anthias_viewer.get_skip_event', return_value=skip_event),
+        mock.patch('anthias_viewer.monotonic', return_value=0.0),
+    ):
+        viewer.asset_loop(scheduler)
+    skip_event.wait.assert_called_once_with(timeout=DURATION_S_MAX)
+
+
+def _timed_asset(mimetype: str, duration: int) -> dict[str, Any]:
+    return {
+        'asset_id': 'a',
+        'name': 'a',
+        'uri': 'https://example.com/a',
+        'mimetype': mimetype,
+        'duration': duration,
+        'skip_asset_check': True,
+        'is_reachable': True,
+    }
+
+
+def _run_timed_tick(
+    mimetype: str, duration: int, scheduler_cost: float, view_cost: float
+) -> mock.Mock:
+    """Run one asset_loop tick on a fake monotonic clock that advances
+    by ``scheduler_cost`` inside ``get_next_asset`` and by ``view_cost``
+    inside ``view_image`` (which ``view_video`` also calls, to blank the
+    webview), and return the skip event so the caller can assert on the
+    wait timeout. Costs are binary fractions so the expected remainder
+    compares exactly."""
+    clock = [100.0]
+
+    def get_next_asset() -> dict[str, Any]:
+        clock[0] += scheduler_cost
+        return _timed_asset(mimetype, duration)
+
+    def slow_view(*_args: Any, **_kwargs: Any) -> None:
+        clock[0] += view_cost
+
+    scheduler = mock.Mock()
+    scheduler.get_next_asset.side_effect = get_next_asset
+    skip_event = mock.Mock()
+    skip_event.wait.return_value = False
+    with (
+        mock.patch('anthias_viewer.view_image', side_effect=slow_view),
+        mock.patch('anthias_viewer.watchdog'),
+        mock.patch('anthias_viewer.get_skip_event', return_value=skip_event),
+        mock.patch('anthias_viewer.monotonic', side_effect=lambda: clock[0]),
+        mock.patch(
+            'anthias_viewer.MediaPlayerProxy.get_instance',
+            return_value=mock.Mock(),
+        ),
+    ):
+        viewer.asset_loop(scheduler)
+    return skip_event
+
+
+def test_asset_loop_wait_is_a_deadline_not_a_flat_duration() -> None:
+    """The wait must absorb the tick's own overhead, both the scheduler
+    refresh before the display call and the display call itself, so
+    one rotation takes exactly ``duration`` and co-located players
+    don't drift apart (GH #3319)."""
+    skip_event = _run_timed_tick('image', 10, 0.5, 1.5)
+    skip_event.wait.assert_called_once_with(timeout=8.0)
+
+
+def test_asset_loop_video_wait_is_the_same_deadline() -> None:
+    """``view_video`` has its own wait; it must be anchored on the same
+    tick start, or playlists with video keep drifting."""
+    skip_event = _run_timed_tick('video', 10, 0.5, 1.5)
+    skip_event.wait.assert_called_once_with(timeout=8.0)
+
+
+def test_asset_loop_wait_never_goes_negative() -> None:
+    """A browser respawn inside the tick can outlast a short duration;
+    the asset then moves on at once rather than waiting a negative
+    remainder."""
+    skip_event = _run_timed_tick('image', 2, 0.0, 30.0)
+    skip_event.wait.assert_called_once_with(timeout=0.0)
+
+
 # ---------------------------------------------------------------------------
 # _handle_reload / _skip_if_current_asset_inactive — issue #2430
 # ---------------------------------------------------------------------------
@@ -702,6 +2585,449 @@ def test_rotation_value_clamps(raw: Any, expected: int) -> None:
         assert viewer._rotation_value() == expected
 
 
+# ---------------------------------------------------------------------------
+# Prefer dark mode — the C++ webview reads ANTHIAS_PREFER_DARK_MODE at
+# launch (applyDarkModePreference in src/anthias_webview/src/main.cpp).
+
+
+@pytest.fixture
+def reset_dark_mode_state() -> Iterator[None]:
+    """_last_applied_dark_mode + _rotation_bounce_pending are module
+    state — snapshot and restore so these tests don't bleed into each
+    other or the rotation tests that share the bounce flag."""
+    prior_dark = viewer._last_applied_dark_mode
+    prior_pending = viewer._rotation_bounce_pending
+    try:
+        viewer._last_applied_dark_mode = False
+        viewer._rotation_bounce_pending = False
+        yield
+    finally:
+        viewer._last_applied_dark_mode = prior_dark
+        viewer._rotation_bounce_pending = prior_pending
+
+
+def test_build_webview_env_sets_dark_mode_flag_when_enabled() -> None:
+    with (
+        mock.patch.dict(settings, {'prefer_dark_mode': True}),
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'linuxfb'}, clear=False
+        ),
+    ):
+        env = viewer._build_webview_env()
+    assert env['ANTHIAS_PREFER_DARK_MODE'] == '1'
+
+
+def test_build_webview_env_drops_dark_mode_flag_when_disabled() -> None:
+    # A stale value inherited from the process env must not leak into the
+    # spawned webview when the operator turns the setting back off.
+    with (
+        mock.patch.dict(settings, {'prefer_dark_mode': False}),
+        mock.patch.dict(
+            os.environ,
+            {'QT_QPA_PLATFORM': 'linuxfb', 'ANTHIAS_PREFER_DARK_MODE': '1'},
+            clear=False,
+        ),
+    ):
+        env = viewer._build_webview_env()
+    assert 'ANTHIAS_PREFER_DARK_MODE' not in env
+
+
+# Video presentation substrate — pi3-64 (VideoCore IV / GLES2) can't
+# scan out the QML VideoOutput RHI path (issue #3084), so the Python side
+# flags it onto the C++ non-VideoOutput presenter: ANTHIAS_VIDEO_OVERLAY
+# selects the GStreamer vc4 overlay-plane path (preferred), with the
+# ANTHIAS_VIDEO_RASTER CPU-raster blit as the fallback. Every other board
+# keeps the GPU VideoOutput path.
+
+
+def test_build_webview_env_sets_video_raster_on_pi3_64() -> None:
+    with (
+        mock.patch.dict(settings, {'screen_rotation': 0}),
+        mock.patch.dict(
+            os.environ,
+            {'QT_QPA_PLATFORM': 'eglfs', 'DEVICE_TYPE': 'pi3-64'},
+            clear=False,
+        ),
+    ):
+        env = viewer._build_webview_env()
+    assert env['ANTHIAS_VIDEO_RASTER'] == '1'
+    # Upright: the fast HW overlay-plane path is the pi3-64 default;
+    # assert it so the default can't regress to the (slow) raster blit
+    # silently.
+    assert env['ANTHIAS_VIDEO_OVERLAY'] == '1'
+
+
+@pytest.mark.parametrize('rotation', [90, 270])
+def test_build_webview_env_pi3_64_drops_overlay_for_90_270(
+    rotation: int,
+) -> None:
+    """forum 6730: the pi3-64 vc4 overlay plane is scanned out
+    independently of the eglfs QOpenGLCompositor, so QT_QPA_EGLFS_ROTATION
+    can't rotate it. The plane hardware can only rotate 0°/180°, so at
+    90°/270° we must drop ANTHIAS_VIDEO_OVERLAY and let VideoView fall
+    back to the eglfs-composited raster blit, which inherits the rotation
+    like images/webpages. ANTHIAS_VIDEO_RASTER stays set (it selects the
+    non-VideoOutput presenter regardless of overlay)."""
+    with (
+        mock.patch.dict(settings, {'screen_rotation': rotation}),
+        mock.patch.dict(
+            os.environ,
+            {
+                'QT_QPA_PLATFORM': 'eglfs',
+                'DEVICE_TYPE': 'pi3-64',
+                # A stale overlay flag inherited from the process env must
+                # be actively dropped, not merely left unset.
+                'ANTHIAS_VIDEO_OVERLAY': '1',
+            },
+            clear=False,
+        ),
+    ):
+        env = viewer._build_webview_env()
+    assert env['ANTHIAS_VIDEO_RASTER'] == '1'
+    assert 'ANTHIAS_VIDEO_OVERLAY' not in env
+    # Sanity: the screen itself still rotates via eglfs (clockwise, so
+    # 90° CW is spelled -90 and 270° CW is spelled 90).
+    assert env['QT_QPA_EGLFS_ROTATION'] == ('-90' if rotation == 90 else '90')
+
+
+def test_build_webview_env_pi3_64_keeps_overlay_at_180() -> None:
+    """180° is the one rotated case the vc4 overlay plane CAN do in
+    hardware (rotate-180 is a free scanout transform — full 30 fps, no
+    CPU cost). So keep ANTHIAS_VIDEO_OVERLAY at 180°; VideoView reads
+    QT_QPA_EGLFS_ROTATION=180 and sets the kmssink plane rotation to
+    match the eglfs-rotated UI (forum 6730)."""
+    with (
+        mock.patch.dict(settings, {'screen_rotation': 180}),
+        mock.patch.dict(
+            os.environ,
+            {'QT_QPA_PLATFORM': 'eglfs', 'DEVICE_TYPE': 'pi3-64'},
+            clear=False,
+        ),
+    ):
+        env = viewer._build_webview_env()
+    assert env['ANTHIAS_VIDEO_RASTER'] == '1'
+    assert env['ANTHIAS_VIDEO_OVERLAY'] == '1'
+    assert env['QT_QPA_EGLFS_ROTATION'] == '180'
+
+
+def test_build_webview_env_no_video_raster_on_pi4_64() -> None:
+    # Pi 4 (V3D 4.2) keeps the GPU VideoOutput path; stale flags
+    # inherited from the process env must not leak onto it.
+    with mock.patch.dict(
+        os.environ,
+        {
+            'QT_QPA_PLATFORM': 'eglfs',
+            'DEVICE_TYPE': 'pi4-64',
+            'ANTHIAS_VIDEO_RASTER': '1',
+            'ANTHIAS_VIDEO_OVERLAY': '1',
+        },
+        clear=False,
+    ):
+        env = viewer._build_webview_env()
+    assert 'ANTHIAS_VIDEO_RASTER' not in env
+    assert 'ANTHIAS_VIDEO_OVERLAY' not in env
+
+
+# User-Agent token — the C++ webview appends ANTHIAS_UA_TOKEN to
+# QtWebEngine's default User-Agent (the profile setup in
+# src/anthias_webview/src/view.cpp). The token is composed by the
+# canonical get_anthias_product_token() helper.
+
+
+def test_build_webview_env_sets_ua_token() -> None:
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'linuxfb'}, clear=False
+        ),
+        mock.patch(
+            'anthias_viewer.get_anthias_product_token',
+            return_value='Anthias/1.2.3',
+        ),
+    ):
+        env = viewer._build_webview_env()
+    assert env['ANTHIAS_UA_TOKEN'] == 'Anthias/1.2.3'
+
+
+def test_build_webview_env_overwrites_stale_ua_token() -> None:
+    # The token is set unconditionally, so a stale value inherited from
+    # the process env is always overwritten with the freshly composed
+    # one (parity with the dark-mode set-or-clear discipline).
+    with (
+        mock.patch.dict(
+            os.environ,
+            {
+                'QT_QPA_PLATFORM': 'linuxfb',
+                'ANTHIAS_UA_TOKEN': 'Anthias/stale',
+            },
+            clear=False,
+        ),
+        mock.patch(
+            'anthias_viewer.get_anthias_product_token',
+            return_value='Anthias/1.2.3',
+        ),
+    ):
+        env = viewer._build_webview_env()
+    assert env['ANTHIAS_UA_TOKEN'] == 'Anthias/1.2.3'
+
+
+# Low-memory Chromium profile — ~1 GB boards (Pi 3, plus 1 GB Pi 4 / Pi 5
+# SKUs) with no swap head-room slowly grow past their RAM under a
+# long-lived / cycling web-page asset (forum #6731). Chromium only
+# auto-enables its low-memory profile below ~512 MB, so _build_webview_env
+# forces it on for boards the shared is_low_ram_device() gate flags — the
+# same gate that drives the video 1080p cap and the system-info badge.
+# HW-validated on a real Pi 3B+: −78 MB (−35 %) steady-state RSS.
+
+_LOW_MEMORY_FLAGS = '--enable-low-end-device-mode'
+
+
+def test_build_webview_env_injects_low_memory_flags_on_low_ram_board() -> None:
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'linuxfb'}, clear=False
+        ),
+        mock.patch('anthias_viewer.is_low_ram_device', return_value=True),
+    ):
+        env = viewer._build_webview_env()
+    flags = env['QTWEBENGINE_CHROMIUM_FLAGS']
+    assert _LOW_MEMORY_FLAGS in flags
+    assert '--js-flags=--max-old-space-size=64' in flags
+    assert '--renderer-process-limit=1' in flags
+    assert '--process-per-site' in flags
+    assert '--disable-dev-shm-usage' in flags
+
+
+def test_build_webview_env_skips_low_memory_flags_on_roomy_board() -> None:
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'linuxfb'}, clear=False
+        ),
+        mock.patch('anthias_viewer.is_low_ram_device', return_value=False),
+    ):
+        env = viewer._build_webview_env()
+    assert _LOW_MEMORY_FLAGS not in env.get('QTWEBENGINE_CHROMIUM_FLAGS', '')
+
+
+def test_build_webview_env_low_memory_flags_prepend_and_idempotent() -> None:
+    # A device-supplied QTWEBENGINE_CHROMIUM_FLAGS must survive (prepended,
+    # not clobbered), and a value already carrying the low-memory switch
+    # (e.g. inherited on a respawn) must not stack a duplicate.
+    with (
+        mock.patch.dict(
+            os.environ,
+            {
+                'QT_QPA_PLATFORM': 'linuxfb',
+                'QTWEBENGINE_CHROMIUM_FLAGS': '--custom-device-flag',
+            },
+            clear=False,
+        ),
+        mock.patch('anthias_viewer.is_low_ram_device', return_value=True),
+    ):
+        first = viewer._build_webview_env()
+        # Feed the composed value back in to emulate an inherited respawn.
+        with mock.patch.dict(
+            os.environ,
+            {
+                'QTWEBENGINE_CHROMIUM_FLAGS': first[
+                    'QTWEBENGINE_CHROMIUM_FLAGS'
+                ]
+            },
+            clear=False,
+        ):
+            second = viewer._build_webview_env()
+    flags = first['QTWEBENGINE_CHROMIUM_FLAGS']
+    assert '--custom-device-flag' in flags
+    assert flags.count(_LOW_MEMORY_FLAGS) == 1
+    # Prepended, not appended: the injected switches precede the
+    # device-supplied flag (Chromium keeps the last occurrence, but we
+    # want ours ahead of the operator's so theirs can still override).
+    assert flags.index(_LOW_MEMORY_FLAGS) < flags.index('--custom-device-flag')
+    assert second['QTWEBENGINE_CHROMIUM_FLAGS'].count(_LOW_MEMORY_FLAGS) == 1
+
+
+def test_build_webview_env_low_memory_respects_preset_switches() -> None:
+    # A device that already set some of the switches (here a *different*
+    # --js-flags value, plus the bare low-end switch) must keep its own:
+    # we add only the still-missing flags, never a second occurrence of a
+    # switch Chromium would then resolve to the wrong value.
+    with (
+        mock.patch.dict(
+            os.environ,
+            {
+                'QT_QPA_PLATFORM': 'linuxfb',
+                'QTWEBENGINE_CHROMIUM_FLAGS': (
+                    '--enable-low-end-device-mode '
+                    '--js-flags=--max-old-space-size=256'
+                ),
+            },
+            clear=False,
+        ),
+        mock.patch('anthias_viewer.is_low_ram_device', return_value=True),
+    ):
+        env = viewer._build_webview_env()
+    flags = env['QTWEBENGINE_CHROMIUM_FLAGS']
+    # Device's own values are untouched — no duplicate switch added.
+    assert flags.count('--js-flags=') == 1
+    assert '--max-old-space-size=256' in flags
+    assert '--max-old-space-size=64' not in flags
+    assert flags.count(_LOW_MEMORY_FLAGS) == 1
+    # The genuinely-missing caps are still injected.
+    assert '--renderer-process-limit=1' in flags
+    assert '--process-per-site' in flags
+    assert '--disable-dev-shm-usage' in flags
+
+
+def test_handle_reload_queues_bounce_on_dark_mode_change(
+    reset_dark_mode_state: None,
+) -> None:
+    """The dark-mode flag is only read at webview launch, so a live
+    toggle has to respawn AnthiasViewer. Like the rotation path,
+    _handle_reload runs on the subscriber thread and MUST NOT terminate
+    the browser directly — it only latches the new value and sets the
+    bounce flag the main thread consumes."""
+    fake_browser = mock.Mock()
+    skip = mock.Mock()
+    with (
+        mock.patch.dict(settings, {'prefer_dark_mode': True}),
+        mock.patch.object(viewer, 'load_settings'),
+        mock.patch.object(viewer, '_maybe_reapply_rotation'),
+        mock.patch.object(viewer, '_skip_if_current_asset_inactive'),
+        mock.patch.object(viewer, 'browser', fake_browser),
+        mock.patch('anthias_viewer.get_skip_event', return_value=skip),
+    ):
+        viewer._handle_reload()
+    fake_browser.terminate.assert_not_called()
+    assert viewer._rotation_bounce_pending is True
+    skip.set.assert_called_once()
+    # Latched immediately so a second `reload` in the gap before the
+    # respawn doesn't re-queue another bounce.
+    assert viewer._last_applied_dark_mode is True
+
+
+def test_handle_reload_no_op_when_dark_mode_unchanged(
+    reset_dark_mode_state: None,
+) -> None:
+    skip = mock.Mock()
+    viewer._last_applied_dark_mode = True
+    with (
+        mock.patch.dict(settings, {'prefer_dark_mode': True}),
+        mock.patch.object(viewer, 'load_settings'),
+        mock.patch.object(viewer, '_maybe_reapply_rotation'),
+        mock.patch.object(viewer, '_skip_if_current_asset_inactive'),
+        mock.patch('anthias_viewer.get_skip_event', return_value=skip),
+    ):
+        viewer._handle_reload()
+    assert viewer._rotation_bounce_pending is False
+    skip.set.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    'qpa, expected',
+    [
+        # cage + Wayland boards (x86 / arm64 / pi5 per
+        # docker/Dockerfile.viewer.j2) — the compositor owns the
+        # transform and rotation goes through wlr-randr.
+        ('wayland', True),
+        # eglfs (pi4-64 / pi3-64) and linuxfb (pi2 / pi3) rotate via a
+        # Qt plugin option, NOT wlr-randr.
+        ('eglfs', False),
+        ('linuxfb', False),
+        ('linuxfb:rotation=90', False),
+        # Defensive: an unset QPA must not be mistaken for Wayland.
+        ('', False),
+    ],
+)
+def test_is_wayland_board_keys_off_qpa(qpa: str, expected: bool) -> None:
+    """Issue #3044: _is_wayland_board() must recognise every cage board
+    (x86, arm64, pi5), not just x86. Keying off QT_QPA_PLATFORM mirrors
+    the Dockerfile split so Pi 5 / arm64 route through the wlr-randr
+    rotation path instead of silently doing nothing."""
+    with mock.patch.dict(os.environ, {'QT_QPA_PLATFORM': qpa}, clear=False):
+        assert viewer._is_wayland_board() is expected
+
+
+def test_is_wayland_board_true_for_pi5() -> None:
+    """The concrete regression: a Pi 5 viewer (DEVICE_TYPE=pi5,
+    QT_QPA_PLATFORM=wayland from the Dockerfile) is now correctly
+    classified as a Wayland board."""
+    with mock.patch.dict(
+        os.environ,
+        {'DEVICE_TYPE': 'pi5', 'QT_QPA_PLATFORM': 'wayland'},
+        clear=False,
+    ):
+        assert viewer._is_wayland_board() is True
+
+
+def test_build_webview_env_no_op_on_pi5_wayland() -> None:
+    """Issue #3044: on Pi 5 the rotation must NOT be appended as a
+    ``:rotation=N`` option — the Qt wayland plugin ignores it (that's a
+    linuxfb-only option). Rotation is handled by wlr-randr instead, so
+    QT_QPA_PLATFORM is left untouched."""
+    with (
+        mock.patch.dict(settings, {'screen_rotation': 90}),
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'pi5', 'QT_QPA_PLATFORM': 'wayland'},
+            clear=False,
+        ),
+    ):
+        env = viewer._build_webview_env()
+    assert env['QT_QPA_PLATFORM'] == 'wayland'
+
+
+@pytest.mark.parametrize(
+    ('rotation', 'transform'),
+    [(0, 'normal'), (90, '270'), (180, '180'), (270, '90')],
+)
+def test_wlr_transform_value_is_clockwise(
+    rotation: int, transform: str
+) -> None:
+    """screen_rotation is clockwise but wlr-randr transforms turn the
+    output anticlockwise, so 90° CW maps to '270' and 270° CW to '90'
+    (0/180 are direction-agnostic). Keeps wayland aligned with linuxfb +
+    videoflip."""
+    assert viewer._wlr_transform_value(rotation) == transform
+
+
+def test_apply_wlr_transform_runs_on_pi5() -> None:
+    """Issue #3044: the wlr-randr path must actually fire on Pi 5 —
+    previously gated behind an x86-only _is_wayland_board(), so the
+    rotation menu was a complete no-op there."""
+
+    def _fake_run(argv: Any, **kwargs: Any) -> mock.Mock:
+        result = mock.Mock()
+        result.returncode = 0
+        result.stdout = (
+            'HDMI-A-1\n  Enabled: yes\n' if argv == ['wlr-randr'] else ''
+        )
+        result.stderr = ''
+        return result
+
+    with (
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'pi5', 'QT_QPA_PLATFORM': 'wayland'},
+            clear=False,
+        ),
+        mock.patch(
+            'anthias_viewer.subprocess.run', side_effect=_fake_run
+        ) as run,
+    ):
+        assert viewer._apply_wlr_transform(90) is True
+
+    transform_calls = [
+        c
+        for c in run.call_args_list
+        if c.args
+        and c.args[0][:1] == ['wlr-randr']
+        and '--transform' in c.args[0]
+    ]
+    assert len(transform_calls) == 1
+    argv = transform_calls[0].args[0]
+    # 90° clockwise == wlr transform '270' (wlr turns anticlockwise).
+    assert argv[argv.index('--transform') + 1] == '270'
+
+
 def test_build_webview_env_appends_rotation_on_linuxfb() -> None:
     """Pi boards (linuxfb) get the rotation baked into QT_QPA_PLATFORM
     so the Qt plugin rotates the framebuffer for free."""
@@ -709,7 +3035,7 @@ def test_build_webview_env_appends_rotation_on_linuxfb() -> None:
         mock.patch.dict(settings, {'screen_rotation': 90}),
         mock.patch.dict(
             os.environ,
-            {'DEVICE_TYPE': 'pi5', 'QT_QPA_PLATFORM': 'linuxfb'},
+            {'DEVICE_TYPE': 'pi3', 'QT_QPA_PLATFORM': 'linuxfb'},
             clear=False,
         ),
     ):
@@ -725,7 +3051,7 @@ def test_build_webview_env_strips_existing_rotation_suffix() -> None:
         mock.patch.dict(
             os.environ,
             {
-                'DEVICE_TYPE': 'pi5',
+                'DEVICE_TYPE': 'pi3',
                 'QT_QPA_PLATFORM': 'linuxfb:rotation=90',
             },
             clear=False,
@@ -758,7 +3084,7 @@ def test_build_webview_env_no_suffix_at_zero_rotation() -> None:
         mock.patch.dict(settings, {'screen_rotation': 0}),
         mock.patch.dict(
             os.environ,
-            {'DEVICE_TYPE': 'pi5', 'QT_QPA_PLATFORM': 'linuxfb'},
+            {'DEVICE_TYPE': 'pi3', 'QT_QPA_PLATFORM': 'linuxfb'},
             clear=False,
         ),
     ):
@@ -775,7 +3101,7 @@ def test_build_webview_env_preserves_other_qpa_options() -> None:
         mock.patch.dict(
             os.environ,
             {
-                'DEVICE_TYPE': 'pi5',
+                'DEVICE_TYPE': 'pi3',
                 'QT_QPA_PLATFORM': 'linuxfb:fb=/dev/fb1,tty=/dev/tty1',
             },
             clear=False,
@@ -801,7 +3127,7 @@ def test_build_webview_env_removes_stale_rotation_when_dialed_to_zero() -> (
         mock.patch.dict(
             os.environ,
             {
-                'DEVICE_TYPE': 'pi5',
+                'DEVICE_TYPE': 'pi3',
                 'QT_QPA_PLATFORM': 'linuxfb:fb=/dev/fb1,rotation=90',
             },
             clear=False,
@@ -811,11 +3137,82 @@ def test_build_webview_env_removes_stale_rotation_when_dialed_to_zero() -> (
     assert env['QT_QPA_PLATFORM'] == 'linuxfb:fb=/dev/fb1'
 
 
+@pytest.mark.parametrize(
+    ('rotation', 'expected'),
+    [(90, '-90'), (180, '180'), (270, '90')],
+)
+def test_build_webview_env_sets_eglfs_rotation(
+    rotation: int, expected: str
+) -> None:
+    """Pi 4 runs eglfs, which ignores the linuxfb ``:rotation=N`` plugin
+    option (that silent no-op was the 2026.06.0 bug). eglfs reads
+    QT_QPA_EGLFS_ROTATION at QPA init instead, so we set that and leave
+    QT_QPA_PLATFORM untouched. The angle is NEGATED because eglfs turns
+    the compositor anticlockwise while screen_rotation is clockwise
+    (matching linuxfb + videoflip), and eglfs only accepts 180/90/-90 — a
+    literal 270 rotates the content without swapping the screen geometry
+    to portrait, rendering everything stretched (issue #2970). So 90° CW
+    is emitted as -90 and 270° CW as 90."""
+    with (
+        mock.patch.dict(settings, {'screen_rotation': rotation}),
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'pi4-64', 'QT_QPA_PLATFORM': 'eglfs'},
+            clear=False,
+        ),
+    ):
+        env = viewer._build_webview_env()
+    assert env['QT_QPA_EGLFS_ROTATION'] == expected
+    # The platform string must stay a bare plugin — appending
+    # ``:rotation=N`` here is exactly the no-op that broke Pi 4.
+    assert env['QT_QPA_PLATFORM'] == 'eglfs'
+
+
+def test_build_webview_env_eglfs_zero_omits_rotation() -> None:
+    """Default orientation must not set QT_QPA_EGLFS_ROTATION at all."""
+    with (
+        mock.patch.dict(settings, {'screen_rotation': 0}),
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'pi4-64', 'QT_QPA_PLATFORM': 'eglfs'},
+            clear=False,
+        ),
+    ):
+        # Guard against a stray value leaking in from the real env.
+        os.environ.pop('QT_QPA_EGLFS_ROTATION', None)
+        env = viewer._build_webview_env()
+    assert 'QT_QPA_EGLFS_ROTATION' not in env
+    assert env['QT_QPA_PLATFORM'] == 'eglfs'
+
+
+def test_build_webview_env_eglfs_clears_stale_rotation() -> None:
+    """Dialling back to 0° after a rotated launch must drop a stale
+    QT_QPA_EGLFS_ROTATION so the respawned webview un-rotates."""
+    with (
+        mock.patch.dict(settings, {'screen_rotation': 0}),
+        mock.patch.dict(
+            os.environ,
+            {
+                'DEVICE_TYPE': 'pi4-64',
+                'QT_QPA_PLATFORM': 'eglfs',
+                'QT_QPA_EGLFS_ROTATION': '270',
+            },
+            clear=False,
+        ),
+    ):
+        env = viewer._build_webview_env()
+    assert 'QT_QPA_EGLFS_ROTATION' not in env
+
+
 def test_apply_wlr_transform_skipped_on_linuxfb() -> None:
     """The wlr-randr binary isn't even shipped on Pi boards — make
     sure we never call it from a non-wayland viewer."""
     with (
-        mock.patch.dict(os.environ, {'DEVICE_TYPE': 'pi5'}, clear=False),
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'pi3', 'QT_QPA_PLATFORM': 'linuxfb'},
+            clear=False,
+        ),
         mock.patch('anthias_viewer.subprocess.run') as run,
     ):
         viewer._apply_wlr_transform(90)
@@ -843,7 +3240,11 @@ def test_apply_wlr_transform_invokes_wlr_randr_per_output() -> None:
         return result
 
     with (
-        mock.patch.dict(os.environ, {'DEVICE_TYPE': 'x86'}, clear=False),
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'x86', 'QT_QPA_PLATFORM': 'wayland'},
+            clear=False,
+        ),
         mock.patch(
             'anthias_viewer.subprocess.run', side_effect=_fake_run
         ) as run,
@@ -885,7 +3286,11 @@ def test_wlr_output_names_skips_disabled_outputs() -> None:
         return result
 
     with (
-        mock.patch.dict(os.environ, {'DEVICE_TYPE': 'x86'}, clear=False),
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'x86', 'QT_QPA_PLATFORM': 'wayland'},
+            clear=False,
+        ),
         mock.patch('anthias_viewer.subprocess.run', side_effect=_fake_run),
     ):
         names = viewer._wlr_output_names()
@@ -913,7 +3318,11 @@ def test_apply_wlr_transform_logs_warning_on_nonzero_exit(
         return result
 
     with (
-        mock.patch.dict(os.environ, {'DEVICE_TYPE': 'x86'}, clear=False),
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'x86', 'QT_QPA_PLATFORM': 'wayland'},
+            clear=False,
+        ),
         mock.patch('anthias_viewer.subprocess.run', side_effect=_fake_run),
         caplog.at_level(logging.WARNING, logger='root'),
     ):
@@ -942,7 +3351,11 @@ def test_handle_reload_reapplies_rotation_when_changed(
     """
     with (
         mock.patch.dict(settings, {'screen_rotation': 90}),
-        mock.patch.dict(os.environ, {'DEVICE_TYPE': 'x86'}, clear=False),
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'x86', 'QT_QPA_PLATFORM': 'wayland'},
+            clear=False,
+        ),
         mock.patch.object(viewer, 'load_settings'),
         mock.patch.object(viewer, '_skip_if_current_asset_inactive'),
         mock.patch('anthias_viewer.MediaPlayerProxy.reset') as reset,
@@ -989,7 +3402,11 @@ def test_handle_reload_does_not_latch_when_wlr_transform_fails(
     viewer._last_applied_rotation = 0
     with (
         mock.patch.dict(settings, {'screen_rotation': 90}),
-        mock.patch.dict(os.environ, {'DEVICE_TYPE': 'x86'}, clear=False),
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'x86', 'QT_QPA_PLATFORM': 'wayland'},
+            clear=False,
+        ),
         mock.patch.object(viewer, 'load_settings'),
         mock.patch.object(viewer, '_skip_if_current_asset_inactive'),
         mock.patch('anthias_viewer.MediaPlayerProxy.reset'),
@@ -1008,7 +3425,11 @@ def test_handle_reload_no_rotation_change_is_no_op(
     viewer._last_applied_rotation = 90
     with (
         mock.patch.dict(settings, {'screen_rotation': 90}),
-        mock.patch.dict(os.environ, {'DEVICE_TYPE': 'x86'}, clear=False),
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'x86', 'QT_QPA_PLATFORM': 'wayland'},
+            clear=False,
+        ),
         mock.patch.object(viewer, 'load_settings'),
         mock.patch.object(viewer, '_skip_if_current_asset_inactive'),
         mock.patch('anthias_viewer.MediaPlayerProxy.reset') as reset,
@@ -1023,7 +3444,7 @@ def test_handle_reload_queues_bounce_on_linuxfb_rotation_change(
     reset_rotation_state: None,
 ) -> None:
     """linuxfb only reads :rotation=N at QPA init, so the live-rotation
-    path has to bounce AnthiasWebview. _handle_reload runs on the
+    path has to bounce AnthiasViewer. _handle_reload runs on the
     subscriber thread and MUST NOT terminate the browser directly —
     that would race a concurrent view_*() call mid-D-Bus on the main
     thread (Copilot review of #2882). It only sets a flag; the main
@@ -1033,7 +3454,11 @@ def test_handle_reload_queues_bounce_on_linuxfb_rotation_change(
     viewer._rotation_bounce_pending = False
     with (
         mock.patch.dict(settings, {'screen_rotation': 270}),
-        mock.patch.dict(os.environ, {'DEVICE_TYPE': 'pi5'}, clear=False),
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'pi3', 'QT_QPA_PLATFORM': 'linuxfb'},
+            clear=False,
+        ),
         mock.patch.object(viewer, 'load_settings'),
         mock.patch.object(viewer, '_skip_if_current_asset_inactive'),
         mock.patch.object(viewer, 'browser', fake_browser),
@@ -1061,6 +3486,7 @@ def test_consume_pending_rotation_bounce_terminates_browser(
     terminate the webview and clear current_browser_url so the next
     view_*() call respawns it via load_browser()."""
     fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = False
     viewer._rotation_bounce_pending = True
     with mock.patch.object(viewer, 'browser', fake_browser):
         viewer._consume_pending_rotation_bounce()
@@ -1068,6 +3494,101 @@ def test_consume_pending_rotation_bounce_terminates_browser(
     assert viewer.current_browser_url is None
     # Flag cleared so a subsequent tick (with no new pending bounce)
     # doesn't terminate the freshly-spawned process.
+    assert viewer._rotation_bounce_pending is False
+
+
+def test_consume_pending_rotation_bounce_waits_for_exit(
+    reset_rotation_state: None,
+) -> None:
+    """The bounce must not return while the webview is still alive.
+
+    The whole handoff rests on the next view_*() seeing
+    ``is_alive() == False``; the gap between the two is under a
+    millisecond, and SIGTERM alone does not close it. Returning early
+    sends the loadImage over D-Bus to a dying peer, which only recovers
+    via _send_to_webview's error path on the short inline budget.
+    """
+    fake_browser = mock.Mock()
+    # Alive for the first few polls, then gone — a webview that takes a
+    # moment to tear QtWebEngine down, as it does on real hardware.
+    fake_browser.is_alive.side_effect = [True, True, False]
+    viewer._rotation_bounce_pending = True
+    with (
+        mock.patch.object(viewer, 'browser', fake_browser),
+        mock.patch.object(viewer, 'sleep'),
+    ):
+        viewer._consume_pending_rotation_bounce()
+    fake_browser.terminate.assert_called_once()
+    # Confirmed gone within the grace window, so no SIGKILL needed.
+    fake_browser.kill.assert_not_called()
+    assert fake_browser.is_alive.called
+
+
+def test_consume_pending_rotation_bounce_kills_unresponsive_browser(
+    reset_rotation_state: None,
+) -> None:
+    """A webview that ignores SIGTERM must be SIGKILLed, not left
+    running.
+
+    The pending flag is already cleared by this point, so an orphan that
+    survives here keeps the ``anthias.viewer`` D-Bus name, the setting
+    never applies, and the next spawn is refused registration by the
+    leftover owner.
+    """
+    fake_browser = mock.Mock()
+    fake_browser.is_alive.return_value = True
+    viewer._rotation_bounce_pending = True
+    with (
+        mock.patch.object(viewer, 'browser', fake_browser),
+        mock.patch.object(viewer, 'BROWSER_TERMINATE_GRACE_SECONDS', 0),
+    ):
+        viewer._consume_pending_rotation_bounce()
+    fake_browser.terminate.assert_called_once()
+    fake_browser.kill.assert_called_once()
+
+
+def test_consume_pending_rotation_bounce_delegates_to_the_helper(
+    reset_rotation_state: None,
+) -> None:
+    """The bounce stops the webview through ``_terminate_webview`` and
+    nothing else.
+
+    Pinning the delegation rather than re-implementing the teardown is
+    the point: how hard the helper tries — whether it confirms the reap
+    after SIGKILL, and what it reports when a process survives both
+    signals — is the helper's contract, covered by its own tests. This
+    path inherits every improvement to it instead of growing a second
+    copy that could drift.
+    """
+    fake_browser = mock.Mock()
+    viewer._rotation_bounce_pending = True
+    with (
+        mock.patch.object(viewer, 'browser', fake_browser),
+        mock.patch.object(viewer, '_terminate_webview') as m_terminate,
+    ):
+        viewer._consume_pending_rotation_bounce()
+    m_terminate.assert_called_once_with(fake_browser)
+    # Teardown goes through the helper, never direct signalling here.
+    fake_browser.terminate.assert_not_called()
+    fake_browser.kill.assert_not_called()
+
+
+def test_consume_pending_rotation_bounce_survives_terminate_failure(
+    reset_rotation_state: None,
+) -> None:
+    """A raising terminate() must not propagate out of the asset_loop
+    tick: _terminate_webview swallows it, and the URL reset behind it
+    still runs so the respawn is not skipped."""
+    fake_browser = mock.Mock()
+    fake_browser.terminate.side_effect = OSError('no such process')
+    fake_browser.is_alive.return_value = True
+    viewer._rotation_bounce_pending = True
+    with (
+        mock.patch.object(viewer, 'browser', fake_browser),
+        mock.patch.object(viewer, 'BROWSER_TERMINATE_GRACE_SECONDS', 0),
+    ):
+        viewer._consume_pending_rotation_bounce()
+    assert viewer.current_browser_url is None
     assert viewer._rotation_bounce_pending is False
 
 
@@ -1081,6 +3602,7 @@ def test_consume_pending_rotation_bounce_no_op_when_flag_clear(
     with mock.patch.object(viewer, 'browser', fake_browser):
         viewer._consume_pending_rotation_bounce()
     fake_browser.terminate.assert_not_called()
+    fake_browser.kill.assert_not_called()
 
 
 def test_asset_loop_consumes_pending_rotation_bounce(
@@ -1135,7 +3657,11 @@ def test_retry_wayland_rotation_skips_when_already_applied(
     viewer._last_applied_rotation = 90
     with (
         mock.patch.dict(settings, {'screen_rotation': 90}),
-        mock.patch.dict(os.environ, {'DEVICE_TYPE': 'x86'}, clear=False),
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'x86', 'QT_QPA_PLATFORM': 'wayland'},
+            clear=False,
+        ),
         mock.patch.object(viewer, '_apply_wlr_transform') as apply,
     ):
         viewer._retry_wayland_rotation_if_pending()
@@ -1151,7 +3677,11 @@ def test_retry_wayland_rotation_recovers_from_startup_failure(
     viewer._last_applied_rotation = -1
     with (
         mock.patch.dict(settings, {'screen_rotation': 270}),
-        mock.patch.dict(os.environ, {'DEVICE_TYPE': 'x86'}, clear=False),
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'x86', 'QT_QPA_PLATFORM': 'wayland'},
+            clear=False,
+        ),
         mock.patch.object(
             viewer, '_apply_wlr_transform', return_value=True
         ) as apply,
@@ -1169,7 +3699,11 @@ def test_retry_wayland_rotation_keeps_sentinel_on_failure(
     viewer._last_applied_rotation = -1
     with (
         mock.patch.dict(settings, {'screen_rotation': 270}),
-        mock.patch.dict(os.environ, {'DEVICE_TYPE': 'x86'}, clear=False),
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'x86', 'QT_QPA_PLATFORM': 'wayland'},
+            clear=False,
+        ),
         mock.patch.object(viewer, '_apply_wlr_transform', return_value=False),
     ):
         viewer._retry_wayland_rotation_if_pending()
@@ -1185,7 +3719,11 @@ def test_retry_wayland_rotation_skipped_on_linuxfb(
     viewer._last_applied_rotation = -1
     with (
         mock.patch.dict(settings, {'screen_rotation': 90}),
-        mock.patch.dict(os.environ, {'DEVICE_TYPE': 'pi5'}, clear=False),
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'pi3', 'QT_QPA_PLATFORM': 'linuxfb'},
+            clear=False,
+        ),
         mock.patch.object(viewer, '_apply_wlr_transform') as apply,
     ):
         viewer._retry_wayland_rotation_if_pending()
@@ -1205,7 +3743,11 @@ def test_handle_reload_linuxfb_idempotent_under_repeat(
     viewer._rotation_bounce_pending = False
     with (
         mock.patch.dict(settings, {'screen_rotation': 90}),
-        mock.patch.dict(os.environ, {'DEVICE_TYPE': 'pi5'}, clear=False),
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'pi3', 'QT_QPA_PLATFORM': 'linuxfb'},
+            clear=False,
+        ),
         mock.patch.object(viewer, 'load_settings'),
         mock.patch.object(viewer, '_skip_if_current_asset_inactive'),
         mock.patch.object(viewer, 'browser', fake_browser),
@@ -1217,3 +3759,1386 @@ def test_handle_reload_linuxfb_idempotent_under_repeat(
     fake_browser.terminate.assert_not_called()
     skip.set.assert_called_once()
     assert viewer._rotation_bounce_pending is True
+
+
+class TestPublishDisplayResolutionOnce:
+    """The reporter tick must treat a redis blip as a retryable state
+    (warning), not a crash (Sentry ANTHIAS-M / ANTHIAS-H)."""
+
+    @pytest.fixture(autouse=True)
+    def _enable_logging(self) -> Iterator[None]:
+        # This module calls logging.disable(logging.CRITICAL) at
+        # import time, which would make the caplog assertions below
+        # vacuous (no records ever emitted). Lift the disable for
+        # these tests and restore it afterwards.
+        logging.disable(logging.NOTSET)
+        try:
+            yield
+        finally:
+            logging.disable(logging.CRITICAL)
+
+    def test_redis_down_logs_warning_not_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import redis.exceptions
+
+        with (
+            mock.patch.object(
+                viewer, 'detect_screen_resolution', return_value='1920x1080'
+            ),
+            mock.patch.object(
+                viewer.r,
+                'set',
+                side_effect=redis.exceptions.ConnectionError('refused'),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            viewer._publish_display_resolution_once()
+        assert any(
+            record.levelno == logging.WARNING
+            and 'redis unreachable' in record.getMessage()
+            for record in caplog.records
+        )
+        assert all(record.levelno < logging.ERROR for record in caplog.records)
+
+    def test_other_failures_still_log_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with (
+            mock.patch.object(
+                viewer,
+                'detect_screen_resolution',
+                side_effect=RuntimeError('boom'),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            viewer._publish_display_resolution_once()
+        assert any(
+            record.levelno == logging.ERROR for record in caplog.records
+        )
+
+    def test_writes_resolution_with_ttl(self) -> None:
+        with (
+            mock.patch.object(
+                viewer, 'detect_screen_resolution', return_value='1280x720'
+            ),
+            mock.patch.object(viewer.r, 'set') as set_mock,
+        ):
+            viewer._publish_display_resolution_once()
+        set_mock.assert_called_once_with(
+            viewer.DISPLAY_RESOLUTION_KEY,
+            '1280x720',
+            ex=viewer.DISPLAY_RESOLUTION_TTL_S,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Wayland socket wait (Sentry ANTHIAS-19)
+# ---------------------------------------------------------------------------
+
+
+class TestWaitForWaylandSocket:
+    """The webview spawn must not race cage's Wayland socket — a spawn
+    before the socket is up dies with 'Failed to create wl_display'
+    and wastes a retry attempt (Sentry ANTHIAS-19). The gate is the
+    WAYLAND_DISPLAY env cage exports, NOT _is_wayland_board(): the wait
+    is needed on any board where cage actually ran, and keying it on the
+    concrete socket env keeps it correct regardless of how the board
+    helper classifies things.
+
+    Readiness is a ``connect()``, not an ``os.path.exists``: a cage that
+    died or is restarting leaves its socket inode behind, and the
+    existence probe waved that straight through (Sentry ANTHIAS-1W)."""
+
+    def test_no_op_when_no_socket_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # linuxfb/eglfs board: cage never ran, so WAYLAND_DISPLAY is
+        # unset and the wait returns immediately without polling.
+        monkeypatch.delenv('WAYLAND_DISPLAY', raising=False)
+        slept = mock.Mock()
+        monkeypatch.setattr(viewer, 'sleep', slept)
+        viewer._wait_for_wayland_socket(monotonic() + 5)
+        slept.assert_not_called()
+
+    def test_returns_immediately_when_socket_listening(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        # cage up and accepting: the probe connects on the first try and
+        # the spawn proceeds without a single sleep.
+        monkeypatch.setenv('XDG_RUNTIME_DIR', str(tmp_path))
+        monkeypatch.setenv('WAYLAND_DISPLAY', 'wayland-1')
+        with _listening_unix_socket(tmp_path / 'wayland-1'):
+            slept = mock.Mock()
+            monkeypatch.setattr(viewer, 'sleep', slept)
+            viewer._wait_for_wayland_socket(monotonic() + 5)
+        slept.assert_not_called()
+
+    def test_waits_out_a_stale_socket_then_proceeds(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        """Sentry ANTHIAS-1W: cage dies and leaves its socket inode
+        behind. connect() is REFUSED (not ENOENT), so the old
+        os.path.exists gate returned at once and every inline retry
+        burned in ~13s against a compositor that was seconds from
+        coming back. The wait must ride it out until cage rebinds."""
+        monkeypatch.setenv('XDG_RUNTIME_DIR', str(tmp_path))
+        monkeypatch.setenv('WAYLAND_DISPLAY', 'wayland-1')
+        socket_path = tmp_path / 'wayland-1'
+        # A stale inode: the path exists, nothing is listening on it.
+        socket_path.write_text('')
+        os.unlink(socket_path)
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(str(socket_path))  # bound but never listen()ing
+        assert socket_path.exists()
+        assert viewer._wayland_socket_ready(str(socket_path)) is False
+
+        # cage comes back on the third poll.
+        calls = {'n': 0}
+        revived: list[Any] = []
+
+        def fake_sleep(_seconds: float) -> None:
+            calls['n'] += 1
+            if calls['n'] == 3:
+                stale.close()
+                os.unlink(socket_path)
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                listener.bind(str(socket_path))
+                listener.listen(1)
+                revived.append(listener)
+
+        monkeypatch.setattr(viewer, 'sleep', fake_sleep)
+        try:
+            viewer._wait_for_wayland_socket(monotonic() + 100)
+        finally:
+            stale.close()
+            for listener in revived:
+                listener.close()
+        assert calls['n'] == 3
+
+    def test_probe_reports_ready_on_an_error_it_cannot_read(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        # Conservative by design: only ECONNREFUSED/ENOENT mean "not
+        # ready". Anything else is a verdict we can't reach (e.g. a
+        # socket whose directory denies us search permission), so the
+        # probe declines to block the spawn and lets the launch fail
+        # the normal way instead of stalling on a probe it can't read.
+        def refuse_with_eacces(self: Any, _address: Any) -> None:
+            raise PermissionError(errno.EACCES, 'Permission denied')
+
+        monkeypatch.setattr(socket.socket, 'connect', refuse_with_eacces)
+        assert viewer._wayland_socket_ready(str(tmp_path / 'guarded')) is True
+
+    def test_probe_reports_not_ready_for_a_non_socket_path(
+        self, tmp_path: Any
+    ) -> None:
+        # Linux answers ECONNREFUSED (not ENOTSOCK) for a regular file
+        # at the socket path, so it is waited out exactly like a stale
+        # socket. Pinned because the conservative branch above reads as
+        # if a plain file would land there, and it does not.
+        plain = tmp_path / 'not-a-socket'
+        plain.write_text('')
+        assert viewer._wayland_socket_ready(str(plain)) is False
+
+    def test_probe_reports_not_ready_when_path_absent(
+        self, tmp_path: Any
+    ) -> None:
+        assert viewer._wayland_socket_ready(str(tmp_path / 'nope')) is False
+
+    def test_fires_via_env_not_board_helper(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Any,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # The wait is decoupled from _is_wayland_board(): even a board the
+        # helper does NOT classify as Wayland (QT_QPA_PLATFORM unset here,
+        # so the helper returns False) still engages the wait when cage
+        # exported WAYLAND_DISPLAY. This is the ANTHIAS-19 guarantee —
+        # gating on the concrete socket env, not the board helper, is what
+        # kept the Pi 5 covered even while the helper was x86-only.
+        monkeypatch.delenv('QT_QPA_PLATFORM', raising=False)
+        monkeypatch.setenv('DEVICE_TYPE', 'pi5')
+        assert viewer._is_wayland_board() is False
+        monkeypatch.setenv('XDG_RUNTIME_DIR', str(tmp_path))
+        monkeypatch.setenv('WAYLAND_DISPLAY', 'wayland-1')
+        monkeypatch.setattr(viewer, 'sleep', lambda _s: None)
+        with caplog.at_level(logging.WARNING):
+            # Deadline already passed: the loop body is skipped, but the
+            # pre-loop "not accepting connections yet" warning still
+            # fires iff the wait was entered (i.e. not board-skipped).
+            viewer._wait_for_wayland_socket(monotonic() - 1)
+        assert any(
+            'not accepting connections yet' in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_waits_then_proceeds_when_socket_appears(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        monkeypatch.setenv('XDG_RUNTIME_DIR', str(tmp_path))
+        monkeypatch.setenv('WAYLAND_DISPLAY', 'wayland-1')
+        socket_path = tmp_path / 'wayland-1'
+
+        # The socket shows up after the second poll.
+        calls = {'n': 0}
+        listeners: list[Any] = []
+
+        def fake_sleep(_seconds: float) -> None:
+            calls['n'] += 1
+            if calls['n'] >= 2 and not listeners:
+                listener = _listen_on(socket_path)
+                listeners.append(listener)
+
+        monkeypatch.setattr(viewer, 'sleep', fake_sleep)
+        try:
+            viewer._wait_for_wayland_socket(monotonic() + 100)
+        finally:
+            for listener in listeners:
+                listener.close()
+        assert socket_path.exists()
+        assert calls['n'] >= 2
+
+    def test_bounded_when_socket_never_appears(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        # A dead compositor must not hang the asset_loop thread — once
+        # the shared deadline passes the wait falls through and lets the
+        # spawn fail the normal way.
+        monkeypatch.setenv('XDG_RUNTIME_DIR', str(tmp_path))
+        monkeypatch.setenv('WAYLAND_DISPLAY', 'wayland-1')
+        monkeypatch.setattr(viewer, 'sleep', lambda _s: None)
+        # Deadline already in the past → returns at once, no hang.
+        viewer._wait_for_wayland_socket(monotonic() - 1)
+        assert not (tmp_path / 'wayland-1').exists()
+
+    def test_skips_when_runtime_dir_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # WAYLAND_DISPLAY set but XDG_RUNTIME_DIR absent → no socket
+        # path can be formed, so skip rather than guess.
+        monkeypatch.setenv('WAYLAND_DISPLAY', 'wayland-1')
+        monkeypatch.delenv('XDG_RUNTIME_DIR', raising=False)
+        slept = mock.Mock()
+        monkeypatch.setattr(viewer, 'sleep', slept)
+        viewer._wait_for_wayland_socket(monotonic() + 5)
+        slept.assert_not_called()
+
+    def test_spawn_waits_for_socket_before_launching(
+        self, viewer_fixtures: _ViewerFixtures
+    ) -> None:
+        # _spawn_webview_once must call the wait before it shells out,
+        # so a respawn never races cage. Make the spawn fail fast (a
+        # missing binary is the cheapest terminal error) and assert
+        # the wait ran first.
+        order: list[str] = []
+
+        def fake_wait(_deadline: float) -> None:
+            order.append('wait')
+
+        def fake_command(*args: Any, **kwargs: Any) -> Any:
+            order.append('spawn')
+            raise viewer_fixtures.u.sh.CommandNotFound('AnthiasViewer')
+
+        with (
+            mock.patch.object(
+                viewer_fixtures.u,
+                '_wait_for_wayland_socket',
+                side_effect=fake_wait,
+            ),
+            mock.patch.object(
+                viewer_fixtures.u.sh, 'Command', side_effect=fake_command
+            ),
+            pytest.raises(viewer_fixtures.u.WebviewBinaryMissingError),
+        ):
+            viewer_fixtures.u._spawn_webview_once(1)
+        assert order == ['wait', 'spawn']
+
+
+# --- display blanking (blank / unblank commands) ----------------------
+
+
+@pytest.fixture
+def restore_blank_state() -> Iterator[None]:
+    try:
+        yield
+    finally:
+        viewer.display_blanked = False
+        viewer.loop_is_stopped = False
+        get_skip_event().clear()
+
+
+def test_apply_wlr_power_targets_all_outputs_including_disabled() -> None:
+    """Power-off/on must reach *disabled* outputs too, so unblank can
+    turn a previously blanked (Enabled: no) connector back on."""
+
+    def _fake_run(argv: Any, **kwargs: Any) -> mock.Mock:
+        result = mock.Mock()
+        result.returncode = 0
+        result.stderr = ''
+        result.stdout = (
+            'HDMI-A-1\n  Enabled: yes\nHDMI-A-2\n  Enabled: no\n'
+            if argv == ['wlr-randr']
+            else ''
+        )
+        return result
+
+    with (
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'pi5', 'QT_QPA_PLATFORM': 'wayland'},
+            clear=False,
+        ),
+        mock.patch(
+            'anthias_viewer.subprocess.run', side_effect=_fake_run
+        ) as run,
+    ):
+        assert viewer._apply_wlr_power(False) is True
+
+    off_calls = [
+        c for c in run.call_args_list if c.args and '--off' in c.args[0]
+    ]
+    targeted = {c.args[0][c.args[0].index('--output') + 1] for c in off_calls}
+    assert targeted == {'HDMI-A-1', 'HDMI-A-2'}
+
+
+def test_apply_wlr_power_noop_off_wayland() -> None:
+    """eglfs/linuxfb boards can't be powered off via wlr-randr; the call
+    is a no-op there (the blank path paints black instead)."""
+    with (
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'pi4-64', 'QT_QPA_PLATFORM': 'eglfs'},
+            clear=False,
+        ),
+        mock.patch('anthias_viewer.subprocess.run') as run,
+    ):
+        assert viewer._apply_wlr_power(False) is False
+    run.assert_not_called()
+
+
+def test_blank_display_powers_off_and_pauses_on_wayland(
+    restore_blank_state: None,
+) -> None:
+    with (
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'pi5', 'QT_QPA_PLATFORM': 'wayland'},
+            clear=False,
+        ),
+        mock.patch(
+            'anthias_viewer._apply_wlr_power', return_value=True
+        ) as power,
+    ):
+        viewer.blank_display()
+
+    assert viewer.display_blanked is True
+    assert viewer.loop_is_stopped is True
+    power.assert_called_once_with(False)
+
+
+def test_blank_display_pauses_without_wlr_on_eglfs(
+    restore_blank_state: None,
+) -> None:
+    """On eglfs the screen blanks by the loop painting BLACK_SCREEN, so
+    blank_display() flips the state but must not invoke wlr-randr."""
+    with (
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'pi4-64', 'QT_QPA_PLATFORM': 'eglfs'},
+            clear=False,
+        ),
+        mock.patch('anthias_viewer._apply_wlr_power') as power,
+    ):
+        viewer.blank_display()
+
+    assert viewer.display_blanked is True
+    assert viewer.loop_is_stopped is True
+    power.assert_not_called()
+
+
+def test_unblank_display_resumes_and_powers_on(
+    restore_blank_state: None,
+) -> None:
+    viewer.display_blanked = True
+    viewer.loop_is_stopped = True
+
+    with (
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'pi5', 'QT_QPA_PLATFORM': 'wayland'},
+            clear=False,
+        ),
+        mock.patch(
+            'anthias_viewer._apply_wlr_power', return_value=True
+        ) as power,
+    ):
+        viewer.unblank_display()
+
+    assert viewer.display_blanked is False
+    assert viewer.loop_is_stopped is False
+    power.assert_called_once_with(True)
+
+
+def test_blank_and_unblank_commands_registered() -> None:
+    assert 'blank' in viewer.commands
+    assert 'unblank' in viewer.commands
+
+
+def test_stop_playback_sets_module_loop_flag(
+    restore_blank_state: None,
+) -> None:
+    """stop must flip the module-level loop_is_stopped that start_loop
+    reads (the old setattr(__main__, ...) wrote a dead namespace)."""
+    viewer.loop_is_stopped = False
+    viewer.stop_playback()
+    assert viewer.loop_is_stopped is True
+
+
+def test_play_unblanks_when_display_blanked(
+    restore_blank_state: None,
+) -> None:
+    """play on a blanked display implies unblank: power back on, clear
+    the blank, resume — never leave display_blanked set."""
+    viewer.display_blanked = True
+    viewer.loop_is_stopped = True
+
+    with (
+        mock.patch.dict(
+            os.environ,
+            {'DEVICE_TYPE': 'pi5', 'QT_QPA_PLATFORM': 'wayland'},
+            clear=False,
+        ),
+        mock.patch(
+            'anthias_viewer._apply_wlr_power', return_value=True
+        ) as power,
+    ):
+        viewer.play_playback()
+
+    assert viewer.display_blanked is False
+    assert viewer.loop_is_stopped is False
+    power.assert_called_once_with(True)
+
+
+# Headless-boot display wedge self-heal (Wayland/cage)
+
+
+@pytest.fixture
+def reset_wedge_state() -> Iterator[None]:
+    """_headless_wedge_since / _recovery_gave_up_logged are module state —
+    snapshot and restore so watchdog tests don't bleed into each other."""
+    prior_since = viewer._headless_wedge_since
+    prior_gave_up = viewer._recovery_gave_up_logged
+    try:
+        viewer._headless_wedge_since = None
+        viewer._recovery_gave_up_logged = False
+        yield
+    finally:
+        viewer._headless_wedge_since = prior_since
+        viewer._recovery_gave_up_logged = prior_gave_up
+
+
+@contextlib.contextmanager
+def _mock_recovery_budget(
+    count: int = 0, record: bool = True
+) -> Iterator[Any]:
+    """Patch the boot-scoped recovery-budget helpers off the filesystem.
+    ``count`` is what _recovery_restarts_this_boot reports; ``record`` is
+    whether _record_recovery_restart claims it persisted. Yields the
+    _record_recovery_restart mock so callers can assert on it."""
+    with (
+        mock.patch.object(
+            viewer, '_recovery_restarts_this_boot', return_value=count
+        ),
+        mock.patch.object(
+            viewer, '_record_recovery_restart', return_value=record
+        ) as record_mock,
+        mock.patch.object(viewer, '_reset_recovery_restarts'),
+    ):
+        yield record_mock
+
+
+def test_output_watchdog_noop_off_wayland(reset_wedge_state: None) -> None:
+    """Non-Wayland boards (eglfs/linuxfb) get output recovery from Qt's
+    own no-framebuffer exit, so the watchdog must never touch them —
+    even if it can't list outputs."""
+    with (
+        mock.patch.dict(os.environ, {'QT_QPA_PLATFORM': 'eglfs'}, clear=False),
+        mock.patch.object(
+            viewer, '_cage_output_probe', return_value='no-output'
+        ) as probe,
+    ):
+        viewer._wayland_output_watchdog()  # must not raise SystemExit
+
+    probe.assert_not_called()
+    assert viewer._headless_wedge_since is None
+
+
+def test_output_watchdog_healthy_clears_timer(
+    reset_wedge_state: None,
+) -> None:
+    """A bound output clears any pending wedge timer and never exits."""
+    viewer._headless_wedge_since = 100.0
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'wayland'}, clear=False
+        ),
+        mock.patch.object(
+            viewer, '_kernel_has_bindable_display', return_value=True
+        ),
+        mock.patch.object(
+            viewer, '_cage_output_probe', return_value='has-output'
+        ),
+        _mock_recovery_budget(),
+    ):
+        viewer._wayland_output_watchdog()
+
+    assert viewer._headless_wedge_since is None
+
+
+def test_output_watchdog_headless_unit_does_not_loop(
+    reset_wedge_state: None,
+) -> None:
+    """No bindable display (nothing connected, or a connected-but-no-EDID
+    cable) = must never restart-loop, and must not even spawn wlr-randr:
+    the cheap sysfs check short-circuits before the probe so a headless
+    board pays no subprocess (nor its up-to-5s block) on the hot path."""
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'wayland'}, clear=False
+        ),
+        mock.patch.object(
+            viewer, '_cage_output_probe', return_value='no-output'
+        ) as probe,
+        mock.patch.object(
+            viewer, '_kernel_has_bindable_display', return_value=False
+        ),
+        mock.patch.object(
+            viewer, '_kernel_has_connected_display', return_value=False
+        ),
+        _mock_recovery_budget(),
+    ):
+        viewer._wayland_output_watchdog()  # must not raise
+
+    probe.assert_not_called()
+    assert viewer._headless_wedge_since is None
+
+
+def test_output_watchdog_arms_timer_on_first_wedge(
+    reset_wedge_state: None,
+) -> None:
+    """Display connected but no output: arm the grace timer and warn,
+    but don't exit on the first observation."""
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'wayland'}, clear=False
+        ),
+        mock.patch.object(
+            viewer, '_cage_output_probe', return_value='no-output'
+        ),
+        mock.patch.object(
+            viewer, '_kernel_has_bindable_display', return_value=True
+        ),
+        mock.patch.object(viewer, 'monotonic', return_value=500.0),
+    ):
+        viewer._wayland_output_watchdog()  # must not raise
+
+    assert viewer._headless_wedge_since == pytest.approx(500.0)
+
+
+def test_output_watchdog_exits_after_grace(reset_wedge_state: None) -> None:
+    """A wedge that persists past the grace window exits non-zero so
+    Docker recreates the container and cage re-enumerates the display."""
+    viewer._headless_wedge_since = 500.0
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'wayland'}, clear=False
+        ),
+        mock.patch.object(
+            viewer, '_cage_output_probe', return_value='no-output'
+        ),
+        mock.patch.object(
+            viewer, '_kernel_has_bindable_display', return_value=True
+        ),
+        mock.patch.object(
+            viewer,
+            'monotonic',
+            return_value=500.0 + viewer.WAYLAND_OUTPUT_GRACE_S,
+        ),
+        _mock_recovery_budget(count=0, record=True),
+        pytest.raises(SystemExit) as exc,
+    ):
+        viewer._wayland_output_watchdog()
+
+    assert exc.value.code == 1
+
+
+def test_output_watchdog_recovers_before_grace(
+    reset_wedge_state: None,
+) -> None:
+    """A transient wedge that clears before the grace elapses must not
+    exit — a healthy reading resets the timer."""
+    viewer._headless_wedge_since = 500.0
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'wayland'}, clear=False
+        ),
+        mock.patch.object(
+            viewer, '_cage_output_probe', return_value='has-output'
+        ),
+        mock.patch.object(
+            viewer, '_kernel_has_bindable_display', return_value=True
+        ),
+        mock.patch.object(
+            viewer,
+            'monotonic',
+            return_value=500.0 + viewer.WAYLAND_OUTPUT_GRACE_S,
+        ),
+        _mock_recovery_budget(),
+    ):
+        viewer._wayland_output_watchdog()  # must not raise
+
+    assert viewer._headless_wedge_since is None
+
+
+def _patch_drm_sysfs(files: dict[str, str]) -> Any:
+    """Context manager patching glob + open to serve a fake
+    /sys/class/drm tree. ``files`` maps each status/modes path to its
+    contents; glob returns just the status paths (as the real one does)."""
+    status_paths = [p for p in files if p.endswith('/status')]
+
+    def fake_open(path: str, *args: Any, **kwargs: Any) -> Any:
+        if path not in files:
+            raise FileNotFoundError(path)
+        return mock.mock_open(read_data=files[path])()
+
+    return (
+        mock.patch.object(viewer, 'glob', return_value=status_paths),
+        mock.patch('builtins.open', side_effect=fake_open),
+    )
+
+
+def test_output_watchdog_ignores_wlr_randr_failure(
+    reset_wedge_state: None,
+) -> None:
+    """A wlr-randr tooling failure ('unknown') must not be mistaken for a
+    wedge on a board that is probably displaying fine: no arm, no exit,
+    and any pending timer clears — even with a bindable display present
+    and the grace elapsed."""
+    viewer._headless_wedge_since = 500.0
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'wayland'}, clear=False
+        ),
+        mock.patch.object(
+            viewer, '_cage_output_probe', return_value='unknown'
+        ),
+        mock.patch.object(
+            viewer, '_kernel_has_bindable_display', return_value=True
+        ),
+        mock.patch.object(
+            viewer,
+            'monotonic',
+            return_value=500.0 + viewer.WAYLAND_OUTPUT_GRACE_S,
+        ),
+        _mock_recovery_budget(),
+    ):
+        viewer._wayland_output_watchdog()  # must not raise
+
+    assert viewer._headless_wedge_since is None
+
+
+def test_output_watchdog_recovers_empty_modes_wedge(
+    reset_wedge_state: None,
+) -> None:
+    """The #6758 fix: a display that powered on after a headless boot is
+    ``connected`` but modeless (not bindable). It must still be recovered
+    — the restart re-reads its EDID — so the watchdog exits past grace,
+    spending one unit of recovery budget."""
+    viewer._headless_wedge_since = 500.0
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'wayland'}, clear=False
+        ),
+        mock.patch.object(
+            viewer, '_kernel_has_bindable_display', return_value=False
+        ),
+        mock.patch.object(
+            viewer, '_kernel_has_connected_display', return_value=True
+        ),
+        mock.patch.object(
+            viewer, '_cage_output_probe', return_value='no-output'
+        ),
+        mock.patch.object(
+            viewer,
+            'monotonic',
+            return_value=500.0 + viewer.WAYLAND_OUTPUT_GRACE_S,
+        ),
+        _mock_recovery_budget(count=0, record=True) as record,
+        pytest.raises(SystemExit) as exc,
+    ):
+        viewer._wayland_output_watchdog()
+
+    assert exc.value.code == 1
+    record.assert_called_once()
+
+
+def test_output_watchdog_gives_up_after_max_restarts(
+    reset_wedge_state: None,
+) -> None:
+    """Crash-loop guard: once the per-boot restart cap is reached, a
+    persistent wedge must NOT exit again. It gives up quietly (logged
+    once) so a display that never binds can't churn the container — and
+    warm the SoC — for an unattended 8h."""
+    viewer._headless_wedge_since = 500.0
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'wayland'}, clear=False
+        ),
+        mock.patch.object(
+            viewer, '_kernel_has_bindable_display', return_value=True
+        ),
+        mock.patch.object(
+            viewer, '_cage_output_probe', return_value='no-output'
+        ),
+        mock.patch.object(
+            viewer,
+            'monotonic',
+            return_value=500.0 + viewer.WAYLAND_OUTPUT_GRACE_S,
+        ),
+        _mock_recovery_budget(
+            count=viewer.WAYLAND_MAX_RECOVERY_RESTARTS, record=True
+        ) as record,
+    ):
+        viewer._wayland_output_watchdog()  # must NOT raise SystemExit
+
+    record.assert_not_called()
+    assert viewer._recovery_gave_up_logged is True
+
+
+def test_output_watchdog_no_restart_when_counter_unwritable(
+    reset_wedge_state: None,
+) -> None:
+    """If the recovery counter can't be persisted, refuse to restart: an
+    unbounded loop is worse than a still screen."""
+    viewer._headless_wedge_since = 500.0
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'wayland'}, clear=False
+        ),
+        mock.patch.object(
+            viewer, '_kernel_has_bindable_display', return_value=True
+        ),
+        mock.patch.object(
+            viewer, '_cage_output_probe', return_value='no-output'
+        ),
+        mock.patch.object(
+            viewer,
+            'monotonic',
+            return_value=500.0 + viewer.WAYLAND_OUTPUT_GRACE_S,
+        ),
+        _mock_recovery_budget(count=0, record=False),
+    ):
+        viewer._wayland_output_watchdog()  # must NOT raise SystemExit
+
+
+def test_kernel_has_connected_display_true_for_modeless_connected() -> None:
+    """A strictly-``connected`` connector counts even with an empty mode
+    list — that's the wedge we recover."""
+    files = {
+        '/sys/class/drm/card1-HDMI-A-1/status': 'connected\n',
+        '/sys/class/drm/card1-HDMI-A-1/modes': '',
+    }
+    with contextlib.ExitStack() as stack:
+        for cm in _patch_drm_sysfs(files):
+            stack.enter_context(cm)
+        assert viewer._kernel_has_connected_display() is True
+
+
+def test_kernel_has_connected_display_excludes_unknown_writeback() -> None:
+    """Writeback is ``unknown`` + modeless, and a disconnected HDMI is
+    disconnected — neither is a display to recover."""
+    files = {
+        '/sys/class/drm/card1-HDMI-A-1/status': 'disconnected\n',
+        '/sys/class/drm/card1-HDMI-A-1/modes': '',
+        '/sys/class/drm/card1-Writeback-1/status': 'unknown\n',
+        '/sys/class/drm/card1-Writeback-1/modes': '',
+    }
+    with contextlib.ExitStack() as stack:
+        for cm in _patch_drm_sysfs(files):
+            stack.enter_context(cm)
+        assert viewer._kernel_has_connected_display() is False
+
+
+def test_recovery_counter_is_boot_scoped(tmp_path: Any) -> None:
+    """The restart count resets when boot_id changes (a real reboot), so a
+    stale give-up never blocks recovery after the device reboots."""
+    state = tmp_path / '.wayland_recovery'
+    with mock.patch.object(
+        viewer, '_recovery_state_path', return_value=str(state)
+    ):
+        with mock.patch.object(
+            viewer, '_current_boot_id', return_value='boot-A'
+        ):
+            assert viewer._record_recovery_restart() is True
+            assert viewer._record_recovery_restart() is True
+            assert viewer._recovery_restarts_this_boot() == 2
+        with mock.patch.object(
+            viewer, '_current_boot_id', return_value='boot-B'
+        ):
+            assert viewer._recovery_restarts_this_boot() == 0
+
+
+def test_recovery_counter_reset_and_corrupt_read(tmp_path: Any) -> None:
+    state = tmp_path / '.wayland_recovery'
+    with (
+        mock.patch.object(
+            viewer, '_recovery_state_path', return_value=str(state)
+        ),
+        mock.patch.object(viewer, '_current_boot_id', return_value='boot-A'),
+    ):
+        viewer._record_recovery_restart()
+        assert viewer._recovery_restarts_this_boot() == 1
+        viewer._reset_recovery_restarts()
+        assert viewer._recovery_restarts_this_boot() == 0
+        # A corrupt file reads as 0, never a crash.
+        state.write_text('{not json')
+        assert viewer._recovery_restarts_this_boot() == 0
+
+
+def test_record_recovery_restart_write_failure_returns_false() -> None:
+    """A write that can't land returns False so the caller won't restart."""
+    with (
+        mock.patch.object(
+            viewer,
+            '_recovery_state_path',
+            return_value='/no/such/dir/.wayland_recovery',
+        ),
+        mock.patch.object(viewer, '_current_boot_id', return_value='boot-A'),
+    ):
+        assert viewer._record_recovery_restart() is False
+
+
+def test_current_boot_id_prefers_boot_id() -> None:
+    with mock.patch('builtins.open', mock.mock_open(read_data='abc-123\n')):
+        assert viewer._current_boot_id() == 'abc-123'
+
+
+def test_current_boot_id_falls_back_to_btime() -> None:
+    """If boot_id is unreadable, fall back to /proc/stat btime — which
+    also changes on reboot — so the per-boot cap still resets and a stale
+    '' can't pin a give-up across reboots."""
+
+    def fake_open(file_path: str, *args: Any, **kwargs: Any) -> Any:
+        if 'boot_id' in file_path:
+            raise OSError('unreadable')
+        if file_path == '/proc/stat':
+            return mock.mock_open(read_data='cpu 1 2 3\nbtime 1700000000\n')()
+        raise FileNotFoundError(file_path)
+
+    with mock.patch('builtins.open', side_effect=fake_open):
+        assert viewer._current_boot_id() == 'btime:1700000000'
+
+
+def test_cage_output_probe_classifies_wlr_randr_result() -> None:
+    """has-output when a connector is listed, no-output on a clean empty
+    run, unknown when wlr-randr can't be run (nonzero / missing)."""
+    with mock.patch(
+        'anthias_viewer.subprocess.run',
+        return_value=mock.Mock(
+            returncode=0, stdout='HDMI-A-1 "X"\n  Enabled: yes\n', stderr=''
+        ),
+    ):
+        assert viewer._cage_output_probe() == 'has-output'
+    with mock.patch(
+        'anthias_viewer.subprocess.run',
+        return_value=mock.Mock(returncode=0, stdout='', stderr=''),
+    ):
+        assert viewer._cage_output_probe() == 'no-output'
+    with mock.patch(
+        'anthias_viewer.subprocess.run',
+        return_value=mock.Mock(returncode=1, stdout='', stderr='boom'),
+    ):
+        assert viewer._cage_output_probe() == 'unknown'
+    with mock.patch(
+        'anthias_viewer.subprocess.run', side_effect=FileNotFoundError()
+    ):
+        assert viewer._cage_output_probe() == 'unknown'
+
+
+def test_kernel_has_bindable_display_connected_with_modes() -> None:
+    """connected + a non-empty EDID mode list = bindable."""
+    files = {
+        '/sys/class/drm/card1-HDMI-A-1/status': 'disconnected\n',
+        '/sys/class/drm/card1-HDMI-A-1/modes': '',
+        '/sys/class/drm/card1-HDMI-A-2/status': 'connected\n',
+        '/sys/class/drm/card1-HDMI-A-2/modes': '3840x2160\n1920x1080\n',
+        '/sys/class/drm/card1-Writeback-1/status': 'unknown\n',
+        '/sys/class/drm/card1-Writeback-1/modes': '',
+    }
+    with contextlib.ExitStack() as stack:
+        for cm in _patch_drm_sysfs(files):
+            stack.enter_context(cm)
+        assert viewer._kernel_has_bindable_display() is True
+
+
+def test_kernel_has_bindable_display_unknown_status_with_modes() -> None:
+    """Some HDMI bridges report 'unknown' for a real display. With a
+    non-empty mode list that's still bindable (status is matched as 'not
+    disconnected', mirroring eglfs_has_display); the modes gate still
+    excludes the Writeback connector, which is 'unknown' but modeless."""
+    files = {
+        '/sys/class/drm/card1-HDMI-A-1/status': 'unknown\n',
+        '/sys/class/drm/card1-HDMI-A-1/modes': '1920x1080\n',
+        '/sys/class/drm/card1-Writeback-1/status': 'unknown\n',
+        '/sys/class/drm/card1-Writeback-1/modes': '',
+    }
+    with contextlib.ExitStack() as stack:
+        for cm in _patch_drm_sysfs(files):
+            stack.enter_context(cm)
+        assert viewer._kernel_has_bindable_display() is True
+
+
+def test_kernel_has_bindable_display_connected_no_modes() -> None:
+    """A connector that's 'connected' but has an EMPTY mode list (HPD
+    asserted, EDID unread — a marginally-seated cable) is NOT bindable:
+    restarting can't recover it, so the watchdog must leave it alone."""
+    files = {
+        '/sys/class/drm/card1-HDMI-A-1/status': 'connected\n',
+        '/sys/class/drm/card1-HDMI-A-1/modes': '',
+    }
+    with contextlib.ExitStack() as stack:
+        for cm in _patch_drm_sysfs(files):
+            stack.enter_context(cm)
+        assert viewer._kernel_has_bindable_display() is False
+
+
+def test_kernel_has_bindable_display_all_disconnected() -> None:
+    """Nothing connected = headless."""
+    files = {
+        '/sys/class/drm/card1-HDMI-A-1/status': 'disconnected\n',
+        '/sys/class/drm/card1-HDMI-A-1/modes': '',
+        '/sys/class/drm/card1-Writeback-1/status': 'unknown\n',
+        '/sys/class/drm/card1-Writeback-1/modes': '',
+    }
+    with contextlib.ExitStack() as stack:
+        for cm in _patch_drm_sysfs(files):
+            stack.enter_context(cm)
+        assert viewer._kernel_has_bindable_display() is False
+
+
+# ---------------------------------------------------------------------------
+# _display_device_vanished — GH #3266
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'failure_text',
+    [
+        (
+            'AnthiasViewer exited before emitting D-Bus handshake; stdout: '
+            'Unable to figure out framebuffer device. Specify it manually.'
+        ),
+        'linuxfb: Failed to initialize screen',
+        'Cannot create window: no screens available',
+    ],
+)
+def test_display_device_vanished_detects_qt_no_screen(
+    failure_text: str,
+) -> None:
+    """The container's /dev is a start-time snapshot and
+    wait_for_framebuffer only runs once, so a linuxfb board whose display
+    disappears afterwards can never spawn a webview again. Retrying just
+    delays the container restart that actually fixes it."""
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'linuxfb'}, clear=False
+        ),
+        mock.patch.object(os.path, 'exists', return_value=False),
+    ):
+        assert viewer._display_device_vanished(failure_text) is True
+
+
+def test_display_device_vanished_requires_the_device_to_be_absent() -> None:
+    """Conservative on purpose: a transient Qt init crash on a board whose
+    framebuffer is still present must keep its full retry budget."""
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'linuxfb'}, clear=False
+        ),
+        mock.patch.object(os.path, 'exists', return_value=True),
+    ):
+        assert viewer._display_device_vanished('no screens available') is False
+
+
+def test_display_device_vanished_ignores_unrelated_failures() -> None:
+    """A crash with no no-screen signature is not this bug, even with the
+    device genuinely absent."""
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'linuxfb'}, clear=False
+        ),
+        mock.patch.object(os.path, 'exists', return_value=False),
+    ):
+        assert viewer._display_device_vanished('Segmentation fault') is False
+
+
+@pytest.mark.parametrize('platform', ['wayland', 'eglfs'])
+def test_display_device_vanished_excludes_non_linuxfb(platform: str) -> None:
+    """Wayland and eglfs boards do not consume /dev/fb0, and the Wayland
+    wedge already has its own bounded-restart watchdog — so this
+    short-circuit must never fire there."""
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': platform}, clear=False
+        ),
+        mock.patch.object(os.path, 'exists', return_value=False),
+    ):
+        assert viewer._display_device_vanished('no screens available') is False
+
+
+# ---------------------------------------------------------------------------
+# Idle-log latches — GH #3268
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _reset_log_latches() -> Iterator[None]:
+    """Both latches are module state; isolate each test from the others."""
+    prev_empty = viewer._empty_playlist_logged
+    prev_unavail = viewer._unavailable_asset_logged
+    viewer._empty_playlist_logged = False
+    viewer._unavailable_asset_logged = None
+    try:
+        yield
+    finally:
+        viewer._empty_playlist_logged = prev_empty
+        viewer._unavailable_asset_logged = prev_unavail
+
+
+def test_empty_playlist_logs_once_then_resets_on_both_edges(
+    caplog: Any,
+) -> None:
+    """The idle notice must fire on the transition, not on every 5s poll —
+    2 lines/tick was ~1440 lines/hour into a ~15 MB volatile journal,
+    evicting the crash diagnostics it shares space with.
+
+    Equally important: the latch has to reset, or a board that goes
+    empty once goes permanently silent."""
+    scheduler = mock.MagicMock()
+    scheduler.get_next_asset.return_value = None
+    with (
+        _reset_log_latches(),
+        mock.patch.object(viewer, 'view_image'),
+        mock.patch.object(viewer, '_wayland_output_watchdog'),
+        mock.patch.object(viewer, '_consume_pending_rotation_bounce'),
+        mock.patch.object(viewer, '_skip_if_current_asset_inactive'),
+        mock.patch.object(viewer, 'get_skip_event') as skip,
+        caplog.at_level(logging.INFO, logger=viewer.logger.name),
+    ):
+        skip.return_value.wait.return_value = False
+        logging.disable(logging.NOTSET)
+        try:
+            for _ in range(5):
+                viewer.asset_loop(scheduler)
+        finally:
+            logging.disable(logging.CRITICAL)
+    empties = [
+        r for r in caplog.records if 'Playlist is empty' in r.getMessage()
+    ]
+    assert len(empties) == 1, (
+        f'expected 1 notice across 5 polls, got {len(empties)}'
+    )
+
+
+def test_unavailable_asset_logs_once_per_offender(caplog: Any) -> None:
+    """The 0.5s retry arm was the worse offender: ~7180 lines/hour from a
+    single unreachable asset, measured on the arm64 testbed — about 5x the
+    idle-playlist rate. Log once per distinct asset, and speak up again
+    when a *different* asset fails."""
+    first = {
+        'asset_id': 'a1',
+        'name': 'one',
+        'uri': '/missing/one.png',
+        'mimetype': 'image',
+    }
+    second = dict(first, asset_id='a2', name='two', uri='/missing/two.png')
+    scheduler = mock.MagicMock()
+    with (
+        _reset_log_latches(),
+        mock.patch.object(viewer, '_asset_is_displayable', return_value=False),
+        mock.patch.object(viewer, '_asset_is_local_file', return_value=True),
+        mock.patch.object(viewer, '_wayland_output_watchdog'),
+        mock.patch.object(viewer, '_consume_pending_rotation_bounce'),
+        mock.patch.object(viewer, '_skip_if_current_asset_inactive'),
+        mock.patch.object(viewer, 'get_skip_event') as skip,
+        caplog.at_level(logging.INFO, logger=viewer.logger.name),
+    ):
+        skip.return_value.wait.return_value = False
+        logging.disable(logging.NOTSET)
+        try:
+            scheduler.get_next_asset.return_value = first
+            for _ in range(4):
+                viewer.asset_loop(scheduler)
+            scheduler.get_next_asset.return_value = second
+            viewer.asset_loop(scheduler)
+        finally:
+            logging.disable(logging.CRITICAL)
+    msgs = [
+        r.getMessage()
+        for r in caplog.records
+        if 'is not available, skipping' in r.getMessage()
+    ]
+    assert len(msgs) == 2, (
+        f'expected one line per distinct asset, got {len(msgs)}: {msgs}'
+    )
+    assert '/missing/one.png' in msgs[0]
+    assert '/missing/two.png' in msgs[1]
+
+
+def test_load_browser_short_circuits_a_vanished_display(caplog: Any) -> None:
+    """Integration for the guard: the retry loop must abandon its budget
+    on the FIRST failure, with the distinct message.
+
+    Measured on the armhf testbed: 3 attempts / 6.02s before, 1 attempt /
+    2.94s after. On the 30-attempt startup path the saving is ~6.5min of
+    black screen, and the distinct wording also stops this grouping with
+    genuine Qt init crashes in Sentry."""
+    qt_text = (
+        'AnthiasViewer exited before emitting D-Bus handshake; stdout: '
+        'Unable to figure out framebuffer device. Specify it manually.'
+    )
+    spawn = mock.Mock(side_effect=viewer.WebviewLaunchError(qt_text))
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'linuxfb'}, clear=False
+        ),
+        mock.patch.object(os.path, 'exists', return_value=False),
+        mock.patch.object(viewer, '_spawn_webview_once', spawn),
+        mock.patch.object(viewer, 'sleep') as slept,
+        pytest.raises(viewer.WebviewLaunchError) as excinfo,
+    ):
+        viewer.load_browser(max_attempts=30, startup_timeout=30)
+    assert spawn.call_count == 1, (
+        f'expected 1 attempt, spent {spawn.call_count} of a 30 budget'
+    )
+    slept.assert_not_called()
+    assert 'the display device is gone' in str(excinfo.value)
+
+
+def test_load_browser_keeps_its_budget_when_the_device_is_present() -> None:
+    """The false-positive guard, in the loop. Same Qt no-screen text, but
+    the device exists — so this must spend the full budget rather than
+    abandon a retry that would have succeeded. Verified on hardware by
+    swapping /dev/fb0 for an unopenable node."""
+    qt_text = 'linuxfb: Failed to initialize screen'
+    spawn = mock.Mock(side_effect=viewer.WebviewLaunchError(qt_text))
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'linuxfb'}, clear=False
+        ),
+        mock.patch.object(os.path, 'exists', return_value=True),
+        mock.patch.object(viewer, '_spawn_webview_once', spawn),
+        mock.patch.object(viewer, 'sleep'),
+        pytest.raises(viewer.WebviewLaunchError) as excinfo,
+    ):
+        viewer.load_browser(max_attempts=3, startup_timeout=10)
+    assert spawn.call_count == 3
+    assert 'did not start after 3 attempts' in str(excinfo.value)
+    assert 'the display device is gone' not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    'platform,expected',
+    [
+        ('linuxfb', '/dev/fb0'),
+        ('linuxfb:rotation=90', '/dev/fb0'),
+        ('linuxfb:fb=/dev/fb1', '/dev/fb1'),
+        # Qt's syntax is <plugin>:opt=val,opt=val — ONE colon, then
+        # comma-separated options. Parsing the options on ':' instead
+        # returned '/dev/fb1,rotation=90' as the device path, so
+        # os.path.exists said False and the guard fired on a board whose
+        # framebuffer was fine. Copilot review of #3266.
+        ('linuxfb:fb=/dev/fb1,rotation=90', '/dev/fb1'),
+        ('linuxfb:rotation=90,fb=/dev/fb1', '/dev/fb1'),
+        ('linuxfb:tty=/dev/tty1,fb=/dev/fb2,rotation=270', '/dev/fb2'),
+    ],
+)
+def test_linuxfb_device_honours_the_fb_option(
+    platform: str, expected: str
+) -> None:
+    """linuxfb accepts fb=/dev/fbN, so a board configured onto fb1 must
+    not be judged by fb0's presence."""
+    with mock.patch.dict(
+        os.environ, {'QT_QPA_PLATFORM': platform}, clear=False
+    ):
+        assert viewer._linuxfb_device() == expected
+
+
+def test_wayland_recovery_logs_at_warning_not_error(caplog: Any) -> None:
+    """#3265: the Sentry logging integration promotes ERROR records to
+    events, so logging a *successful* self-heal at ERROR filed a Sentry
+    issue on every recovery (ANTHIAS-4M). Demoted to WARNING.
+
+    Verified end to end on the Pi 5 by inducing a real cage no-output
+    state: recovery logged at WARNING(30), give-up at ERROR(40), and a
+    capturing-transport A/B confirmed ERROR -> 1 event, WARNING -> 0."""
+    with (
+        mock.patch.dict(
+            os.environ, {'QT_QPA_PLATFORM': 'wayland'}, clear=False
+        ),
+        mock.patch.object(
+            viewer, '_kernel_has_connected_display', return_value=True
+        ),
+        mock.patch.object(
+            viewer, '_cage_output_probe', return_value='no-output'
+        ),
+        mock.patch.object(
+            viewer, '_recovery_restarts_this_boot', return_value=0
+        ),
+        mock.patch.object(
+            viewer, '_record_recovery_restart', return_value=True
+        ),
+        mock.patch.object(viewer, 'sys') as fake_sys,
+        caplog.at_level(logging.WARNING, logger=viewer.logger.name),
+    ):
+        fake_sys.exit.side_effect = SystemExit(1)
+        viewer._headless_wedge_since = 0.0
+        logging.disable(logging.NOTSET)
+        try:
+            with pytest.raises(SystemExit):
+                viewer._wayland_output_watchdog()
+        finally:
+            logging.disable(logging.CRITICAL)
+            viewer._headless_wedge_since = None
+    recovery = [
+        r for r in caplog.records if 'headless-boot wedge' in r.getMessage()
+    ]
+    assert recovery, 'the recovery message was not logged at all'
+    assert all(r.levelno == logging.WARNING for r in recovery), (
+        f'recovery must be WARNING; got {[r.levelname for r in recovery]} — '
+        'at ERROR the Sentry integration files an issue per self-heal'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Startup schema gate (Sentry ANTHIAS-C)
+# ---------------------------------------------------------------------------
+
+
+class TestWaitForDbSchema:
+    """The viewer must not query the asset table before it exists.
+
+    ``Scheduler()`` reads the playlist on construction, ``__main__``
+    re-raises whatever that throws, and the container restarts — so a
+    single unguarded query turns a slow first-boot migrate into a crash
+    loop that re-reports once per restart.
+    """
+
+    def test_returns_immediately_when_the_schema_is_ready(self) -> None:
+        with (
+            mock.patch(
+                'anthias_server.lib.db_readiness.migrations_ready',
+                return_value=True,
+            ),
+            mock.patch('anthias_server.lib.db_readiness.time.sleep') as sleep,
+        ):
+            viewer_utils.wait_for_db_schema()
+        sleep.assert_not_called()
+
+    def test_blocks_until_the_schema_is_ready(self) -> None:
+        with (
+            mock.patch(
+                'anthias_server.lib.db_readiness.migrations_ready',
+                side_effect=[False, False, True],
+            ),
+            mock.patch('anthias_server.lib.db_readiness.time.sleep') as sleep,
+        ):
+            viewer_utils.wait_for_db_schema()
+        assert sleep.call_count == 2
+
+    def test_pokes_the_watchdog_while_waiting(self) -> None:
+        """A long migrate must not read as a wedged viewer.
+
+        The host watchdog only sees the mtime of the watchdog file, so
+        a gate that blocks without touching it trades a crash loop for
+        a watchdog reboot loop.
+        """
+        with (
+            mock.patch(
+                'anthias_server.lib.db_readiness.migrations_ready',
+                side_effect=[False, False, True],
+            ),
+            mock.patch('anthias_server.lib.db_readiness.time.sleep'),
+            mock.patch.object(viewer_utils, 'watchdog') as poke,
+        ):
+            viewer_utils.wait_for_db_schema()
+        assert poke.call_count == 2
+
+    def test_main_gates_the_scheduler_on_the_schema(self) -> None:
+        """The gate has to sit before ``Scheduler()``, not merely exist.
+
+        Asserting on call order is the point: a correct
+        ``wait_for_db_schema`` placed after the construction it is meant
+        to protect leaves ANTHIAS-C exactly as it was.
+        """
+        calls: list[str] = []
+
+        def _record(name: str) -> Any:
+            def record(*_args: Any, **_kwargs: Any) -> mock.Mock:
+                calls.append(name)
+                return mock.Mock()
+
+            return record
+
+        with (
+            mock.patch.object(viewer, 'setup'),
+            mock.patch.object(viewer, 'ViewerSubscriber'),
+            mock.patch.object(viewer, '_publish_cec_availability'),
+            mock.patch.object(viewer, '_publish_display_resolution_loop'),
+            mock.patch.object(viewer, '_publish_smart_loop'),
+            mock.patch.object(viewer, 'view_image'),
+            mock.patch.object(viewer, 'view_webpage'),
+            mock.patch.object(viewer, 'sleep'),
+            mock.patch.object(viewer, 'start_loop'),
+            mock.patch.object(
+                viewer,
+                'wait_for_server',
+                side_effect=_record('wait_for_server'),
+            ),
+            mock.patch.object(
+                viewer,
+                'wait_for_db_schema',
+                side_effect=_record('wait_for_db_schema'),
+            ),
+            mock.patch.object(
+                viewer, 'Scheduler', side_effect=_record('Scheduler')
+            ),
+        ):
+            viewer.main()
+        assert calls.index('wait_for_db_schema') < calls.index('Scheduler')
+
+
+def test_wait_for_server_logs_when_it_gives_up(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Falling through the budget is allowed; doing it silently is not.
+
+    Every later failure on a device whose server never started reads
+    differently once this line is in the log.
+    """
+    with (
+        mock.patch(
+            'anthias_viewer.utils.requests.get',
+            side_effect=requests.exceptions.ConnectionError(),
+        ),
+        mock.patch('anthias_viewer.utils.sleep'),
+        caplog.at_level(logging.WARNING, logger=viewer_utils.logger.name),
+    ):
+        logging.disable(logging.NOTSET)
+        try:
+            viewer_utils.wait_for_server(3)
+        finally:
+            logging.disable(logging.CRITICAL)
+    assert any('did not answer' in r.getMessage() for r in caplog.records)

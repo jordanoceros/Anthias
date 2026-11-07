@@ -1,14 +1,17 @@
 import logging
+import signal
+import sys
 from collections.abc import Iterator
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from anthias_viewer import media_player as media_player_module
 from anthias_viewer.media_player import (
-    MPVMediaPlayer,
+    GstFbdevMediaPlayer,
     MediaPlayerProxy,
-    VLCMediaPlayer,
+    MPVMediaPlayer,
     get_alsa_audio_device,
 )
 
@@ -27,7 +30,7 @@ def mpv() -> Iterator[_MPVFixtures]:
     fixtures.player = MPVMediaPlayer()
 
     # MPVMediaPlayer now hands play() / stop() through a pydbus
-    # proxy of the AnthiasWebview C++ process (issue #2904 —
+    # proxy of the AnthiasViewer C++ process (issue #2904 —
     # libmpv lives inside the webview). Inject a Mock so tests
     # can assert on the options dict shipped over D-Bus without
     # standing up a real D-Bus session.
@@ -122,13 +125,40 @@ def test_play_omits_libmpv_era_options(mpv: _MPVFixtures) -> None:
         assert legacy not in options, legacy
 
 
-def test_play_uses_default_alsa_device_on_arm64(mpv: _MPVFixtures) -> None:
-    # No portable per-SoC HDMI card name exists across Rockchip /
-    # Allwinner / Amlogic, so arm64 defers to ALSA's `default`
-    # device rather than the Pi-firmware vc4hdmi* / HID cards the
-    # regular dispatch would otherwise pick.
+def test_play_routes_to_hdmi_sink_on_arm64(mpv: _MPVFixtures) -> None:
+    # arm64 SBCs have no portable per-SoC ALSA card name, so the
+    # audio_output setting is resolved against a live PulseAudio sink
+    # (issue #3208). With HDMI selected, playback routes to the HDMI
+    # sink rather than whatever pulse happens to default to.
     mpv.player.set_asset('file:///test/video.mp4', 30)
-    with patch.dict('os.environ', {'DEVICE_TYPE': 'arm64'}):
+    with (
+        patch.dict('os.environ', {'DEVICE_TYPE': 'arm64'}),
+        patch(
+            'anthias_viewer.media_player._list_pulse_sinks',
+            return_value=[
+                'alsa_output.hdmisound.stereo-fallback',
+                'alsa_output.Analog.stereo-fallback',
+            ],
+        ),
+    ):
+        mpv.player.play()
+
+    options = _last_play_options(mpv.mock_bus)
+    assert (
+        options['audio-device'] == 'alsa/alsa_output.hdmisound.stereo-fallback'
+    )
+
+
+def test_play_falls_back_to_default_sink_on_arm64(mpv: _MPVFixtures) -> None:
+    # When pulse is unreachable (no sinks listed), fall back to the
+    # default sink rather than silencing audio.
+    mpv.player.set_asset('file:///test/video.mp4', 30)
+    with (
+        patch.dict('os.environ', {'DEVICE_TYPE': 'arm64'}),
+        patch(
+            'anthias_viewer.media_player._list_pulse_sinks', return_value=[]
+        ),
+    ):
         mpv.player.play()
 
     options = _last_play_options(mpv.mock_bus)
@@ -253,7 +283,7 @@ def test_marshal_dbus_options_wraps_in_glib_variant() -> None:
 
 def test_set_browser_bus_injects_module_state() -> None:
     # Smoke test the injection hook the viewer uses after the
-    # AnthiasWebview D-Bus handshake. Re-injecting a fresh proxy
+    # AnthiasViewer D-Bus handshake. Re-injecting a fresh proxy
     # (post-webview-restart) must replace the previous one rather
     # than appending.
     import anthias_viewer.media_player as mp
@@ -338,12 +368,339 @@ def test_hdmi_on_pi1_pi2_pi3_uses_vc4hdmi(
         assert get_alsa_audio_device() == 'sysdefault:CARD=vc4hdmi'
 
 
-def test_hdmi_on_x86_falls_back_to_hid(alsa_settings: Any) -> None:
+# Real-world `pactl list short sinks` layouts from the testbeds:
+# an HDA x86 box (analog + HDMI on separate cards) and a Rock Pi 4B.
+_X86_SINKS = [
+    'alsa_output.HID.analog-stereo',
+    'alsa_output.PCH.hdmi-stereo',
+]
+_ROCKPI_SINKS = [
+    'alsa_output.hdmisound.stereo-fallback',
+    'alsa_output.Analog.stereo-fallback',
+]
+
+
+def test_hdmi_on_x86_routes_to_hdmi_sink(alsa_settings: Any) -> None:
+    # x86 resolves HDMI to the live HDMI sink instead of the pulse
+    # default (issue #3208).
     alsa_settings.__getitem__.return_value = 'hdmi'
-    with patch(
-        'anthias_viewer.media_player.get_device_type', return_value='x86'
+    with (
+        patch(
+            'anthias_viewer.media_player.get_device_type', return_value='x86'
+        ),
+        patch(
+            'anthias_viewer.media_player._list_pulse_sinks',
+            return_value=_X86_SINKS,
+        ),
     ):
-        assert get_alsa_audio_device() == 'sysdefault:CARD=HID'
+        assert get_alsa_audio_device() == 'alsa_output.PCH.hdmi-stereo'
+
+
+def test_local_on_x86_routes_to_analog_sink(alsa_settings: Any) -> None:
+    alsa_settings.__getitem__.return_value = 'local'
+    with (
+        patch(
+            'anthias_viewer.media_player.get_device_type', return_value='x86'
+        ),
+        patch(
+            'anthias_viewer.media_player._list_pulse_sinks',
+            return_value=_X86_SINKS,
+        ),
+    ):
+        assert get_alsa_audio_device() == 'alsa_output.HID.analog-stereo'
+
+
+def test_x86_falls_back_to_default_when_no_matching_sink(
+    alsa_settings: Any,
+) -> None:
+    # HDMI requested but only an analog sink exists and no HDMI profile
+    # can be activated -> default sink. Patch _activate_output_profile
+    # so the miss-recovery path stays hermetic (no real `pactl`).
+    alsa_settings.__getitem__.return_value = 'hdmi'
+    with (
+        patch(
+            'anthias_viewer.media_player.get_device_type', return_value='x86'
+        ),
+        patch(
+            'anthias_viewer.media_player._list_pulse_sinks',
+            return_value=['alsa_output.HID.analog-stereo'],
+        ),
+        patch(
+            'anthias_viewer.media_player._activate_output_profile',
+            return_value=False,
+        ),
+    ):
+        assert get_alsa_audio_device() == 'default'
+
+
+@pytest.mark.parametrize(
+    'audio_output,sinks,expected',
+    [
+        ('hdmi', _X86_SINKS, 'alsa_output.PCH.hdmi-stereo'),
+        ('local', _X86_SINKS, 'alsa_output.HID.analog-stereo'),
+        ('hdmi', _ROCKPI_SINKS, 'alsa_output.hdmisound.stereo-fallback'),
+        ('local', _ROCKPI_SINKS, 'alsa_output.Analog.stereo-fallback'),
+        # Same HDA card exposes both profiles (forum #6749 Dell): the
+        # profile token, not the card name, disambiguates.
+        (
+            'hdmi',
+            [
+                'alsa_output.pci-0000_00_1f.3.analog-stereo',
+                'alsa_output.pci-0000_00_1f.3.hdmi-stereo',
+            ],
+            'alsa_output.pci-0000_00_1f.3.hdmi-stereo',
+        ),
+        ('hdmi', ['alsa_output.HID.analog-stereo'], None),
+        ('local', [], None),
+    ],
+)
+def test_select_pulse_sink(
+    audio_output: str, sinks: list[str], expected: str | None
+) -> None:
+    from anthias_viewer.media_player import _select_pulse_sink
+
+    assert _select_pulse_sink(sinks, audio_output) == expected
+
+
+def test_select_pulse_sink_prefers_stereo_among_multiple_hdmi() -> None:
+    # Multi-HDMI box: pactl order isn't guaranteed, so the plain
+    # *-stereo sink must win over surround / secondary-port variants
+    # regardless of listing order.
+    from anthias_viewer.media_player import _select_pulse_sink
+
+    sinks = [
+        'alsa_output.pci.hdmi-surround',
+        'alsa_output.pci.hdmi-stereo-extra1',
+        'alsa_output.pci.hdmi-stereo',
+    ]
+    assert _select_pulse_sink(sinks, 'hdmi') == 'alsa_output.pci.hdmi-stereo'
+
+
+def test_list_pulse_sinks_parses_pactl_output() -> None:
+    from anthias_viewer.media_player import _list_pulse_sinks
+
+    media_player_module._sink_cache = None
+    stdout = (
+        '0\talsa_output.HID.analog-stereo\tmodule-alsa-card.c\t'
+        's16le 2ch 48000Hz\tSUSPENDED\n'
+        '1\talsa_output.PCH.hdmi-stereo\tmodule-alsa-card.c\t'
+        's16le 2ch 44100Hz\tSUSPENDED\n'
+    )
+    with patch(
+        'anthias_viewer.media_player.subprocess.run',
+        return_value=MagicMock(stdout=stdout),
+    ):
+        assert _list_pulse_sinks() == [
+            'alsa_output.HID.analog-stereo',
+            'alsa_output.PCH.hdmi-stereo',
+        ]
+
+
+def test_list_pulse_sinks_returns_empty_when_pactl_missing() -> None:
+    from anthias_viewer.media_player import _list_pulse_sinks
+
+    media_player_module._sink_cache = None
+    with patch(
+        'anthias_viewer.media_player.subprocess.run',
+        side_effect=FileNotFoundError('pactl'),
+    ):
+        assert _list_pulse_sinks() == []
+
+
+def test_list_pulse_sinks_caches_within_ttl() -> None:
+    from anthias_viewer.media_player import _list_pulse_sinks
+
+    media_player_module._sink_cache = None
+    stdout = '0\talsa_output.PCH.hdmi-stereo\tm\ts16le 2ch\tSUSPENDED\n'
+    with patch(
+        'anthias_viewer.media_player.subprocess.run',
+        return_value=MagicMock(stdout=stdout),
+    ) as mock_run:
+        first = _list_pulse_sinks()
+        second = _list_pulse_sinks()
+    assert first == second == ['alsa_output.PCH.hdmi-stereo']
+    # Second call served from cache — pactl invoked only once.
+    mock_run.assert_called_once()
+
+
+# `pactl list cards` excerpt from the forum #6749 Dell Latitude: HDMI
+# and analog share one HDA card, every *pure* HDMI output profile is
+# available: no (the display carries no audio), and the combined
+# output+input profiles read yes only because of the analog input.
+_DELL_CARDS = """\
+Card #0
+\tName: alsa_card.pci-0000_00_1f.3
+\tProfiles:
+\t\toutput:analog-stereo: Analog Stereo Output (sinks: 1, sources: 0, priority: 6500, available: yes)
+\t\toutput:hdmi-stereo: Digital Stereo (HDMI) Output (sinks: 1, sources: 0, priority: 5900, available: no)
+\t\toutput:hdmi-stereo+input:analog-stereo: HDMI + Analog In (sinks: 1, sources: 1, priority: 5965, available: yes)
+\t\toutput:hdmi-surround: Digital Surround 5.1 (HDMI) Output (sinks: 1, sources: 0, priority: 800, available: no)
+\t\toff: Off (sinks: 0, sources: 0, priority: 0, available: yes)
+\tActive Profile: output:analog-stereo
+"""
+
+# A single-card box whose attached display *does* accept HDMI audio:
+# the pure HDMI output profile is available but analog is still active.
+_HDMI_CAPABLE_CARDS = """\
+Card #0
+\tName: alsa_card.pci-0000_00_1f.3
+\tProfiles:
+\t\toutput:analog-stereo: Analog Stereo Output (sinks: 1, sources: 0, priority: 6500, available: yes)
+\t\toutput:hdmi-stereo: Digital Stereo (HDMI) Output (sinks: 1, sources: 0, priority: 5900, available: yes)
+\t\toutput:hdmi-surround: Digital Surround 5.1 (HDMI) Output (sinks: 1, sources: 0, priority: 800, available: yes)
+\tActive Profile: output:analog-stereo
+"""
+
+
+def _cards_from(stdout: str) -> Any:
+    return patch(
+        'anthias_viewer.media_player.subprocess.run',
+        return_value=MagicMock(stdout=stdout),
+    )
+
+
+def test_list_pulse_cards_tracks_only_available_pure_outputs() -> None:
+    from anthias_viewer.media_player import _list_pulse_cards
+
+    with _cards_from(_DELL_CARDS):
+        cards = _list_pulse_cards()
+
+    assert len(cards) == 1
+    card = cards[0]
+    assert card.name == 'alsa_card.pci-0000_00_1f.3'
+    assert card.active_profile == 'output:analog-stereo'
+    # Combined output+input profile is excluded; pure HDMI output is
+    # tracked as unavailable, analog as available.
+    assert card.output_profiles == {
+        'output:analog-stereo': True,
+        'output:hdmi-stereo': False,
+        'output:hdmi-surround': False,
+    }
+
+
+def test_list_pulse_cards_treats_unknown_as_unavailable() -> None:
+    # ``available: unknown`` (driver can't probe the port) is not a
+    # confirmation — must not count as available, or we'd risk switching
+    # a working analog profile for a dead HDMI one.
+    from anthias_viewer.media_player import _list_pulse_cards
+
+    stdout = (
+        'Card #0\n'
+        '\tName: alsa_card.x\n'
+        '\tProfiles:\n'
+        '\t\toutput:hdmi-stereo: Digital Stereo (HDMI) Output '
+        '(sinks: 1, sources: 0, priority: 5900, available: unknown)\n'
+        '\tActive Profile: output:analog-stereo\n'
+    )
+    with _cards_from(stdout):
+        cards = _list_pulse_cards()
+
+    assert cards[0].output_profiles == {'output:hdmi-stereo': False}
+
+
+def test_activate_output_profile_switches_when_available() -> None:
+    # Full path: parse `pactl list cards`, find an available HDMI output
+    # that isn't active, and issue set-card-profile. Both subprocess
+    # calls (list + set) share the patched run.
+    from anthias_viewer.media_player import _activate_output_profile
+
+    with _cards_from(_HDMI_CAPABLE_CARDS) as mock_run:
+        assert _activate_output_profile('hdmi') is True
+
+    set_calls = [
+        call.args[0]
+        for call in mock_run.call_args_list
+        if call.args[0][:2] == ['pactl', 'set-card-profile']
+    ]
+    assert len(set_calls) == 1
+    # Switched the right card to the *stereo* HDMI profile (preferred
+    # over the surround variant).
+    assert set_calls[0] == [
+        'pactl',
+        'set-card-profile',
+        'alsa_card.pci-0000_00_1f.3',
+        'output:hdmi-stereo',
+    ]
+
+
+def test_activate_output_profile_noop_when_hdmi_unavailable() -> None:
+    # The Dell case: no available pure HDMI output -> no switch.
+    from anthias_viewer.media_player import _activate_output_profile
+
+    with _cards_from(_DELL_CARDS):
+        # _cards_from patches subprocess.run for the list; a
+        # set-card-profile call would reuse the same mock, so assert it
+        # only ran the list (no profile change was attempted).
+        assert _activate_output_profile('hdmi') is False
+
+
+def test_activate_output_profile_noop_when_already_active() -> None:
+    from anthias_viewer.media_player import _activate_output_profile
+
+    with _cards_from(_DELL_CARDS):
+        # analog already active -> nothing to switch.
+        assert _activate_output_profile('local') is False
+
+
+def test_resolve_pulse_sink_activates_profile_on_miss() -> None:
+    # Single-card box: analog sink present, hdmi requested. The first
+    # listing misses, profile activation exposes the hdmi sink, and the
+    # refreshed listing resolves to it.
+    from anthias_viewer.media_player import _resolve_pulse_sink
+
+    media_player_module._last_pulse_resolution = None
+    listings = [
+        ['alsa_output.pci.analog-stereo'],
+        ['alsa_output.pci.hdmi-stereo'],
+    ]
+    with (
+        patch(
+            'anthias_viewer.media_player._list_pulse_sinks',
+            side_effect=listings,
+        ),
+        patch(
+            'anthias_viewer.media_player._activate_output_profile',
+            return_value=True,
+        ) as mock_activate,
+    ):
+        assert _resolve_pulse_sink('hdmi') == 'alsa_output.pci.hdmi-stereo'
+    mock_activate.assert_called_once_with('hdmi')
+
+
+def test_resolve_pulse_sink_falls_back_when_activation_fails() -> None:
+    from anthias_viewer.media_player import _resolve_pulse_sink
+
+    media_player_module._last_pulse_resolution = None
+    with (
+        patch(
+            'anthias_viewer.media_player._list_pulse_sinks',
+            return_value=['alsa_output.pci.analog-stereo'],
+        ),
+        patch(
+            'anthias_viewer.media_player._activate_output_profile',
+            return_value=False,
+        ),
+    ):
+        # hdmi unavailable and unswitchable -> default sink.
+        assert _resolve_pulse_sink('hdmi') == 'default'
+
+
+def test_resolve_pulse_sink_skips_activation_when_pulse_unreachable() -> None:
+    # An empty sink list means pulse is unreachable — probing cards
+    # would just fail again, so activation must not be attempted.
+    from anthias_viewer.media_player import _resolve_pulse_sink
+
+    media_player_module._last_pulse_resolution = None
+    with (
+        patch(
+            'anthias_viewer.media_player._list_pulse_sinks', return_value=[]
+        ),
+        patch(
+            'anthias_viewer.media_player._activate_output_profile'
+        ) as mock_activate,
+    ):
+        assert _resolve_pulse_sink('hdmi') == 'default'
+    mock_activate.assert_not_called()
 
 
 class _FakeDirEntry:
@@ -471,8 +828,8 @@ def test_detect_hdmi_logs_only_on_transitions() -> None:
         # 1. Three identical "no HDMI" calls — WARN once, DEBUG twice.
         with (
             patch('anthias_viewer.media_player.os.scandir', return_value=[]),
-            patch('anthias_viewer.media_player.logging.warning') as mock_warn,
-            patch('anthias_viewer.media_player.logging.debug') as mock_debug,
+            patch('anthias_viewer.media_player.logger.warning') as mock_warn,
+            patch('anthias_viewer.media_player.logger.debug') as mock_debug,
         ):
             for _ in range(3):
                 assert (
@@ -498,8 +855,8 @@ def test_detect_hdmi_logs_only_on_transitions() -> None:
         with (
             scandir_patch,
             open_patch,
-            patch('anthias_viewer.media_player.logging.info') as mock_info,
-            patch('anthias_viewer.media_player.logging.debug') as mock_debug,
+            patch('anthias_viewer.media_player.logger.info') as mock_info,
+            patch('anthias_viewer.media_player.logger.debug') as mock_debug,
         ):
             assert mp._detect_hdmi_audio_device() == 'sysdefault:CARD=vc4hdmi1'
             assert mp._detect_hdmi_audio_device() == 'sysdefault:CARD=vc4hdmi1'
@@ -514,7 +871,7 @@ def test_detect_hdmi_logs_only_on_transitions() -> None:
         # 3. Cable yanked: back to fallback — WARN re-fires on transition.
         with (
             patch('anthias_viewer.media_player.os.scandir', return_value=[]),
-            patch('anthias_viewer.media_player.logging.warning') as mock_warn,
+            patch('anthias_viewer.media_player.logger.warning') as mock_warn,
         ):
             assert mp._detect_hdmi_audio_device() == 'sysdefault:CARD=vc4hdmi0'
             assert mock_warn.call_count == 1
@@ -536,45 +893,196 @@ def test_detect_hdmi_falls_back_on_oserror() -> None:
         assert _detect_hdmi_audio_device() == 'sysdefault:CARD=vc4hdmi0'
 
 
-class _VLCFixtures:
-    player: VLCMediaPlayer
-    mock_media: Any
-    mock_vlc_player: Any
+class _GstFixtures:
+    player: GstFbdevMediaPlayer
     mock_settings: Any
 
 
 @pytest.fixture
-def vlc() -> Iterator[_VLCFixtures]:
-    fixtures = _VLCFixtures()
-    with patch.object(VLCMediaPlayer, '__init__', return_value=None):
-        fixtures.player = VLCMediaPlayer()
-
-    fixtures.mock_media = MagicMock()
-    fixtures.mock_vlc_player = MagicMock()
-    fixtures.mock_vlc_player.get_media.return_value = fixtures.mock_media
-    fixtures.player.player = fixtures.mock_vlc_player
+def gstfb() -> Iterator[_GstFixtures]:
+    fixtures = _GstFixtures()
+    # Pin the framebuffer geometry/format so the test doesn't depend on
+    # the host's /sys/class/graphics/fb0.
+    with patch(
+        'anthias_viewer.media_player._fb_geometry',
+        return_value=(1920, 1080, 'RGB16'),
+    ):
+        fixtures.player = GstFbdevMediaPlayer()
 
     patch_settings = patch('anthias_viewer.media_player.settings')
-    patch_device_type = patch(
-        'anthias_viewer.media_player.get_device_type', return_value='pi4'
+    patch_rotation = patch(
+        'anthias_viewer.media_player._screen_rotation', return_value=0
     )
-
+    patch_alsa = patch(
+        'anthias_viewer.media_player.get_alsa_audio_device',
+        return_value='sysdefault:CARD=vc4hdmi0',
+    )
     fixtures.mock_settings = patch_settings.start()
-    fixtures.mock_settings.__getitem__.return_value = 'hdmi'
-    patch_device_type.start()
-
+    patch_rotation.start()
+    patch_alsa.start()
     try:
         yield fixtures
     finally:
         patch_settings.stop()
-        patch_device_type.stop()
+        patch_rotation.stop()
+        patch_alsa.stop()
 
 
-def test_set_asset_invokes_parse(vlc: _VLCFixtures) -> None:
-    vlc.player.set_asset('file:///test/video.mp4', 30)
+def test_set_asset_stores_uri_and_reloads_settings(
+    gstfb: _GstFixtures,
+) -> None:
+    gstfb.player.set_asset('file:///test/video.mp4', 30)
+    assert gstfb.player.uri == 'file:///test/video.mp4'
+    gstfb.mock_settings.load.assert_called_once()
 
-    vlc.mock_vlc_player.get_media.assert_called_once()
-    vlc.mock_media.parse.assert_called_once()
+
+def _flag(cmd: list[str], name: str) -> str:
+    return cmd[cmd.index(name) + 1]
+
+
+def test_build_command_spawns_looping_player_module(
+    gstfb: _GstFixtures,
+) -> None:
+    gstfb.player.uri = 'file:///test/video.mp4'
+    cmd = gstfb.player._build_command()
+    # The helper module loops gaplessly in-process and pins aspect-fit
+    # caps from the decoder's CAPS event (issue #2987) — the fb
+    # geometry and audio device are resolved here and handed over.
+    assert cmd[0] == sys.executable
+    # Direct-by-path execution: ``-m`` would import the package
+    # __init__ (Django settings, redis) in the child and stall the
+    # slot start on a Pi 3.
+    assert cmd[1].endswith('anthias_viewer/gst_fbdev_player.py')
+    assert _flag(cmd, '--uri') == 'file:///test/video.mp4'
+    assert _flag(cmd, '--fb-width') == '1920'
+    assert _flag(cmd, '--fb-height') == '1080'
+    assert _flag(cmd, '--fb-format') == 'RGB16'
+    assert _flag(cmd, '--rotation') == '0'
+    assert _flag(cmd, '--audio-device') == 'sysdefault:CARD=vc4hdmi0'
+
+
+def test_build_command_wraps_bare_path_as_file_uri(
+    gstfb: _GstFixtures,
+) -> None:
+    # Local assets store a bare absolute path; playbin's uri property
+    # rejects anything without a scheme, so it must be file://-wrapped
+    # (regression: a bare path black-screened every local video).
+    gstfb.player.uri = '/data/.anthias/assets/abc123'
+    cmd = gstfb.player._build_command()
+    assert _flag(cmd, '--uri') == 'file:///data/.anthias/assets/abc123'
+
+
+def test_build_command_passes_through_scheme_uris(
+    gstfb: _GstFixtures,
+) -> None:
+    for uri in (
+        # NOSONAR: the http:// case is the point — _as_gst_uri must pass
+        # any already-schemed URI through untouched; no connection is made.
+        'http://example.com/v.mp4',  # NOSONAR
+        'https://host/v.mp4',
+        'file:///already/a/uri.mp4',
+    ):
+        gstfb.player.uri = uri
+        cmd = gstfb.player._build_command()
+        assert _flag(cmd, '--uri') == uri
+
+
+def test_build_command_quotes_spaces_in_bare_path(
+    gstfb: _GstFixtures,
+) -> None:
+    gstfb.player.uri = '/data/.anthias/assets/my clip.mp4'
+    cmd = gstfb.player._build_command()
+    assert _flag(cmd, '--uri') == 'file:///data/.anthias/assets/my%20clip.mp4'
+
+
+def test_build_command_passes_rotation(gstfb: _GstFixtures) -> None:
+    gstfb.player.uri = 'file:///test/video.mp4'
+    with patch(
+        'anthias_viewer.media_player._screen_rotation', return_value=90
+    ):
+        cmd = gstfb.player._build_command()
+    assert _flag(cmd, '--rotation') == '90'
+
+
+def test_play_spawns_player_and_is_playing(gstfb: _GstFixtures) -> None:
+    gstfb.player.uri = 'file:///test/video.mp4'
+    fake_proc = MagicMock()
+    fake_proc.poll.return_value = None  # alive
+    with patch(
+        'anthias_viewer.media_player.subprocess.Popen', return_value=fake_proc
+    ) as mock_popen:
+        gstfb.player.play()
+    mock_popen.assert_called_once()
+    argv = mock_popen.call_args.args[0]
+    assert argv[1].endswith('gst_fbdev_player.py')
+    # New session group so stop() can kill the player's whole group.
+    assert mock_popen.call_args.kwargs['start_new_session'] is True
+    assert gstfb.player.is_playing() is True
+
+
+def test_stop_kills_process_group(gstfb: _GstFixtures) -> None:
+    fake_proc = MagicMock()
+    fake_proc.poll.return_value = None
+    fake_proc.pid = 4242
+    gstfb.player._proc = fake_proc
+    with (
+        patch('anthias_viewer.media_player.os.getpgid', return_value=4242),
+        patch('anthias_viewer.media_player.os.killpg') as mock_killpg,
+    ):
+        gstfb.player.stop()
+    mock_killpg.assert_called_once_with(4242, signal.SIGTERM)
+    assert gstfb.player._proc is None
+
+
+def test_is_playing_false_when_process_exited(gstfb: _GstFixtures) -> None:
+    fake_proc = MagicMock()
+    fake_proc.poll.return_value = 0  # exited
+    gstfb.player._proc = fake_proc
+    assert gstfb.player.is_playing() is False
+
+
+def test_fb_geometry_prefers_vscreeninfo_ioctl() -> None:
+    # The visible xres/yres from FBIOGET_VSCREENINFO are what
+    # fbdevsink centers against; virtual_size can be larger (panning /
+    # double-buffer configs) and must not win when the ioctl works.
+    import struct
+
+    def fake_ioctl(fd: Any, request: int, buf: bytearray) -> int:
+        assert request == media_player_module._FBIOGET_VSCREENINFO
+        struct.pack_into('=2I', buf, 0, 1920, 1080)
+        struct.pack_into('=I', buf, 24, 16)
+        return 0
+
+    def fake_open(path: str, *a: Any, **k: Any) -> Any:
+        if path == '/dev/fb0':
+            return MagicMock(__enter__=lambda s: s, __exit__=lambda *a: None)
+        data = '3840,2160\n' if 'virtual_size' in path else '16\n'
+        return MagicMock(
+            __enter__=lambda s: MagicMock(read=lambda: data),
+            __exit__=lambda *a: None,
+        )
+
+    with (
+        patch('builtins.open', side_effect=fake_open),
+        patch('fcntl.ioctl', side_effect=fake_ioctl),
+    ):
+        w, h, fb_fmt = media_player_module._fb_geometry()
+    assert (w, h, fb_fmt) == (1920, 1080, 'RGB16')
+
+
+def test_fb_geometry_falls_back_to_sysfs() -> None:
+    def fake_open(path: str, *a: Any, **k: Any) -> Any:
+        if path == '/dev/fb0':
+            raise OSError('no fb device')
+        data = '1280,720\n' if 'virtual_size' in path else '32\n'
+        return MagicMock(
+            __enter__=lambda s: MagicMock(read=lambda: data),
+            __exit__=lambda *a: None,
+        )
+
+    with patch('builtins.open', side_effect=fake_open):
+        w, h, fb_fmt = media_player_module._fb_geometry()
+    assert (w, h, fb_fmt) == (1280, 720, 'BGRx')
 
 
 @pytest.fixture
@@ -586,8 +1094,8 @@ def reset_media_proxy() -> Iterator[None]:
         MediaPlayerProxy.INSTANCE = None
 
 
-@pytest.mark.parametrize('device_type', ['pi1', 'pi2', 'pi3', 'pi4'])
-def test_get_instance_returns_vlc_for_pi_devices(
+@pytest.mark.parametrize('device_type', ['pi1', 'pi2', 'pi3'])
+def test_get_instance_returns_gst_fbdev_for_pi_devices(
     reset_media_proxy: None, device_type: str
 ) -> None:
     MediaPlayerProxy.INSTANCE = None
@@ -597,10 +1105,28 @@ def test_get_instance_returns_vlc_for_pi_devices(
             return_value=device_type,
         ),
         patch.dict('os.environ', {'DEVICE_TYPE': device_type}),
+        patch.object(GstFbdevMediaPlayer, '__init__', return_value=None),
     ):
-        with patch.object(VLCMediaPlayer, '__init__', return_value=None):
-            instance = MediaPlayerProxy.get_instance()
-    assert isinstance(instance, VLCMediaPlayer)
+        instance = MediaPlayerProxy.get_instance()
+    assert isinstance(instance, GstFbdevMediaPlayer)
+
+
+def test_get_instance_pi4_never_routes_to_fbdev(
+    reset_media_proxy: None,
+) -> None:
+    # A Pi 4 reports device_type 'pi4' (Qt6/eglfs). Even when DEVICE_TYPE
+    # is missing/mis-set (here: not the 'pi4-64' the override looks for,
+    # so force_mpv is False), it must NOT fall to the linuxfb fbdev
+    # player — 'pi4' is deliberately absent from the dispatch list.
+    MediaPlayerProxy.INSTANCE = None
+    with (
+        patch(
+            'anthias_viewer.media_player.get_device_type', return_value='pi4'
+        ),
+        patch.dict('os.environ', {'DEVICE_TYPE': 'pi4'}),
+    ):
+        instance = MediaPlayerProxy.get_instance()
+    assert isinstance(instance, MPVMediaPlayer)
 
 
 @pytest.mark.parametrize('device_type', ['pi5', 'x86'])
@@ -662,6 +1188,23 @@ def test_get_instance_returns_mpv_for_pi4_64(reset_media_proxy: None) -> None:
             'anthias_viewer.media_player.get_device_type', return_value='pi4'
         ),
         patch.dict('os.environ', {'DEVICE_TYPE': 'pi4-64'}),
+    ):
+        instance = MediaPlayerProxy.get_instance()
+    assert isinstance(instance, MPVMediaPlayer)
+
+
+def test_get_instance_returns_mpv_for_pi3_64(reset_media_proxy: None) -> None:
+    # A 64-bit Pi 3 still reports model 'Raspberry Pi 3', so
+    # get_device_type() returns 'pi3' — which is in the Gst-fbdev
+    # dispatch list. The baked DEVICE_TYPE='pi3-64' env override is the
+    # only signal that this is the Qt6/eglfs image (which ships no
+    # GStreamer fbdev stack), so it must force MPV.
+    MediaPlayerProxy.INSTANCE = None
+    with (
+        patch(
+            'anthias_viewer.media_player.get_device_type', return_value='pi3'
+        ),
+        patch.dict('os.environ', {'DEVICE_TYPE': 'pi3-64'}),
     ):
         instance = MediaPlayerProxy.get_instance()
     assert isinstance(instance, MPVMediaPlayer)
@@ -734,19 +1277,19 @@ def test_mpv_never_passes_video_rotate_under_cage(
     assert 'video-rotate' not in options
 
 
-@pytest.mark.parametrize('rotation', [90, 180, 270])
+@pytest.mark.parametrize('rotation', [0, 90, 180, 270])
 @patch(
     'anthias_viewer.media_player._detect_hdmi_audio_device',
     return_value='sysdefault:CARD=vc4hdmi0',
 )
-def test_mpv_passes_video_rotate_on_pi4_64(
+def test_mpv_never_passes_video_rotate_on_pi4_64(
     _mock_detect: Any, rotation: int
 ) -> None:
-    """Pi 4 (eglfs, no compositor) has no transform plumbing — the
-    video pipeline has to apply rotation itself via the
-    ``video-rotate`` option (forwarded to
-    ``QGraphicsVideoItem::setRotation`` on the C++ side; sent as an
-    ``int``, marshalled to ``Variant('i', …)``)."""
+    """Pi 4 (eglfs) rotates the whole screen via QT_QPA_EGLFS_ROTATION
+    (set in src/anthias_viewer/__init__.py:_build_webview_env), and the
+    QGraphicsVideoItem inherits that transform. Emitting ``video-rotate``
+    on top would double-rotate the frames, so the option must be omitted
+    at every angle — including 0°."""
     player = MPVMediaPlayer()
     mock_bus = MagicMock()
     with (
@@ -758,42 +1301,6 @@ def test_mpv_passes_video_rotate_on_pi4_64(
         patch(
             'anthias_viewer.media_player.settings',
             _rotated_mpv_settings(rotation),
-        ),
-        patch(
-            'anthias_viewer.media_player.get_device_type',
-            return_value='pi5',
-        ),
-        patch.dict('os.environ', {'DEVICE_TYPE': 'pi4-64'}),
-    ):
-        player.set_asset('file:///test/video.mp4', 30)
-        player.play()
-    options = _last_play_options(mock_bus)
-    assert options['video-rotate'] == rotation
-    assert isinstance(options['video-rotate'], int)
-
-
-@patch(
-    'anthias_viewer.media_player._detect_hdmi_audio_device',
-    return_value='sysdefault:CARD=vc4hdmi0',
-)
-def test_mpv_skips_video_rotate_at_zero_on_pi4_64(
-    _mock_detect: Any,
-) -> None:
-    """0° must NOT emit ``video-rotate=0`` — keeps the D-Bus surface
-    unchanged for the 99% of operators who never touch the dropdown,
-    so the video pipeline falls back to its own default rather than
-    being told to rotate by zero."""
-    player = MPVMediaPlayer()
-    mock_bus = MagicMock()
-    with (
-        patch('anthias_viewer.media_player._browser_bus', mock_bus),
-        patch(
-            'anthias_viewer.media_player._marshal_dbus_options',
-            side_effect=lambda opts: opts,
-        ),
-        patch(
-            'anthias_viewer.media_player.settings',
-            _rotated_mpv_settings(0),
         ),
         patch(
             'anthias_viewer.media_player.get_device_type',
@@ -843,3 +1350,100 @@ def test_upload_gate_codecs_are_h264_or_hevc() -> None:
             f'in the libavcodec h264/hevc dispatch — add the '
             f'matching decoder or remove from the gate.'
         )
+
+
+# ---------------------------------------------------------------------------
+# Webview-gone respawn routing (#3027 / Sentry ANTHIAS-1A)
+# ---------------------------------------------------------------------------
+
+
+class TestPlayRoutesThroughWebviewWrapper:
+    """play()/stop() must run their D-Bus calls through the injected
+    webview-gone wrapper so a crashed webview is respawned + retried,
+    not logged at ERROR with the screen left dark."""
+
+    def test_play_uses_injected_wrapper(self, mpv: _MPVFixtures) -> None:
+        # A wrapper that just invokes the call (the happy path) — play
+        # must go through it rather than touching the bus directly.
+        calls: list[str] = []
+
+        def wrapper(send: Any) -> None:
+            calls.append('wrapped')
+            send()
+
+        with patch.object(media_player_module, '_send_to_webview', wrapper):
+            mpv.player.uri = 'https://example.com/v.mp4'
+            mpv.player.play()
+
+        assert calls == ['wrapped']
+        mpv.mock_bus.playVideo.assert_called_once()
+        assert mpv.player.is_playing() is True
+
+    def test_stop_uses_injected_wrapper(self, mpv: _MPVFixtures) -> None:
+        calls: list[str] = []
+
+        def wrapper(send: Any) -> None:
+            calls.append('wrapped')
+            send()
+
+        with patch.object(media_player_module, '_send_to_webview', wrapper):
+            mpv.player.stop()
+
+        assert calls == ['wrapped']
+        mpv.mock_bus.stopVideo.assert_called_once()
+
+    def test_play_recovers_when_wrapper_respawns(
+        self, mpv: _MPVFixtures
+    ) -> None:
+        # Simulate the real wrapper: first send hits a webview-gone
+        # error, the wrapper respawns and the retried send succeeds.
+        attempts = {'n': 0}
+
+        def respawning_wrapper(send: Any) -> None:
+            attempts['n'] += 1
+            mpv.mock_bus.playVideo.side_effect = [
+                RuntimeError('NoReply'),
+                None,
+            ]
+            # The production wrapper retries send() once after respawn;
+            # emulate that here so the second call lands.
+            try:
+                send()
+            except RuntimeError:
+                send()
+
+        with patch.object(
+            media_player_module, '_send_to_webview', respawning_wrapper
+        ):
+            mpv.player.uri = 'https://example.com/v.mp4'
+            mpv.player.play()
+
+        assert mpv.mock_bus.playVideo.call_count == 2
+        assert mpv.player.is_playing() is True
+
+    def test_play_clears_state_when_wrapper_reraises(
+        self, mpv: _MPVFixtures
+    ) -> None:
+        # A non-webview-gone error propagates out of the wrapper; play
+        # must log + clear _playing so it doesn't think a video is up.
+        def reraising_wrapper(send: Any) -> None:
+            raise RuntimeError('Disconnected')
+
+        with patch.object(
+            media_player_module, '_send_to_webview', reraising_wrapper
+        ):
+            mpv.player.uri = 'https://example.com/v.mp4'
+            mpv.player.play()
+
+        assert mpv.player.is_playing() is False
+
+    def test_direct_call_when_no_wrapper_injected(
+        self, mpv: _MPVFixtures
+    ) -> None:
+        # Standalone / test use (no injection): calls run directly, so
+        # the prior behaviour is preserved.
+        assert media_player_module._send_to_webview is None
+        mpv.player.uri = 'https://example.com/v.mp4'
+        mpv.player.play()
+        mpv.mock_bus.playVideo.assert_called_once()
+        assert mpv.player.is_playing() is True

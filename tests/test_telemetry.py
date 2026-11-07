@@ -4,9 +4,11 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from celery.exceptions import SoftTimeLimitExceeded
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import Timeout
 
+from anthias_server.app.models import Asset
 from anthias_server.lib import telemetry
 
 
@@ -29,7 +31,7 @@ def settings_data() -> dict[str, Any]:
 def fake_redis(redis_data: dict[str, str]) -> MagicMock:
     fake = MagicMock()
     fake.get.side_effect = redis_data.get
-    fake.set.side_effect = lambda key, value: redis_data.__setitem__(
+    fake.set.side_effect = lambda key, value, ex=None: redis_data.__setitem__(
         key, value
     )
     fake.expire.side_effect = lambda key, _ttl: None
@@ -98,6 +100,11 @@ def test_sends_event_when_no_cooldown(
     assert params['resolution'] == '1920x1080'
     assert params['audio_output'] == 'hdmi'
     assert params['tls_enabled'] is False
+    # The released CalVer, which GA4's "Version distribution" report
+    # reads via its version_name dimension. Never sent before, so that
+    # report showed ~3,700 devices as "(not reported)".
+    assert params['version_name']
+    assert params['version_name'] != 'unknown'
 
 
 @patch.object(telemetry, 'requests_post')
@@ -165,9 +172,12 @@ def test_sets_cooldown_after_success(
 ) -> None:
     telemetry.send_telemetry()
     assert telemetry.TELEMETRY_COOLDOWN_KEY in redis_data
-    fake_redis.expire.assert_any_call(
+    # Value and TTL are written in a single atomic SET so a soft time
+    # limit can't strand the cooldown key without an expiry.
+    fake_redis.set.assert_any_call(
         telemetry.TELEMETRY_COOLDOWN_KEY,
-        telemetry.TELEMETRY_COOLDOWN_TTL,
+        '1',
+        ex=telemetry.TELEMETRY_COOLDOWN_TTL,
     )
 
 
@@ -195,3 +205,62 @@ def test_generates_and_persists_new_device_id(
     assert (
         len(redis_data[telemetry.DEVICE_ID_KEY]) == telemetry.DEVICE_ID_LENGTH
     )
+
+
+@patch.object(telemetry, 'requests_post')
+def test_version_name_carries_the_released_calver(
+    mock_post: Any, telemetry_env: None
+) -> None:
+    """GA4's "Version distribution" report keys on `version_name`, and
+    nothing ever sent it — not this payload, and not the pre-#2798 one
+    either, whose `Pi_Version` was the *hardware* model. So the report
+    could only ever show "(not reported)".
+
+    Sourced from get_anthias_release() (pyproject.toml, shipped in the
+    image) rather than an env var, because env vars are the known
+    failure mode for telemetry params."""
+    with patch.object(
+        telemetry, 'get_anthias_release', return_value='2026.8.0'
+    ):
+        assert telemetry.send_telemetry() is True
+    params = json.loads(mock_post.call_args.kwargs['data'])['events'][0][
+        'params'
+    ]
+    assert params['version_name'] == '2026.8.0'
+
+
+@patch.object(telemetry, 'requests_post')
+def test_version_name_falls_back_to_an_explicit_bucket(
+    mock_post: Any, telemetry_env: None
+) -> None:
+    """get_anthias_release() returns '' when both its sources fail. Send
+    'unknown' rather than the empty string, so such a device shows up as
+    its own bucket in GA4 instead of silently rejoining the
+    "(not reported)" pile that hid this bug in the first place."""
+    with patch.object(telemetry, 'get_anthias_release', return_value=''):
+        assert telemetry.send_telemetry() is True
+    params = json.loads(mock_post.call_args.kwargs['data'])['events'][0][
+        'params'
+    ]
+    assert params['version_name'] == 'unknown'
+
+
+def test_asset_counts_let_a_soft_time_limit_through() -> None:
+    """The blanket "degrade to zeros" arm must not eat celery's one
+    soft-limit delivery: swallowing it here left
+    ``send_telemetry_task``'s handler unreachable and the pool child to
+    be SIGKILLed at the 60s hard limit (Sentry ANTHIAS-A / 9 / B)."""
+    with (
+        patch.object(
+            Asset.objects,
+            'filter',
+            side_effect=SoftTimeLimitExceeded(),
+        ),
+        pytest.raises(SoftTimeLimitExceeded),
+    ):
+        telemetry._get_asset_counts()
+
+
+def test_asset_counts_still_degrade_to_zeros_on_a_db_fault() -> None:
+    with patch.object(Asset.objects, 'filter', side_effect=OSError('no db')):
+        assert telemetry._get_asset_counts()['asset_count'] == 0

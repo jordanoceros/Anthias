@@ -2,29 +2,18 @@
 #
 # In-container companion to bin/migrate_legacy_paths.sh.
 #
-# After the rebrand, container code reads from /data/.anthias and
-# /data/anthias_assets. Defensively expose the legacy paths as symlinks
-# in case:
-#   - The user is running an older docker-compose.yml that still mounts
-#     `~/.screenly:/data/.screenly` while the host data has already been
-#     migrated (so the bind mount lands on a symlink, which docker
-#     dereferences).
-#   - DB rows or external integrations stored absolute container paths
-#     beginning with /data/.screenly or /data/screenly_assets.
+# The host-side bin/migrate_legacy_paths.sh (screenly -> anthias rename)
+# only runs on apt/ansible installs, never on balena. So a pre-rebrand
+# balena device keeps its data in /data/.screenly + /data/screenly_assets
+# while the post-rebrand container reads /data/.anthias + /data/anthias_assets.
+# Run the exact same migration against the container's /data volume so the
+# balena upgrade path is covered by the one canonical migration (rather
+# than a parallel reimplementation). DATA mode skips the host-only repo
+# rename and sudoers cleanup, and additionally recovers devices that
+# already booted the broken release with an empty anthias.db.
 #
-# Idempotent. Skips creation if the legacy path already exists (e.g. a
-# bind mount took precedence).
+# Idempotent and safe to run on every container start.
 
 set -euo pipefail
 
-create_symlink_if_absent() {
-    local link="$1"
-    local target="$2"
-
-    if [ -e "${target}" ] && [ ! -e "${link}" ] && [ ! -L "${link}" ]; then
-        ln -s "${target}" "${link}"
-    fi
-}
-
-create_symlink_if_absent /data/.screenly        /data/.anthias
-create_symlink_if_absent /data/screenly_assets  /data/anthias_assets
+exec "$(dirname "$(readlink -f "$0")")/migrate_legacy_paths.sh" /data

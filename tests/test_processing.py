@@ -34,20 +34,25 @@ import io
 import json
 import os
 import shutil
+import struct
 import subprocess
+import zlib
 from collections.abc import Iterator
+from datetime import UTC
 from os import path
-from typing import Any
+from pathlib import Path
+from typing import Any, Self
 from unittest import mock
 
 import pytest
 import sh
-from PIL import Image, UnidentifiedImageError
+from celery.exceptions import SoftTimeLimitExceeded
+from PIL import Image, ImageOps, UnidentifiedImageError
 
+from anthias_common.board import resolve_device_key
 from anthias_server import processing
 from anthias_server.app.models import Asset
 from anthias_server.settings import settings as anthias_settings
-
 
 # ---------------------------------------------------------------------------
 # Skip markers — keep the suite green on hosts without optional deps
@@ -297,6 +302,49 @@ def test_image_normalises_to_lossless_webp_across_formats(
 
 @pytest_heif
 @pytest.mark.django_db
+def test_heif_decoder_owns_orientation_not_exif_transpose(
+    asset_dir: str,
+) -> None:
+    """pillow-heif normalises EXIF Orientation away, so HEIC rotation is
+    the decoder's job — and a synthetic HEIC fixture cannot test it.
+
+    Real camera HEICs encode rotation in the HEIF ``irot`` box rather
+    than as EXIF Orientation, and pillow-heif applies ``irot`` at decode
+    *and* rewrites the Orientation tag to 1. Two consequences worth
+    pinning:
+
+    1. ``_bake_exif_orientation`` is a defensive no-op for HEIC. If a
+       future pillow-heif stopped normalising, this test fails and warns
+       that the HEIC leg needs rethinking — including the possibility of
+       a double rotation, since ``irot`` would already have been applied.
+    2. Injecting Orientation into a HEIC to build a test fixture is
+       futile: the tag does not survive the round-trip. This was
+       independently mistaken for a bug twice during release QA. The
+       real behaviour was confirmed against genuine iPhone 12 Pro files
+       (``irot`` 90 and 270, stored 3024x4032) which decode to the
+       correct portrait with the tag reading 1.
+    """
+    src = path.join(asset_dir, 'injected.heic')
+    image = Image.new('RGB', (400, 200), (200, 30, 30))
+    exif = image.getexif()
+    exif[0x0112] = 6
+    image.save(src, 'HEIF', exif=exif)
+
+    with Image.open(src) as reopened:
+        assert reopened.getexif().get(0x0112) in (None, 1), (
+            'pillow-heif no longer normalises injected EXIF Orientation — '
+            'the HEIC orientation path needs re-verifying against a real '
+            'camera file, and may now double-rotate'
+        )
+        stored = reopened.size
+        transposed = ImageOps.exif_transpose(reopened)
+        assert transposed.size == stored, (
+            'exif_transpose became load-bearing for HEIC; see docstring'
+        )
+
+
+@pytest_heif
+@pytest.mark.django_db
 @pytest.mark.parametrize('ext', ['.heic', '.heif', '.HEIC'])
 def test_image_heif_converts_to_lossless_webp(
     asset_dir: str, ext: str
@@ -323,6 +371,99 @@ def test_image_heif_converts_to_lossless_webp(
 
 
 @pytest.mark.django_db
+def test_image_normalisation_applies_exif_orientation(asset_dir: str) -> None:
+    """A portrait photo shot on a rotated camera is stored with
+    landscape pixels plus an EXIF Orientation tag (6 or 8). WebP output
+    carries no Orientation tag and Pillow never auto-applies it, so
+    without an explicit transpose the asset would be baked rotated 90°
+    on screen (issue 3232). Feed ``_convert_image_to_webp`` a 24x16
+    (landscape) source tagged Orientation=6 and assert the WebP comes
+    out 16x24 (upright portrait)."""
+    src = path.join(asset_dir, 'rotated.jpg')
+    landscape = Image.new('RGB', (24, 16), (10, 20, 30))
+    exif = landscape.getexif()
+    exif[0x0112] = 6  # Orientation: rotate 90° CW to display upright
+    landscape.save(src, 'JPEG', exif=exif)
+
+    # Sanity-check the fixture: pixels are landscape, tag says portrait.
+    with Image.open(src) as probe:
+        assert probe.size == (24, 16)
+        assert probe.getexif().get(0x0112) == 6
+
+    out = path.join(asset_dir, 'rotated.webp')
+    processing._convert_image_to_webp(src, out)
+
+    # Without the exif_transpose the WebP would be a landscape 24x16
+    # (pixels copied verbatim, tag dropped); with it the orientation is
+    # baked so the stored image is upright 16x24.
+    with Image.open(out) as result:
+        assert result.size == (16, 24), (
+            f'expected orientation applied (16x24), got {result.size}'
+        )
+
+
+@pytest.mark.django_db
+def test_image_downscaled_to_cap_on_low_ram(asset_dir: str) -> None:
+    """On a low-RAM board a >1080p image is downscaled to the pixel cap
+    before the RGBA convert + lossless WebP encode. At full resolution a
+    many-MP photo drives peak RSS past what a Pi 2/3 normalisation
+    container is capped at and OOM-kills / reboots the board. The
+    downscale is aspect-preserving (a 1080p board can't show more)."""
+    src = path.join(asset_dir, 'big.jpg')
+    # 4000x3000 = 12 MP, ~6x over the 1080p (2.07 MP) cap.
+    Image.new('RGB', (4000, 3000), (10, 20, 30)).save(src, 'JPEG')
+    out = path.join(asset_dir, 'big.webp')
+
+    with mock.patch(
+        'anthias_server.processing.is_low_ram_device', return_value=True
+    ):
+        processing._convert_image_to_webp(src, out)
+
+    with Image.open(out) as result:
+        w, h = result.size
+        assert w * h <= processing._LOW_RAM_MAX_PIXELS, (
+            f'{w}x{h} still exceeds the low-RAM cap'
+        )
+        # Aspect ratio (4:3) preserved.
+        assert abs((w / h) - (4000 / 3000)) < 0.02
+
+
+@pytest.mark.django_db
+def test_image_full_resolution_on_normal_ram(asset_dir: str) -> None:
+    """A normal-RAM board keeps full resolution — the downscale is a
+    low-RAM concession, not a global quality drop."""
+    src = path.join(asset_dir, 'big.jpg')
+    Image.new('RGB', (4000, 3000), (10, 20, 30)).save(src, 'JPEG')
+    out = path.join(asset_dir, 'big.webp')
+
+    with mock.patch(
+        'anthias_server.processing.is_low_ram_device', return_value=False
+    ):
+        processing._convert_image_to_webp(src, out)
+
+    with Image.open(out) as result:
+        assert result.size == (4000, 3000)
+
+
+@pytest.mark.django_db
+def test_image_under_cap_not_downscaled_on_low_ram(asset_dir: str) -> None:
+    """Even on a low-RAM board, an image already within the 1080p cap is
+    left untouched — the downscale only kicks in above the budget."""
+    src = path.join(asset_dir, 'small.jpg')
+    # 1280x720 = 0.92 MP, comfortably under the 2.07 MP cap.
+    Image.new('RGB', (1280, 720), (10, 20, 30)).save(src, 'JPEG')
+    out = path.join(asset_dir, 'small.webp')
+
+    with mock.patch(
+        'anthias_server.processing.is_low_ram_device', return_value=True
+    ):
+        processing._convert_image_to_webp(src, out)
+
+    with Image.open(out) as result:
+        assert result.size == (1280, 720)
+
+
+@pytest.mark.django_db
 def test_image_corrupt_input_raises_clean_error(asset_dir: str) -> None:
     """Pillow's UnidentifiedImageError must bubble out so the
     on_failure hook can write metadata.error_message — never leave a
@@ -331,9 +472,11 @@ def test_image_corrupt_input_raises_clean_error(asset_dir: str) -> None:
     _write_corrupt(src, '.tiff')
     asset = _make_processing_asset('img-bad', src)
 
-    with mock.patch.object(processing, '_notify'):
-        with pytest.raises(UnidentifiedImageError):
-            processing._run_image_normalisation(asset)
+    with (
+        mock.patch.object(processing, '_notify'),
+        pytest.raises(UnidentifiedImageError),
+    ):
+        processing._run_image_normalisation(asset)
 
     # No webp produced; the source file is left in place for the
     # operator to inspect / re-upload. Staging .webp.tmp must also
@@ -364,13 +507,13 @@ def test_image_decompression_bomb_is_rejected(asset_dir: str) -> None:
         size = bomb_size
         format = 'TIFF'
 
-        def __enter__(self) -> '_FakeImage':
+        def __enter__(self) -> Self:
             return self
 
         def __exit__(self, *_: object) -> None:
             return None
 
-        def convert(self, _mode: str) -> 'mock.MagicMock':
+        def convert(self, _mode: str) -> mock.MagicMock:
             # Should never be reached — the size check raises first.
             raise AssertionError(
                 'convert() called on a bomb input — size check missed'
@@ -385,9 +528,9 @@ def test_image_decompression_bomb_is_rejected(asset_dir: str) -> None:
             'anthias_server.processing.Image.open',
             return_value=_FakeImage(),
         ),
+        pytest.raises(processing.ImageTooLargeError, match='decode cap'),
     ):
-        with pytest.raises(ValueError, match='exceed cap'):
-            processing._run_image_normalisation(asset)
+        processing._run_image_normalisation(asset)
 
     # Staging cleanup contract still holds for the bomb path.
     leftover = [n for n in os.listdir(asset_dir) if n.endswith('.webp.tmp')]
@@ -416,9 +559,9 @@ def test_image_partial_write_cleans_staging(asset_dir: str) -> None:
         mock.patch.object(
             processing, '_convert_image_to_webp', side_effect=half_write
         ),
+        pytest.raises(OSError, match='disk full'),
     ):
-        with pytest.raises(OSError, match='disk full'):
-            processing._run_image_normalisation(asset)
+        processing._run_image_normalisation(asset)
 
     # No leftover .webp.tmp in the asset dir — the runner removed it
     # before the raise propagated.
@@ -448,9 +591,9 @@ def test_image_rename_failure_cleans_staging(asset_dir: str) -> None:
     with (
         mock.patch.object(processing, '_notify'),
         mock.patch('anthias_server.processing.os.replace', side_effect=boom),
+        pytest.raises(OSError, match='cross-device'),
     ):
-        with pytest.raises(OSError, match='cross-device'):
-            processing._run_image_normalisation(asset)
+        processing._run_image_normalisation(asset)
 
     leftover = [n for n in os.listdir(asset_dir) if n.endswith('.webp.tmp')]
     assert not leftover, f'image staging leftover after rename: {leftover}'
@@ -466,9 +609,11 @@ def test_image_missing_file_raises_filenotfound(asset_dir: str) -> None:
     src = path.join(asset_dir, 'gone.tiff')
     asset = _make_processing_asset('img-gone', src)
 
-    with mock.patch.object(processing, '_notify'):
-        with pytest.raises(FileNotFoundError):
-            processing._run_image_normalisation(asset)
+    with (
+        mock.patch.object(processing, '_notify'),
+        pytest.raises(FileNotFoundError),
+    ):
+        processing._run_image_normalisation(asset)
 
 
 @pytest.mark.django_db
@@ -602,9 +747,11 @@ def test_set_processing_error_writes_metadata(asset_dir: str) -> None:
 def test_video_missing_file_raises_filenotfound(asset_dir: str) -> None:
     src = path.join(asset_dir, 'gone.mp4')
     asset = _make_processing_asset('vid-gone', src, mimetype='video')
-    with mock.patch.object(processing, '_notify'):
-        with pytest.raises(FileNotFoundError):
-            processing._run_video_normalisation(asset)
+    with (
+        mock.patch.object(processing, '_notify'),
+        pytest.raises(FileNotFoundError),
+    ):
+        processing._run_video_normalisation(asset)
 
 
 @pytest_ffmpeg
@@ -632,74 +779,108 @@ def test_video_supported_codec_writes_metadata_and_clears_processing(
     assert path.exists(src)
 
 
-@pytest_ffmpeg
 @pytest.mark.django_db
 def test_video_unsupported_codec_raises_with_ffmpeg_recipe(
     asset_dir: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An H.264 upload on a Pi 5 (HEVC only — Pi 5's mpv has no v4l2-
-    request H.264 hwdec) is rejected. The exception's message names
-    the rejected codec and supported set; its ``recipe`` attribute
-    carries an ffmpeg command pre-filled with the upload's filename
-    (taken from ``metadata.upload_name``, which the upload view
-    stashes at create time) so the operator can copy-paste it
-    verbatim."""
-    monkeypatch.setenv('DEVICE_TYPE', 'pi5')
+    """A codec outside the board's HW decode set is rejected. The
+    exception's message names the rejected codec and supported set;
+    its ``recipe`` attribute carries an ffmpeg command pre-filled with
+    the upload's filename so the operator can copy-paste it verbatim.
+
+    Pi 3 (H.264 only) is used here — an HEVC upload is the clearest
+    unsupported-codec case for that board."""
+    monkeypatch.setenv('DEVICE_TYPE', 'pi3')
     src = path.join(asset_dir, 'sample.mp4')
-    _make_video(src, codec='libx264', container='mp4', audio='aac')
+    # Create a minimal placeholder — ffprobe is mocked below so the
+    # file content doesn't matter, only path.isfile() needs to pass.
+    with open(src, 'wb') as f:
+        f.write(b'\x00' * 16)
     asset = _make_processing_asset(
-        'vid-h264-pi5',
+        'vid-hevc-pi3',
         src,
         mimetype='video',
         metadata={'upload_name': 'beach-clip.mp4'},
     )
+    fake_summary = {
+        'container': 'mp4',
+        'video_codec': 'hevc',
+        'video_width': 1920,
+        'video_height': 1080,
+        'video_fps': 30.0,
+        'audio_codec': 'aac',
+        'duration_seconds': 60,
+    }
 
-    with mock.patch.object(processing, '_notify'):
-        with pytest.raises(processing.UnsupportedVideoCodecError) as excinfo:
-            processing._run_video_normalisation(asset)
+    with (
+        mock.patch.object(processing, '_notify'),
+        mock.patch.object(
+            processing, '_ffprobe_summary', return_value=fake_summary
+        ),
+        pytest.raises(processing.UnsupportedVideoCodecError) as excinfo,
+    ):
+        processing._run_video_normalisation(asset)
 
     import shlex as _shlex
 
     msg = str(excinfo.value)
-    assert "'h264'" in msg
-    assert 'hevc' in msg
-    # Recipe is on the exception, not in the message body.
+    assert "'hevc'" in msg
+    assert 'h264' in msg
     recipe = excinfo.value.recipe
-    assert 'libx265' in recipe  # Pi 5 supports HEVC only.
-    assert '-tag:v hvc1' in recipe
-    # The upload's filename appears in the recipe's input slot —
-    # operator can copy and paste it without hand-editing INPUT.
+    assert (
+        'libx264' in recipe
+    )  # Pi 3 supports H.264 — recipe encodes to H.264.
     tokens = _shlex.split(recipe)
     assert tokens[1] == '-i'
     assert tokens[2] == 'beach-clip.mp4'
-    # Output filename carries a ``.hevc.`` suffix so the recipe
-    # doesn't ask the operator to overwrite their source file.
-    assert tokens[-1] == 'beach-clip.hevc.mp4'
+    assert tokens[-1] == 'beach-clip.h264.mp4'
 
-    # Metadata was still written so the operator can see *what* they
-    # uploaded next to the error message in the asset list.
+    handbrake = excinfo.value.handbrake
+    assert handbrake
+    joined = ' '.join(handbrake)
+    assert 'HandBrake' in joined
+    assert processing.HANDBRAKE_URL in joined
+    # H.264 board: the stock Fast 1080p30 preset is already H.264,
+    # no encoder-switch step needed.
+    assert 'H.265 (x265)' not in joined
+    assert not any('Resolution Limit' in step for step in handbrake)
+
     asset.refresh_from_db()
-    assert asset.metadata.get('video_codec') == 'h264'
-    assert asset.metadata.get('video_width') == 32
+    assert asset.metadata.get('video_codec') == 'hevc'
+    assert asset.metadata.get('video_width') == 1920
 
 
-@pytest_ffmpeg
 @pytest.mark.django_db
 def test_video_unsupported_codec_recipe_falls_back_to_upload_placeholder(
     asset_dir: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When the row has no ``metadata.upload_name`` (YouTube
-    downloads, pre-rebrand rows), the recipe uses a stable
-    ``upload<ext>`` placeholder so the operator still sees the
-    correct input extension to substitute."""
-    monkeypatch.setenv('DEVICE_TYPE', 'pi5')
+    """When the row has no ``metadata.upload_name`` (YouTube downloads,
+    pre-rebrand rows), the recipe uses a stable ``upload<ext>``
+    placeholder so the operator still sees the correct input extension
+    to substitute."""
+    monkeypatch.setenv('DEVICE_TYPE', 'pi3')
     src = path.join(asset_dir, 'noname.mp4')
-    _make_video(src, codec='libx264', container='mp4', audio='aac')
+    with open(src, 'wb') as f:
+        f.write(b'\x00' * 16)
     asset = _make_processing_asset('vid-noname', src, mimetype='video')
+    fake_summary = {
+        'container': 'mp4',
+        'video_codec': 'hevc',
+        'video_width': 1920,
+        'video_height': 1080,
+        'video_fps': 30.0,
+        'audio_codec': 'aac',
+        'duration_seconds': 60,
+    }
 
-    with mock.patch.object(processing, '_notify'):
-        with pytest.raises(processing.UnsupportedVideoCodecError) as excinfo:
-            processing._run_video_normalisation(asset)
+    with (
+        mock.patch.object(processing, '_notify'),
+        mock.patch.object(
+            processing, '_ffprobe_summary', return_value=fake_summary
+        ),
+        pytest.raises(processing.UnsupportedVideoCodecError) as excinfo,
+    ):
+        processing._run_video_normalisation(asset)
 
     import shlex as _shlex
 
@@ -707,7 +888,85 @@ def test_video_unsupported_codec_recipe_falls_back_to_upload_placeholder(
     tokens = _shlex.split(recipe)
     assert tokens[1] == '-i'
     assert tokens[2] == 'upload.mp4'
-    assert tokens[-1] == 'upload.hevc.mp4'
+    assert tokens[-1] == 'upload.h264.mp4'
+
+
+@pytest.mark.django_db
+def test_video_h264_accepted_on_pi5_software_decode(
+    asset_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H.264 is accepted on Pi 5 via software decode — the
+    Cortex-A76 handles 1080p H.264 without frame drops, and YouTube
+    rarely serves HEVC so blocking H.264 on Pi 5 would prevent all
+    YouTube downloads. (GH #3092)"""
+    monkeypatch.setenv('DEVICE_TYPE', 'pi5')
+    src = path.join(asset_dir, 'sample.mp4')
+    with open(src, 'wb') as f:
+        f.write(b'\x00' * 16)
+    asset = _make_processing_asset('vid-h264-pi5-sw', src, mimetype='video')
+    fake_summary = {
+        'container': 'mp4',
+        'video_codec': 'h264',
+        'video_width': 1920,
+        'video_height': 1080,
+        'video_fps': 30.0,
+        'audio_codec': 'aac',
+        'duration_seconds': 60,
+    }
+
+    with (
+        mock.patch.object(processing, '_notify') as mock_notify,
+        mock.patch.object(
+            processing, '_ffprobe_summary', return_value=fake_summary
+        ),
+    ):
+        processing._run_video_normalisation(asset)
+
+    asset.refresh_from_db()
+    assert asset.is_processing is False
+    assert asset.metadata.get('video_codec') == 'h264'
+    mock_notify.assert_called_once_with('vid-h264-pi5-sw')
+
+
+@pytest.mark.django_db
+def test_video_unsupported_codec_still_rejected_on_pi5(
+    asset_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """VP9 / AV1 uploads on Pi 5 are still rejected even though H.264
+    software-decode was added to the Pi 5 codec set. The rejection recipe
+    tells the operator to re-encode to H.264 (accepted via software decode —
+    faster to encode than HEVC and still plays fine on Cortex-A76)."""
+    monkeypatch.setenv('DEVICE_TYPE', 'pi5')
+    src = path.join(asset_dir, 'sample.mp4')
+    with open(src, 'wb') as f:
+        f.write(b'\x00' * 16)
+    asset = _make_processing_asset('vid-vp9-pi5', src, mimetype='video')
+    fake_summary = {
+        'container': 'mp4',
+        'video_codec': 'vp9',
+        'video_width': 1920,
+        'video_height': 1080,
+        'video_fps': 30.0,
+        'audio_codec': 'aac',
+        'duration_seconds': 60,
+    }
+
+    with (
+        mock.patch.object(processing, '_notify'),
+        mock.patch.object(
+            processing, '_ffprobe_summary', return_value=fake_summary
+        ),
+        pytest.raises(processing.UnsupportedVideoCodecError) as excinfo,
+    ):
+        processing._run_video_normalisation(asset)
+
+    import shlex as _shlex
+
+    recipe = excinfo.value.recipe
+    tokens = _shlex.split(recipe)
+    assert tokens[-1] == 'upload.h264.mp4'
+    assert 'libx264' in recipe
+    assert 'libx265' not in recipe
 
 
 @pytest_ffmpeg
@@ -722,13 +981,56 @@ def test_video_unsupported_codec_h264_board_recipe(
     _make_video(src, codec='mpeg2video', container='mpeg', audio=None)
     asset = _make_processing_asset('vid-mpeg2', src, mimetype='video')
 
-    with mock.patch.object(processing, '_notify'):
-        with pytest.raises(processing.UnsupportedVideoCodecError) as excinfo:
-            processing._run_video_normalisation(asset)
+    with (
+        mock.patch.object(processing, '_notify'),
+        pytest.raises(processing.UnsupportedVideoCodecError) as excinfo,
+    ):
+        processing._run_video_normalisation(asset)
 
     recipe = excinfo.value.recipe
     assert 'libx264' in recipe
     assert 'libx265' not in recipe
+
+
+def test_pi3_64_hw_decode_set_is_h264_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 64-bit Qt6 Pi 3 board (``pi3-64``) runs the same VideoCore IV
+    silicon as the 32-bit ``pi3`` — H.264-only HW decode, no HEVC. The
+    gate must reject HEVC for it just like the armhf stream."""
+    monkeypatch.setenv('DEVICE_TYPE', 'pi3-64')
+    key = resolve_device_key()
+    assert processing._hw_decoded_codecs(key) == frozenset({'h264'})
+
+
+# ---------------------------------------------------------------------------
+# preferred_download_vcodec — per-board yt-dlp format_sort preference
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'device_type, expected',
+    [
+        # Pi 5: HEVC is the hardware decode path; H.264 is software-only.
+        ('pi5', 'hevc'),
+        # All other boards: H.264 is the primary HW path and more available
+        # on YouTube. x86 HEVC via VAAPI is known-broken (black screen).
+        ('pi4-64', 'h264'),
+        ('pi3', 'h264'),
+        ('pi3-64', 'h264'),
+        ('x86', 'h264'),
+        ('rockpi4', 'h264'),
+        # Unknown board must not crash and must default to h264.
+        ('unrecognised-board-xyz', 'h264'),
+    ],
+)
+def test_preferred_download_vcodec(
+    device_type: str,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('DEVICE_TYPE', device_type)
+    assert processing.preferred_download_vcodec() == expected
 
 
 @pytest.mark.parametrize(
@@ -802,11 +1104,14 @@ def test_video_unknown_codec_is_rejected(
 def test_video_arm64_catch_all_rejects_everything(
     asset_dir: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The catch-all ``arm64`` DEVICE_TYPE has no entry in the HW
-    decode map (an unknown aarch64 SBC isn't guaranteed to expose a
-    v4l2-request decoder mpv can address). Without a host_agent
-    subtype publish, every video upload is rejected — operator has
-    to install a board-specific image to get HW decode."""
+    """The catch-all ``arm64`` DEVICE_TYPE has no entry in the map of
+    codecs a board accepts (``_HW_DECODE_VIDEO_CODECS`` — the name is
+    historical), so nothing is certified to play there: an unidentified
+    aarch64 SBC may have a perfectly good decoder, we just have no
+    model match or measurement saying which codecs. Every video upload
+    is therefore rejected, and the message has to explain why in terms
+    the operator can act on — which differs by deployment, so it names
+    both rather than one."""
     monkeypatch.setenv('DEVICE_TYPE', 'arm64')
     src = path.join(asset_dir, 'sample.mp4')
     # Create an empty placeholder file so the FileNotFoundError check
@@ -838,12 +1143,25 @@ def test_video_arm64_catch_all_rejects_everything(
     ):
         processing._run_video_normalisation(asset)
 
-    msg = str(excinfo.value)
-    # Catch-all branch must explain the board-subtype gap rather
-    # than the misleading "Supported: none." that earlier revisions
-    # surfaced.
-    assert 'subtype' in msg.lower()
-    assert 'board-specific image' in msg.lower()
+    msg = str(excinfo.value).lower()
+    # Explain that the board wasn't identified, rather than the
+    # misleading "Supported: none." earlier revisions surfaced, which
+    # reads like the board has no decoder at all.
+    assert 'could not identify this board' in msg
+    # Compose installs: a stopped agent and an unreachable Redis both
+    # land here, so naming only the agent would have operators certify
+    # a running service and conclude the board is unprofiled.
+    assert 'anthias-host-agent' in msg
+    assert 'redis' in msg
+    # balena ships no host agent, and the in-container device-tree read
+    # is masked in the unprivileged server container — there is no
+    # subtype source on that fleet, so the message must not send those
+    # operators after a service their device has never had.
+    assert 'balena' in msg
+    # Never advertise a board-specific image — every SBC runs the
+    # generic arm64 build, so that advice sent operators re-flashing
+    # for an image that was never built.
+    assert 'board-specific image' not in msg
 
 
 @pytest.mark.django_db
@@ -885,6 +1203,540 @@ def test_video_arm64_with_rockpi4_subtype_accepts_h264(
     assert asset.metadata.get('video_codec') == 'h264'
 
 
+@pytest.mark.django_db
+def test_video_arm64_with_rk3566_subtype_accepts_h264(
+    asset_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RK3566 boards (NanoPi R3S, Radxa Zero 3, Orange Pi 3B …) accept
+    H.264. It is software-decoded — measured at 2.56x real time for
+    1080p30 on a NanoPi R3S LTS — the same "CPU keeps up, so ship it"
+    call the pi5 h264 entry makes."""
+    monkeypatch.setenv('DEVICE_TYPE', 'arm64')
+    src = path.join(asset_dir, 'sample.mp4')
+    with open(src, 'wb') as f:
+        f.write(b'\x00')
+    asset = _make_processing_asset('vid-rk3566', src, mimetype='video')
+
+    fake_summary = {
+        'container': 'mp4',
+        'video_codec': 'h264',
+        'video_pixels': 1920 * 1080,
+        'video_width': 1920,
+        'video_height': 1080,
+        'video_fps': 30.0,
+        'audio_codec': 'aac',
+        'duration_seconds': 1,
+    }
+    with (
+        mock.patch.object(processing, '_notify'),
+        mock.patch.object(
+            processing, '_ffprobe_summary', return_value=fake_summary
+        ),
+        mock.patch(
+            'anthias_common.board.get_board_subtype', return_value='rk3566'
+        ),
+    ):
+        processing._run_video_normalisation(asset)
+
+    asset.refresh_from_db()
+    assert asset.is_processing is False
+    assert asset.metadata.get('video_codec') == 'h264'
+
+
+@pytest.mark.django_db
+def test_video_rk3566_rejects_hevc(
+    asset_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HEVC stays out of the RK3566 set: 1.15x real time at 1080p30
+    leaves nothing for the web UI running alongside, and the VPU can't
+    help (stateless rkvdec vs the image's stateful v4l2m2m wrappers)."""
+    monkeypatch.setenv('DEVICE_TYPE', 'arm64')
+    src = path.join(asset_dir, 'sample.mp4')
+    with open(src, 'wb') as f:
+        f.write(b'\x00')
+    asset = _make_processing_asset('vid-rk3566-hevc', src, mimetype='video')
+
+    fake_summary = {
+        'container': 'mp4',
+        'video_codec': 'hevc',
+        'video_pixels': 1920 * 1080,
+        'video_width': 1920,
+        'video_height': 1080,
+        'video_fps': 30.0,
+        'audio_codec': 'aac',
+        'duration_seconds': 1,
+    }
+    with (
+        mock.patch.object(processing, '_notify'),
+        mock.patch.object(
+            processing, '_ffprobe_summary', return_value=fake_summary
+        ),
+        mock.patch(
+            'anthias_common.board.get_board_subtype', return_value='rk3566'
+        ),
+        pytest.raises(processing.UnsupportedVideoCodecError) as excinfo,
+    ):
+        processing._run_video_normalisation(asset)
+
+    msg = str(excinfo.value)
+    assert 'hevc' in msg.lower()
+    assert 'h264' in msg.lower()
+
+
+@pytest.mark.django_db
+def test_video_rk3566_4k_hevc_recipe_also_downscales(
+    asset_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 4K HEVC upload fails on the codec, so it never reaches the
+    resolution branch — but the H.264 it is steered towards is the
+    codec this board decodes in *software*, and 4K H.264 is rejected by
+    the throughput ceiling. Folding only the low-RAM cap into the recipe
+    sent the operator round twice: transcode to 4K H.264, re-upload, get
+    rejected again for resolution. The recipe has to carry the
+    downscale even though this 2 GB board never trips the memory cap."""
+    monkeypatch.setenv('DEVICE_TYPE', 'arm64')
+    src = path.join(asset_dir, 'sample.mp4')
+    with open(src, 'wb') as f:
+        f.write(b'\x00')
+    asset = _make_processing_asset('vid-rk3566-4k-hevc', src, mimetype='video')
+
+    fake_summary = {
+        'container': 'mp4',
+        'video_codec': 'hevc',
+        'video_pixels': 3840 * 2160,
+        'video_width': 3840,
+        'video_height': 2160,
+        'video_fps': 30.0,
+        'audio_codec': 'aac',
+        'duration_seconds': 1,
+    }
+    with (
+        mock.patch.object(processing, '_notify'),
+        mock.patch.object(
+            processing, '_ffprobe_summary', return_value=fake_summary
+        ),
+        mock.patch(
+            'anthias_common.board.get_board_subtype', return_value='rk3566'
+        ),
+        # 2 GB board: the memory cap is definitively not in play, so
+        # only the software-decode ceiling can put the scale filter in.
+        mock.patch(
+            'anthias_server.processing.is_low_ram_device', return_value=False
+        ),
+        pytest.raises(processing.UnsupportedVideoCodecError) as excinfo,
+    ):
+        processing._run_video_normalisation(asset)
+
+    # Codec-focused message, because the codec is the stronger
+    # rejection — but a recipe that fixes both in one pass.
+    assert 'hevc' in str(excinfo.value).lower()
+    assert 'scale=1920:1080' in excinfo.value.recipe
+    assert 'libx264' in excinfo.value.recipe
+
+
+@pytest.mark.django_db
+def test_video_rk3566_rejects_4k_h264_on_throughput(
+    asset_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Accepting h264 must not let 4K through. This board has 2 GB so
+    the low-RAM cap never fires; the rejection has to come from the
+    software-decode ceiling, and must say so — an operator told "the
+    board OOMs" would go buy RAM for a board that is merely slow."""
+    monkeypatch.setenv('DEVICE_TYPE', 'arm64')
+    src = path.join(asset_dir, 'sample.mp4')
+    with open(src, 'wb') as f:
+        f.write(b'\x00')
+    asset = _make_processing_asset('vid-rk3566-4k', src, mimetype='video')
+
+    fake_summary = {
+        'container': 'mp4',
+        'video_codec': 'h264',
+        'video_pixels': 3840 * 2160,
+        'video_width': 3840,
+        'video_height': 2160,
+        'video_fps': 30.0,
+        'audio_codec': 'aac',
+        'duration_seconds': 1,
+    }
+    with (
+        mock.patch.object(processing, '_notify'),
+        mock.patch.object(
+            processing, '_ffprobe_summary', return_value=fake_summary
+        ),
+        mock.patch(
+            'anthias_common.board.get_board_subtype', return_value='rk3566'
+        ),
+        # 2 GB board — above LOW_RAM_THRESHOLD_KB, so the memory cap
+        # is definitively not what rejects this.
+        mock.patch(
+            'anthias_server.processing.is_low_ram_device', return_value=False
+        ),
+        pytest.raises(processing.UnsupportedVideoCodecError) as excinfo,
+    ):
+        processing._run_video_normalisation(asset)
+
+    msg = str(excinfo.value)
+    assert '3840x2160' in msg
+    assert 'software' in msg.lower()
+    assert 'oom' not in msg.lower()
+
+
+@pytest.mark.django_db
+def test_video_gate_resolves_the_board_once(
+    asset_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codec and resolution must judge the same board. On arm64 the
+    subtype comes from Redis, so resolving per-check let a transient
+    miss split the decision: the codec check sees ``rk3566`` and allows
+    h264, the cap check sees bare ``arm64``, finds no ceiling, and waves
+    a 4K file through onto a board that cannot decode it in real time.
+    The gate takes one snapshot and passes it down."""
+    monkeypatch.setenv('DEVICE_TYPE', 'arm64')
+    src = path.join(asset_dir, 'sample.mp4')
+    with open(src, 'wb') as f:
+        f.write(b'\x00')
+    asset = _make_processing_asset('vid-rk3566-flaky', src, mimetype='video')
+
+    fake_summary = {
+        'container': 'mp4',
+        'video_codec': 'h264',
+        'video_pixels': 3840 * 2160,
+        'video_width': 3840,
+        'video_height': 2160,
+        'video_fps': 30.0,
+        'audio_codec': 'aac',
+        'duration_seconds': 1,
+    }
+    reads: list[str] = []
+
+    def flaky_subtype() -> str:
+        # First read lands, every later one comes back empty — the
+        # shape of a Redis blip between two lookups.
+        reads.append('read')
+        return 'rk3566' if len(reads) == 1 else ''
+
+    with (
+        mock.patch.object(processing, '_notify'),
+        mock.patch.object(
+            processing, '_ffprobe_summary', return_value=fake_summary
+        ),
+        mock.patch(
+            'anthias_common.board.get_board_subtype',
+            side_effect=flaky_subtype,
+        ),
+        mock.patch(
+            'anthias_server.processing.is_low_ram_device', return_value=False
+        ),
+        pytest.raises(processing.UnsupportedVideoCodecError) as excinfo,
+    ):
+        processing._run_video_normalisation(asset)
+
+    assert '3840x2160' in str(excinfo.value)
+    # The invariant behind it: the board was identified exactly once.
+    assert len(reads) == 1
+
+
+# ---------------------------------------------------------------------------
+# Low-RAM resolution gate (boards with < 1.5 GiB MemTotal). On-device
+# measurement on a 1 GB Rock Pi 4 showed 4K HEVC OOM-kills the viewer
+# container (dmesg ``global_oom`` on the docker container's bash); the
+# codec gate rejects above-1080p uploads on those boards so an operator
+# gets a clear failure pill + downscale recipe instead of a wedged
+# device.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_video_low_ram_rejects_4k_with_resolution_message(
+    asset_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 4K HEVC upload on a low-RAM board (codec is in the supported
+    set, but resolution exceeds 1920×1080) is rejected with a
+    resolution-specific message and a recipe that includes the
+    downscale ``-vf scale=`` clause. Validates the gate fires *only*
+    on the resolution leg — codec is otherwise fine."""
+    monkeypatch.setenv('DEVICE_TYPE', 'arm64')
+    src = path.join(asset_dir, 'big.mp4')
+    with open(src, 'wb') as f:
+        f.write(b'\x00')
+    asset = _make_processing_asset(
+        'vid-4k-lowram',
+        src,
+        mimetype='video',
+        metadata={'upload_name': 'beach-4k.mp4'},
+    )
+
+    fake_summary = {
+        'container': 'mp4',
+        'video_codec': 'hevc',
+        'video_pixels': 3840 * 2160,
+        'video_width': 3840,
+        'video_height': 2160,
+        'video_fps': 30.0,
+        'audio_codec': 'aac',
+        'duration_seconds': 60,
+    }
+    with (
+        mock.patch.object(processing, '_notify'),
+        mock.patch.object(
+            processing, '_ffprobe_summary', return_value=fake_summary
+        ),
+        mock.patch(
+            'anthias_common.board.get_board_subtype', return_value='rockpi4'
+        ),
+        mock.patch(
+            'anthias_server.processing.is_low_ram_device', return_value=True
+        ),
+        pytest.raises(processing.UnsupportedVideoCodecError) as excinfo,
+    ):
+        processing._run_video_normalisation(asset)
+
+    msg = str(excinfo.value)
+    assert '3840x2160' in msg
+    assert '1080p' in msg
+    assert '1.5 GiB' in msg
+    # Recipe carries the downscale clause + a board-appropriate
+    # codec. rockpi4 supports H.264 so libx264 is preferred.
+    recipe = excinfo.value.recipe
+    assert '-vf scale=1920:1080:force_original_aspect_ratio=decrease' in recipe
+    assert 'libx264' in recipe
+    # Metadata still captured (operator sees what they uploaded).
+    asset.refresh_from_db()
+    assert asset.metadata.get('video_width') == 3840
+
+
+@pytest.mark.django_db
+def test_video_low_ram_accepts_1080p(
+    asset_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """1080p HEVC on the same low-RAM board passes the gate — exactly
+    the boundary the on-device measurement said survives."""
+    monkeypatch.setenv('DEVICE_TYPE', 'arm64')
+    src = path.join(asset_dir, 'hd.mp4')
+    with open(src, 'wb') as f:
+        f.write(b'\x00')
+    asset = _make_processing_asset('vid-1080-lowram', src, mimetype='video')
+
+    fake_summary = {
+        'container': 'mp4',
+        'video_codec': 'hevc',
+        'video_pixels': 1920 * 1080,
+        'video_width': 1920,
+        'video_height': 1080,
+        'video_fps': 30.0,
+        'audio_codec': 'aac',
+        'duration_seconds': 15,
+    }
+    with (
+        mock.patch.object(processing, '_notify'),
+        mock.patch.object(
+            processing, '_ffprobe_summary', return_value=fake_summary
+        ),
+        mock.patch(
+            'anthias_common.board.get_board_subtype', return_value='rockpi4'
+        ),
+        mock.patch(
+            'anthias_server.processing.is_low_ram_device', return_value=True
+        ),
+    ):
+        processing._run_video_normalisation(asset)
+
+    asset.refresh_from_db()
+    assert asset.is_processing is False
+    assert asset.metadata.get('video_codec') == 'hevc'
+
+
+@pytest.mark.django_db
+def test_video_high_ram_accepts_4k(
+    asset_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 4K upload on a high-RAM board (Pi 5, Pi 4 4GB) is NOT gated
+    by resolution — the low-RAM cap only fires when MemTotal sits
+    below the threshold."""
+    monkeypatch.setenv('DEVICE_TYPE', 'pi5')
+    src = path.join(asset_dir, 'big.mp4')
+    with open(src, 'wb') as f:
+        f.write(b'\x00')
+    asset = _make_processing_asset('vid-4k-pi5', src, mimetype='video')
+
+    fake_summary = {
+        'container': 'mp4',
+        'video_codec': 'hevc',
+        'video_pixels': 3840 * 2160,
+        'video_width': 3840,
+        'video_height': 2160,
+        'video_fps': 30.0,
+        'audio_codec': 'aac',
+        'duration_seconds': 60,
+    }
+    with (
+        mock.patch.object(processing, '_notify'),
+        mock.patch.object(
+            processing, '_ffprobe_summary', return_value=fake_summary
+        ),
+        # High-RAM device — gate inactive.
+        mock.patch(
+            'anthias_server.processing.is_low_ram_device', return_value=False
+        ),
+    ):
+        processing._run_video_normalisation(asset)
+
+    asset.refresh_from_db()
+    assert asset.is_processing is False
+    assert asset.metadata.get('video_width') == 3840
+
+
+@pytest.mark.django_db
+def test_video_low_ram_unsupported_codec_recipe_includes_downscale(
+    asset_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the upload fails BOTH the codec gate and the resolution
+    gate (e.g. 4K MPEG-2 on Rock Pi 4 1GB), the codec message wins
+    (codec is the strictly stronger rejection — operator has to
+    re-encode either way) but the recipe folds in the downscale so
+    the operator's re-encode also lands within the 1080p envelope.
+    Saves them an iteration of "re-encoded the codec, now it fails
+    the resolution gate too"."""
+    monkeypatch.setenv('DEVICE_TYPE', 'arm64')
+    src = path.join(asset_dir, 'old.mpg')
+    with open(src, 'wb') as f:
+        f.write(b'\x00')
+    asset = _make_processing_asset('vid-mpeg2-4k', src, mimetype='video')
+
+    fake_summary = {
+        'container': 'mpeg',
+        'video_codec': 'mpeg2video',  # Not in rockpi4's HW set.
+        'video_pixels': 3840 * 2160,
+        'video_width': 3840,
+        'video_height': 2160,
+        'video_fps': 30.0,
+        'audio_codec': 'mp2',
+        'duration_seconds': 60,
+    }
+    with (
+        mock.patch.object(processing, '_notify'),
+        mock.patch.object(
+            processing, '_ffprobe_summary', return_value=fake_summary
+        ),
+        mock.patch(
+            'anthias_common.board.get_board_subtype', return_value='rockpi4'
+        ),
+        mock.patch(
+            'anthias_server.processing.is_low_ram_device', return_value=True
+        ),
+        pytest.raises(processing.UnsupportedVideoCodecError) as excinfo,
+    ):
+        processing._run_video_normalisation(asset)
+
+    msg = str(excinfo.value)
+    # Codec message wins (strictly stronger rejection).
+    assert 'codec' in msg.lower()
+    assert "'mpeg2video'" in msg
+    # Recipe folds in the downscale so a single re-encode satisfies
+    # both gates.
+    recipe = excinfo.value.recipe
+    assert '-vf scale=1920:1080:force_original_aspect_ratio=decrease' in recipe
+
+
+def test_ffmpeg_recipe_omits_scale_clause_by_default() -> None:
+    """The codec-only rejection path passes ``cap_to_1080p=False``
+    (the default). Recipe must NOT include a scale clause then — we
+    don't want to suggest a needless downscale when an HD codec
+    swap is all that's wanted."""
+    recipe = processing._ffmpeg_reencode_recipe(frozenset({'h264'}), 'foo.mkv')
+    assert '-vf scale' not in recipe
+    assert '-c:v libx264' in recipe
+
+
+def test_ffmpeg_recipe_includes_scale_clause_when_capping() -> None:
+    """``cap_to_1080p=True`` injects the
+    ``-vf scale=1920:1080:force_original_aspect_ratio=decrease`` clause
+    between the input and the codec arguments, so the operator's
+    re-encode lands inside the 1920×1080 envelope. The
+    ``force_original_aspect_ratio=decrease`` keeps the aspect ratio
+    intact for landscape, ultrawide, and portrait sources alike."""
+    recipe = processing._ffmpeg_reencode_recipe(
+        frozenset({'h264'}), 'foo.mkv', cap_to_1080p=True
+    )
+    assert '-vf scale=1920:1080:force_original_aspect_ratio=decrease' in recipe
+    # Order matters — scale must be before the encoder so the encoder
+    # sees the downscaled frames.
+    scale_idx = recipe.index('-vf')
+    encoder_idx = recipe.index('-c:v')
+    assert scale_idx < encoder_idx
+
+
+def test_handbrake_steps_h264_board_uses_stock_preset_no_encoder_change() -> (
+    None
+):
+    """An H.264 board's walkthrough leans entirely on the stock
+    ``Fast 1080p30`` preset (which already outputs H.264 MP4), so it
+    must NOT tell the operator to touch the Video Encoder dropdown.
+    The download link and the upload-back step are always present."""
+    steps = processing._handbrake_steps(frozenset({'h264', 'hevc'}))
+    joined = ' '.join(steps)
+    assert processing.HANDBRAKE_URL in joined
+    assert 'Fast 1080p30' in joined
+    # No encoder change for an H.264 board — the preset's default is
+    # already H.264.
+    assert 'Video Encoder' not in joined
+    assert 'H.265 (x265)' not in joined
+    assert any('upload' in step.lower() for step in steps)
+
+
+def test_handbrake_steps_hevc_only_board_switches_encoder_to_x265() -> None:
+    """A Pi 5 (HEVC only — no H.264 in its set) can't use the preset's
+    default H.264, so the walkthrough adds a Video-tab step switching
+    the encoder to ``H.265 (x265)`` — still on the ``Fast 1080p30``
+    preset for the 1080p MP4 envelope."""
+    steps = processing._handbrake_steps(frozenset({'hevc'}))
+    joined = ' '.join(steps)
+    assert 'Fast 1080p30' in joined
+    assert 'Video Encoder' in joined
+    assert 'H.265 (x265)' in joined
+
+
+def test_handbrake_steps_always_target_1080p_preset() -> None:
+    """The stock ``Fast 1080p30`` preset caps output at 1080p, so it
+    doubles as the low-RAM resolution fix — there's no separate
+    Dimensions / Resolution-Limit step to spell out, and the steps are
+    identical regardless of the source resolution."""
+    h264 = processing._handbrake_steps(frozenset({'h264'}))
+    hevc = processing._handbrake_steps(frozenset({'hevc'}))
+    for steps in (h264, hevc):
+        assert any('Fast 1080p30' in step for step in steps)
+        assert not any('Resolution Limit' in step for step in steps)
+
+
+def test_handbrake_steps_empty_when_board_has_no_hw_decode() -> None:
+    """An empty supported set (unrecognised arm64 board) has no
+    transcode target, so there are no HandBrake steps to offer —
+    matching ``_ffmpeg_reencode_recipe`` returning an empty string."""
+    assert processing._handbrake_steps(frozenset()) == []
+
+
+def test_exceeds_low_ram_pixel_cap_unknown_dims_returns_false() -> None:
+    """ffprobe-failed uploads (``video_width=None``) skip the
+    resolution gate — the codec gate already collapsed to ``unknown``
+    and will reject them; double-rejecting on dimensions we can't
+    measure would just be noise."""
+    with mock.patch(
+        'anthias_server.processing.is_low_ram_device', return_value=True
+    ):
+        assert processing._exceeds_low_ram_pixel_cap(None, None) is False
+        assert processing._exceeds_low_ram_pixel_cap(0, 0) is False
+        assert processing._exceeds_low_ram_pixel_cap(1920, None) is False
+
+
+def test_exceeds_low_ram_pixel_cap_high_ram_returns_false() -> None:
+    """High-RAM devices never hit the cap, even for >1080p sources."""
+    with mock.patch(
+        'anthias_server.processing.is_low_ram_device', return_value=False
+    ):
+        assert processing._exceeds_low_ram_pixel_cap(3840, 2160) is False
+        assert processing._exceeds_low_ram_pixel_cap(1920, 1080) is False
+
+
 def test_format_subprocess_stderr_decodes_and_trims() -> None:
     """``_format_subprocess_stderr`` must produce operator-readable
     text: bytes decoded as UTF-8 (with replacement for malformed
@@ -909,7 +1761,8 @@ def test_format_subprocess_stderr_decodes_and_trims() -> None:
         truncate=False,
     )
     out = processing._format_subprocess_stderr(exc)
-    assert 'broken' in out and 'byte' in out
+    assert 'broken' in out
+    assert 'byte' in out
 
     # 3) Long stderr is tail-trimmed with an ellipsis prefix so the
     # operator sees the diagnostic, not 4 KB of build-info preamble.
@@ -1245,6 +2098,92 @@ def test_normalize_image_asset_celery_no_op_when_row_missing() -> None:
     run.assert_not_called()
 
 
+@pytest.mark.django_db
+@pytest.mark.parametrize('kind', ['image', 'video'])
+def test_normalize_task_no_op_when_row_deleted_mid_flight(
+    asset_dir: str, kind: str
+) -> None:
+    """The operator deleted the asset after the entry guard passed.
+
+    ``delete_asset_with_file`` drops the row and then unlinks the file,
+    so the body fails wherever it next touches the source. With the row
+    gone that is the delete winning the race, not a fault: the task
+    returns instead of raising into Sentry (ANTHIAS-1G).
+    """
+    from anthias_server import celery_tasks
+
+    asset_id = f'{kind}-deleted'
+    _make_processing_asset(
+        asset_id, path.join(asset_dir, f'gone.{kind}'), mimetype=kind
+    )
+
+    def _deleted_then_fail(_asset: Asset) -> None:
+        Asset.objects.filter(asset_id=asset_id).delete()
+        raise FileNotFoundError('source vanished')
+
+    with mock.patch.object(
+        processing,
+        f'_run_{kind}_normalisation',
+        side_effect=_deleted_then_fail,
+    ):
+        getattr(celery_tasks, f'normalize_{kind}_asset')(asset_id)
+
+
+@pytest.mark.django_db
+def test_image_task_no_op_when_source_deleted_after_isfile(
+    asset_dir: str,
+) -> None:
+    """The window ``isfile`` cannot close: the delete lands after the
+    check passes and before Pillow opens the source."""
+    from anthias_server.celery_tasks import normalize_image_asset
+
+    src = path.join(asset_dir, 'racing.tiff')
+    Image.new('RGB', (4, 4)).save(src)
+    _make_processing_asset('img-racing', src)
+
+    def _delete_then_open(source: str, _staging: str) -> None:
+        Asset.objects.filter(asset_id='img-racing').delete()
+        os.remove(source)
+        Image.open(source)
+
+    with (
+        mock.patch.object(
+            processing,
+            '_convert_image_to_webp',
+            side_effect=_delete_then_open,
+        ),
+        mock.patch.object(processing, '_notify') as notify,
+    ):
+        normalize_image_asset('img-racing')
+
+    assert notify.call_count == 0
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('kind', ['image', 'video'])
+def test_normalize_task_raises_when_row_still_live(
+    asset_dir: str, kind: str
+) -> None:
+    """A source that vanished under a row nobody deleted is a genuine
+    fault and must still raise."""
+    from anthias_server import celery_tasks
+
+    asset_id = f'{kind}-live'
+    _make_processing_asset(
+        asset_id, path.join(asset_dir, f'gone.{kind}'), mimetype=kind
+    )
+
+    with (
+        mock.patch.object(
+            processing,
+            f'_run_{kind}_normalisation',
+            side_effect=FileNotFoundError('source vanished'),
+        ),
+        pytest.raises(FileNotFoundError),
+    ):
+        getattr(celery_tasks, f'normalize_{kind}_asset')(asset_id)
+
+
 def test_normalize_tasks_exclude_permanent_oserrors_from_autoretry() -> None:
     """Both normalisation tasks have ``autoretry_for=(OSError,)`` so a
     transient disk hiccup is retried automatically. Several OSError
@@ -1294,6 +2233,79 @@ def test_normalize_tasks_exclude_permanent_oserrors_from_autoretry() -> None:
     )
 
 
+def test_video_task_declares_codec_rejection_as_expected() -> None:
+    """The codec/resolution gate raises ``UnsupportedVideoCodecError``
+    as a deliberate, operator-facing rejection — not a fault. The video
+    task must list it in ``throws`` so Celery logs it at INFO without a
+    traceback and sentry-sdk's CeleryIntegration skips it (it returns
+    early on ``isinstance(exc, task.throws)``), keeping the gate from
+    flooding Sentry. The image task never raises it, so it must not be
+    swept into the image task's ``throws``.
+    """
+    from anthias_server.celery_tasks import (
+        normalize_image_asset,
+        normalize_video_asset,
+    )
+
+    assert processing.UnsupportedVideoCodecError in tuple(
+        getattr(normalize_video_asset, 'throws', ())
+    ), (
+        'normalize_video_asset expected throws to include '
+        'UnsupportedVideoCodecError so the by-design codec rejection '
+        'is not reported to Sentry'
+    )
+    assert processing.UnsupportedVideoCodecError not in tuple(
+        getattr(normalize_image_asset, 'throws', ())
+    )
+
+
+def test_a_missing_source_is_declared_as_expected() -> None:
+    """A source file that is gone is an outcome, not a fault.
+
+    The row was deleted, or ``cleanup()`` swept the upload, between
+    dispatch and pickup — which is why both tasks already list
+    ``FileNotFoundError`` in ``dont_autoretry_for``. Reporting the same
+    condition to Sentry as an unhandled crash says a bug happened
+    (ANTHIAS-1G). ``on_failure`` still runs, so the operator still gets
+    the Failed pill and the reason on the row; only the crash report
+    goes away.
+    """
+    from anthias_server.celery_tasks import (
+        normalize_image_asset,
+        normalize_video_asset,
+    )
+
+    for task in (normalize_video_asset, normalize_image_asset):
+        assert FileNotFoundError in tuple(getattr(task, 'throws', ())), (
+            f'{task.name} expected throws to include FileNotFoundError'
+        )
+        # The two lists have to agree: a condition that is expected
+        # enough to skip the retry is expected enough not to page.
+        assert FileNotFoundError in tuple(
+            getattr(task, 'dont_autoretry_for', ())
+        ), task.name
+
+
+def test_image_task_declares_too_large_rejection_as_expected() -> None:
+    """The pixel cap's ``ImageTooLargeError`` is the image counterpart
+    of the video codec gate: an operator-facing rejection, not a fault.
+    ``normalize_image_asset`` must list it in ``throws`` so an over-cap
+    upload is not logged with a traceback or reported to Sentry, and
+    the video task, which never raises it, must not.
+    """
+    from anthias_server.celery_tasks import (
+        normalize_image_asset,
+        normalize_video_asset,
+    )
+
+    assert processing.ImageTooLargeError in tuple(
+        getattr(normalize_image_asset, 'throws', ())
+    )
+    assert processing.ImageTooLargeError not in tuple(
+        getattr(normalize_video_asset, 'throws', ())
+    )
+
+
 @pytest.mark.django_db
 def test_normalize_on_failure_writes_error_metadata(
     asset_dir: str,
@@ -1321,10 +2333,8 @@ def test_normalize_on_failure_writes_error_metadata(
 
     asset.refresh_from_db()
     assert asset.is_processing is False
-    assert (
-        'cannot decode' in asset.metadata['error_message']
-        and 'UnidentifiedImageError' in asset.metadata['error_message']
-    )
+    assert 'cannot decode' in asset.metadata['error_message']
+    assert 'UnidentifiedImageError' in asset.metadata['error_message']
     # Earlier metadata keys are preserved.
     assert asset.metadata['original_ext'] == '.tiff'
     notify.assert_called_once_with(asset.asset_id)
@@ -1351,7 +2361,9 @@ def test_normalize_on_failure_unsupported_codec_persists_recipe(
       P1 review finding), and
     * mirror the exception's ``recipe`` attribute into
       ``metadata.error_recipe`` so the Edit modal can render it in a
-      copyable ``<code>`` block.
+      copyable ``<code>`` block, and
+    * mirror the exception's ``handbrake`` steps into
+      ``metadata.error_handbrake`` for the GUI alternative.
     """
     asset = _make_processing_asset(
         'vid-onfail',
@@ -1359,10 +2371,12 @@ def test_normalize_on_failure_unsupported_codec_persists_recipe(
         mimetype='video',
     )
     task = processing._NormalizeAssetTask()
+    handbrake_steps = processing._handbrake_steps(frozenset({'h264', 'hevc'}))
     exc = processing.UnsupportedVideoCodecError(
         "Video codec 'mpeg2video' is not hardware-decoded on this "
         'device. Supported: h264, hevc.',
         recipe="ffmpeg -i 'fixture.mpg' -c:v libx264 'fixture.mp4'",
+        handbrake=handbrake_steps,
     )
 
     with mock.patch.object(processing, '_notify'):
@@ -1376,21 +2390,24 @@ def test_normalize_on_failure_unsupported_codec_persists_recipe(
     assert asset.metadata['error_recipe'] == (
         "ffmpeg -i 'fixture.mpg' -c:v libx264 'fixture.mp4'"
     )
+    assert asset.metadata['error_handbrake'] == handbrake_steps
 
 
 @pytest.mark.django_db
-def test_normalize_on_failure_clears_stale_error_recipe(
+def test_normalize_on_failure_clears_stale_error_recipe_and_handbrake(
     asset_dir: str,
 ) -> None:
     """A subsequent non-recipe failure must clear any stale
-    ``error_recipe`` from a previous run, otherwise the modal would
-    show an outdated recipe alongside the new error message."""
+    ``error_recipe`` / ``error_handbrake`` from a previous run,
+    otherwise the modal would show an outdated recipe and HandBrake
+    steps alongside the new error message."""
     asset = _make_processing_asset(
         'img-clears',
         path.join(asset_dir, 'fixture.tiff'),
         mimetype='image',
         metadata={
             'error_recipe': "ffmpeg -i 'old.mpg' -c:v libx264 'old.mp4'",
+            'error_handbrake': ['old step one', 'old step two'],
         },
     )
     task = processing._NormalizeAssetTask()
@@ -1406,6 +2423,7 @@ def test_normalize_on_failure_clears_stale_error_recipe(
 
     asset.refresh_from_db()
     assert 'error_recipe' not in asset.metadata
+    assert 'error_handbrake' not in asset.metadata
 
 
 # ---------------------------------------------------------------------------
@@ -1474,6 +2492,465 @@ def test_dispatch_normalize_video_invokes_celery_task() -> None:
     ):
         processing.dispatch_normalize_video('asset-2')
     delay.assert_called_once_with('asset-2')
+
+
+# ---------------------------------------------------------------------------
+# Low-RAM in-place downscale for the formats we don't convert (JPEG / PNG)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'ext,over_cap,low_ram,expected',
+    [
+        # The case that motivated this: a big phone JPEG on a Pi 2/3.
+        ('.jpg', True, True, True),
+        ('.jpeg', True, True, True),
+        ('.png', True, True, True),
+        # Not low-RAM → never resize an operator's photo unasked.
+        ('.jpg', True, False, False),
+        # Low-RAM but already within budget → nothing to do.
+        ('.jpg', False, True, False),
+        # Formats deliberately excluded: GIF/WebP may be animated and
+        # SVG has no pixel buffer to cap.
+        ('.gif', True, True, False),
+        ('.webp', True, True, False),
+        # A convert-format is NORMALIZE_IMAGE_EXTS' job, not this one.
+        ('.tiff', True, True, False),
+    ],
+)
+@pytest.mark.django_db
+def test_needs_low_ram_image_downscale(
+    asset_dir: str, ext: str, over_cap: bool, low_ram: bool, expected: bool
+) -> None:
+    src = path.join(asset_dir, f'probe{ext}')
+    size = (4000, 3000) if over_cap else (1280, 720)
+    fmt = {
+        '.jpg': 'JPEG',
+        '.jpeg': 'JPEG',
+        '.png': 'PNG',
+        '.gif': 'GIF',
+        '.webp': 'WEBP',
+        '.tiff': 'TIFF',
+    }[ext]
+    Image.new('RGB', size, (10, 20, 30)).save(src, fmt)
+
+    with mock.patch(
+        'anthias_server.processing.is_low_ram_device', return_value=low_ram
+    ):
+        assert processing.needs_low_ram_image_downscale(src) is expected
+
+
+@pytest.mark.django_db
+def test_needs_low_ram_image_downscale_unreadable_file_is_false(
+    asset_dir: str,
+) -> None:
+    """A missing or undecodable file must not block the upload here. It
+    fails later with a real decode error the operator can act on;
+    guessing at this point would turn "corrupt file" into the far more
+    confusing "silently skipped resize"."""
+    missing = path.join(asset_dir, 'not-there.jpg')
+    corrupt = path.join(asset_dir, 'broken.jpg')
+    _write_corrupt(corrupt, '.jpg')
+
+    with mock.patch(
+        'anthias_server.processing.is_low_ram_device', return_value=True
+    ):
+        assert processing.needs_low_ram_image_downscale(missing) is False
+        assert processing.needs_low_ram_image_downscale(corrupt) is False
+
+
+@pytest.mark.django_db
+def test_needs_low_ram_downscale_routes_bomb_instead_of_raising(
+    asset_dir: str,
+) -> None:
+    """A decompression bomb must not raise out of the predicate.
+
+    This runs inside the upload request, and the module tightens
+    ``Image.MAX_IMAGE_PIXELS``, so ``Image.open`` raises
+    ``DecompressionBombError`` on a header declaring more than twice the
+    cap. That exception derives straight from ``Exception``, so an
+    ``except (OSError, ValueError)`` misses it and the upload 500s.
+
+    It returns ``True`` — routing the bomb into the Celery task, which
+    rejects it deterministically and surfaces a "Failed" pill with the
+    dimensions, the same way an over-cap HEIC/TIFF already does."""
+    src = path.join(asset_dir, 'bomb.png')
+    # A ~24 KB PNG whose IHDR declares 400 MP — 8x the 50 MP cap, and
+    # over the 2x threshold at which Pillow raises rather than warns.
+    side = 20000
+    ihdr = struct.pack('>IIBBBBB', side, side, 8, 2, 0, 0, 0)
+
+    def _chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack('>I', len(payload))
+            + kind
+            + payload
+            + struct.pack('>I', zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    with open(src, 'wb') as handle:
+        handle.write(
+            b'\x89PNG\r\n\x1a\n'
+            + _chunk(b'IHDR', ihdr)
+            + _chunk(b'IDAT', zlib.compress(b'\x00' * 16))
+            + _chunk(b'IEND', b'')
+        )
+
+    with mock.patch(
+        'anthias_server.processing.is_low_ram_device', return_value=True
+    ):
+        # The assertion that matters is "does not raise"; the True is
+        # what gets the operator a real error message.
+        assert processing.needs_low_ram_image_downscale(src) is True
+        assert processing.needs_image_processing(src) is True
+
+
+def _write_bomb_png(out_path: str, side: int = 20000) -> str:
+    """A ~24 KB PNG whose IHDR declares ``side``x``side`` pixels.
+
+    At the default 20000 that is 400 MP: 8x the 50 MP cap and well
+    over the 2x threshold at which Pillow raises rather than warns.
+    Written by hand because a real fixture of that size would need
+    hundreds of MB to create.
+    """
+    ihdr = struct.pack('>IIBBBBB', side, side, 8, 2, 0, 0, 0)
+
+    def _chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack('>I', len(payload))
+            + kind
+            + payload
+            + struct.pack('>I', zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    with open(out_path, 'wb') as handle:
+        handle.write(
+            b'\x89PNG\r\n\x1a\n'
+            + _chunk(b'IHDR', ihdr)
+            + _chunk(b'IDAT', zlib.compress(b'\x00' * 16))
+            + _chunk(b'IEND', b'')
+        )
+    return out_path
+
+
+# The 9000x9000 fixture below is over the cap but under Pillow's 2x
+# raise threshold, so Pillow warns on the way past; that is the band
+# this test is deliberately exercising.
+@pytest.mark.filterwarnings('ignore::PIL.Image.DecompressionBombWarning')
+@pytest.mark.django_db
+def test_open_image_translates_pillow_bomb_error(asset_dir: str) -> None:
+    """Over twice the cap, Pillow raises from inside ``Image.open``
+    before ``_guard_and_fit_for_board`` ever sees ``image.size``.
+
+    ``DecompressionBombError`` derives straight from ``Exception``, so
+    it slipped past every ``except (OSError, ..., ValueError)`` in the
+    pipeline and surfaced as a crash carrying Pillow's "could be
+    decompression bomb DOS attack" wording — on what is usually a
+    scanner output or a poster export. ``_open_image`` turns it into
+    the same ``ImageTooLargeError`` the in-range band raises."""
+    src = _write_bomb_png(path.join(asset_dir, 'bomb.png'))
+
+    with pytest.raises(
+        processing.ImageTooLargeError, match='is 400000000 pixels'
+    ) as excinfo:
+        processing._open_image(src)
+    # Pillow's alarming wording stays out of the operator's message.
+    assert 'DOS attack' not in str(excinfo.value)
+    assert 'decode cap' in str(excinfo.value)
+
+    # The band between the cap and 2x the cap still goes through the
+    # explicit size check, and reports the dimensions it read.
+    under_2x = _write_bomb_png(path.join(asset_dir, 'big.png'), side=9000)
+    with (
+        pytest.raises(processing.ImageTooLargeError, match='9000x9000'),
+        processing._open_image(under_2x) as image,
+    ):
+        processing._guard_and_fit_for_board(image)
+
+
+@pytest.mark.django_db
+def test_over_cap_image_fails_with_operator_message(asset_dir: str) -> None:
+    """End to end: an over-2x-cap upload reaches the task (that is what
+    ``needs_low_ram_image_downscale`` returning True is for) and must
+    fail as a handled rejection, not as a Pillow bomb error.
+
+    Guards the contract the two halves have asserted separately but
+    never together: the predicate routes the bomb into the task, and
+    the task is the thing that owes the operator an answer."""
+    src = _write_bomb_png(path.join(asset_dir, 'bomb.png'))
+    asset = _make_processing_asset('img-over-cap', src)
+
+    with (
+        mock.patch.object(processing, '_notify'),
+        mock.patch(
+            'anthias_server.processing.is_low_ram_device', return_value=True
+        ),
+        pytest.raises(processing.ImageTooLargeError, match='decode cap'),
+    ):
+        processing._run_image_normalisation(asset)
+
+    # Staging cleanup contract holds on this path too.
+    leftover = [n for n in os.listdir(asset_dir) if n.endswith('.tmp')]
+    assert not leftover, f'image staging leftover: {leftover}'
+
+    # The message the operator sees carries no class-name prefix and
+    # none of Pillow's "DOS attack" wording.
+    task = processing._NormalizeAssetTask()
+    with mock.patch.object(processing, '_notify'):
+        task.on_failure(
+            processing.ImageTooLargeError('image exceeds the cap'),
+            'task-id',
+            (asset.asset_id,),
+            {},
+            None,
+        )
+    asset.refresh_from_db()
+    assert asset.metadata['error_message'] == 'image exceeds the cap'
+    assert asset.is_processing is False
+
+
+@pytest.mark.django_db
+def test_needs_image_processing_is_the_union(asset_dir: str) -> None:
+    """The upload paths branch on the union: a file earns a Celery hop
+    either because its format needs converting or because it is too big
+    for this board."""
+    big_jpeg = path.join(asset_dir, 'big.jpg')
+    Image.new('RGB', (4000, 3000), (10, 20, 30)).save(big_jpeg, 'JPEG')
+    small_jpeg = path.join(asset_dir, 'small.jpg')
+    Image.new('RGB', (800, 600), (10, 20, 30)).save(small_jpeg, 'JPEG')
+
+    with mock.patch(
+        'anthias_server.processing.is_low_ram_device', return_value=True
+    ):
+        # Convert-format: routed on extension alone.
+        assert processing.needs_image_processing('foo.tiff') is True
+        # Bypass-format, over cap on a low-RAM board: routed on size.
+        assert processing.needs_image_processing(big_jpeg) is True
+        # Bypass-format within budget: no hop at all.
+        assert processing.needs_image_processing(small_jpeg) is False
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('ext,fmt', [('.jpg', 'JPEG'), ('.png', 'PNG')])
+def test_downscale_in_place_keeps_format_and_fits_cap(
+    asset_dir: str, ext: str, fmt: str
+) -> None:
+    """The resize keeps the source format — re-encoding a photographic
+    JPEG as lossless WebP would inflate it several times over, which is
+    why this path exists separately from ``_convert_image_to_webp``."""
+    src = path.join(asset_dir, f'big{ext}')
+    Image.new('RGB', (4000, 3000), (10, 20, 30)).save(src, fmt)
+    out = path.join(asset_dir, f'out{ext}')
+
+    with mock.patch(
+        'anthias_server.processing.is_low_ram_device', return_value=True
+    ):
+        processing._downscale_image_in_place(src, out)
+
+    with Image.open(out) as result:
+        assert result.format == fmt
+        w, h = result.size
+        assert w * h <= processing._LOW_RAM_MAX_PIXELS, (
+            f'{w}x{h} still exceeds the low-RAM cap'
+        )
+        assert abs((w / h) - (4000 / 3000)) < 0.02
+
+
+@pytest.mark.django_db
+def test_downscale_in_place_bakes_orientation_and_drops_exif(
+    asset_dir: str,
+) -> None:
+    """The double-rotation hazard, pinned.
+
+    The resize bakes EXIF Orientation into the pixels. If the output
+    then *also* carried the original Orientation tag, the viewer's
+    ``QImageReader::setAutoTransform`` would rotate a second time and
+    turn a correct portrait into a sideways one. So the output must be
+    upright in pixels AND carry no Orientation tag."""
+    src = path.join(asset_dir, 'portrait.jpg')
+    # Stored landscape (4000x3000) but tagged Orientation=6, i.e. the
+    # classic phone photo: display rotated 90° CW → portrait.
+    image = Image.new('RGB', (4000, 3000), (10, 20, 30))
+    exif = image.getexif()
+    exif[0x0112] = 6
+    image.save(src, 'JPEG', exif=exif)
+
+    with Image.open(src) as probe:
+        assert probe.size == (4000, 3000)
+        assert probe.getexif().get(0x0112) == 6
+
+    out = path.join(asset_dir, 'portrait-out.jpg')
+    with mock.patch(
+        'anthias_server.processing.is_low_ram_device', return_value=True
+    ):
+        processing._downscale_image_in_place(src, out)
+
+    with Image.open(out) as result:
+        w, h = result.size
+        # Rotation baked in: the stored buffer is now portrait.
+        assert h > w, f'expected orientation baked to portrait, got {w}x{h}'
+        # And no tag left for the viewer to apply a second time.
+        assert result.getexif().get(0x0112) in (None, 1), (
+            'Orientation tag survived; the viewer would double-rotate'
+        )
+
+
+@pytest.mark.django_db
+def test_run_normalisation_downscales_jpeg_without_changing_uri(
+    asset_dir: str,
+) -> None:
+    """End-to-end: an over-cap JPEG on a low-RAM board is resized in
+    place. The URI keeps its ``.jpg`` extension (no viewer-side cache
+    or path churn), the original is not left behind as a ghost, and the
+    metadata records the resize without claiming a format conversion."""
+    src = path.join(asset_dir, 'photo.jpg')
+    Image.new('RGB', (4000, 3000), (10, 20, 30)).save(src, 'JPEG')
+    asset = _make_processing_asset('img-jpeg-big', src)
+
+    with (
+        mock.patch(
+            'anthias_server.processing.is_low_ram_device', return_value=True
+        ),
+        mock.patch.object(processing, '_notify') as notify,
+    ):
+        processing._run_image_normalisation(asset)
+
+    asset.refresh_from_db()
+    assert asset.uri == src, 'in-place downscale must not move the URI'
+    assert path.isfile(src)
+    assert not path.exists(f'{src}.tmp'), 'staging file must not survive'
+    assert asset.is_processing is False
+    assert asset.metadata['downscaled'] is True
+    assert asset.metadata['original_resolution'] == '4000x3000'
+    # ``converted`` means "re-encoded to a different format" — a resize
+    # is not a conversion, so existing consumers of the flag must not
+    # start seeing JPEGs reported as converted.
+    assert asset.metadata['converted'] is False
+    notify.assert_called_once_with('img-jpeg-big')
+
+    with Image.open(src) as result:
+        assert result.format == 'JPEG'
+        w, h = result.size
+        assert w * h <= processing._LOW_RAM_MAX_PIXELS
+
+
+@pytest.mark.django_db
+def test_original_resolution_reports_display_orientation(
+    asset_dir: str,
+) -> None:
+    """``original_resolution`` must name the dimensions the operator
+    saw, not the stored buffer.
+
+    A phone photo is stored landscape with Orientation=6 ("rotate 90°
+    CW to display"), so a 6000x4000 stored buffer is a 4000x6000
+    portrait to the person who took it. The field exists to answer "why
+    is my photo softer than the file I uploaded?", so reporting the
+    pre-transpose orientation would name an orientation they never
+    saw. Caught on the Pi 3-64 testbed."""
+    src = path.join(asset_dir, 'portrait.jpg')
+    image = Image.new('RGB', (6000, 4000), (10, 20, 30))
+    exif = image.getexif()
+    exif[0x0112] = 6
+    image.save(src, 'JPEG', exif=exif)
+    asset = _make_processing_asset('img-jpeg-portrait', src)
+
+    with (
+        mock.patch(
+            'anthias_server.processing.is_low_ram_device', return_value=True
+        ),
+        mock.patch.object(processing, '_notify'),
+    ):
+        processing._run_image_normalisation(asset)
+
+    asset.refresh_from_db()
+    assert asset.metadata['original_resolution'] == '4000x6000', (
+        'expected the display orientation the operator uploaded'
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'orientation,expected',
+    [
+        # Identity and the pure mirrors keep the stored aspect.
+        (None, (6000, 4000)),
+        (1, (6000, 4000)),
+        (2, (6000, 4000)),
+        (3, (6000, 4000)),
+        (4, (6000, 4000)),
+        # 90°/270°, with or without a mirror, swap the axes.
+        (5, (4000, 6000)),
+        (6, (4000, 6000)),
+        (7, (4000, 6000)),
+        (8, (4000, 6000)),
+    ],
+)
+def test_display_size_per_orientation(
+    asset_dir: str, orientation: int | None, expected: tuple[int, int]
+) -> None:
+    src = path.join(asset_dir, 'probe.jpg')
+    image = Image.new('RGB', (6000, 4000), (10, 20, 30))
+    if orientation is None:
+        image.save(src, 'JPEG')
+    else:
+        exif = image.getexif()
+        exif[0x0112] = orientation
+        image.save(src, 'JPEG', exif=exif)
+
+    with Image.open(src) as probe:
+        assert processing._display_size(probe) == expected
+
+
+@pytest.mark.django_db
+def test_run_normalisation_leaves_small_jpeg_untouched(
+    asset_dir: str,
+) -> None:
+    """A JPEG within budget is a no-op success even if the task somehow
+    gets dispatched for it — byte-identical file, no ``downscaled``
+    flag, and the row still clears ``is_processing``."""
+    src = path.join(asset_dir, 'small.jpg')
+    Image.new('RGB', (800, 600), (10, 20, 30)).save(src, 'JPEG')
+    before = Path(src).read_bytes()
+    asset = _make_processing_asset('img-jpeg-small', src)
+
+    with (
+        mock.patch(
+            'anthias_server.processing.is_low_ram_device', return_value=True
+        ),
+        mock.patch.object(processing, '_notify'),
+    ):
+        processing._run_image_normalisation(asset)
+
+    asset.refresh_from_db()
+    assert asset.uri == src
+    assert Path(src).read_bytes() == before, 'file must not be re-encoded'
+    assert asset.is_processing is False
+    assert 'downscaled' not in asset.metadata
+
+
+@pytest.mark.django_db
+def test_run_normalisation_leaves_big_jpeg_untouched_on_normal_ram(
+    asset_dir: str,
+) -> None:
+    """The resize is a low-RAM concession, not a global quality drop: a
+    Pi 4 / 5 / x86 keeps the operator's full-resolution upload."""
+    src = path.join(asset_dir, 'photo.jpg')
+    Image.new('RGB', (4000, 3000), (10, 20, 30)).save(src, 'JPEG')
+    before = Path(src).read_bytes()
+    asset = _make_processing_asset('img-jpeg-normal-ram', src)
+
+    with (
+        mock.patch(
+            'anthias_server.processing.is_low_ram_device', return_value=False
+        ),
+        mock.patch.object(processing, '_notify'),
+    ):
+        processing._run_image_normalisation(asset)
+
+    asset.refresh_from_db()
+    assert Path(src).read_bytes() == before
+    with Image.open(src) as result:
+        assert result.size == (4000, 3000)
 
 
 @pytest.mark.django_db
@@ -1692,7 +3169,7 @@ def test_prepare_asset_routes_heic_through_image_pipeline(
     """End-to-end-ish: simulate a HEIC upload and verify
     prepare_asset stamps is_processing=True and stashes the pending
     flag the view dispatches on."""
-    from datetime import datetime, timezone as _tz
+    from datetime import datetime
 
     from anthias_server.api.serializers.v2 import CreateAssetSerializerV2
 
@@ -1705,8 +3182,8 @@ def test_prepare_asset_routes_heic_through_image_pipeline(
             'ext': '.heic',
             'mimetype': 'image',
             'duration': 10,
-            'start_date': datetime(2026, 1, 1, tzinfo=_tz.utc),
-            'end_date': datetime(2030, 1, 1, tzinfo=_tz.utc),
+            'start_date': datetime(2026, 1, 1, tzinfo=UTC),
+            'end_date': datetime(2030, 1, 1, tzinfo=UTC),
             'is_enabled': False,
         },
         unique_name=False,
@@ -1732,7 +3209,7 @@ def test_prepare_asset_routes_heic_through_image_pipeline(
 def test_prepare_asset_routes_video_through_video_pipeline(
     asset_dir: str,
 ) -> None:
-    from datetime import datetime, timezone as _tz
+    from datetime import datetime
 
     from anthias_server.api.serializers.v2 import CreateAssetSerializerV2
 
@@ -1745,8 +3222,8 @@ def test_prepare_asset_routes_video_through_video_pipeline(
             'ext': '.mp4',
             'mimetype': 'video',
             'duration': 0,
-            'start_date': datetime(2026, 1, 1, tzinfo=_tz.utc),
-            'end_date': datetime(2030, 1, 1, tzinfo=_tz.utc),
+            'start_date': datetime(2026, 1, 1, tzinfo=UTC),
+            'end_date': datetime(2030, 1, 1, tzinfo=UTC),
             'is_enabled': False,
         },
         unique_name=False,
@@ -1776,7 +3253,7 @@ def test_prepare_asset_skips_pipeline_for_remote_url(
 ) -> None:
     """A webpage / RTSP / HTTP video URL must not get flagged for
     normalisation — only locally-uploaded files do."""
-    from datetime import datetime, timezone as _tz
+    from datetime import datetime
 
     from anthias_server.api.serializers.v2 import CreateAssetSerializerV2
 
@@ -1786,8 +3263,8 @@ def test_prepare_asset_skips_pipeline_for_remote_url(
             'uri': 'https://example.com/page',
             'mimetype': 'webpage',
             'duration': 30,
-            'start_date': datetime(2026, 1, 1, tzinfo=_tz.utc),
-            'end_date': datetime(2030, 1, 1, tzinfo=_tz.utc),
+            'start_date': datetime(2026, 1, 1, tzinfo=UTC),
+            'end_date': datetime(2030, 1, 1, tzinfo=UTC),
             'is_enabled': False,
         },
         unique_name=False,
@@ -1808,7 +3285,7 @@ def test_prepare_asset_skips_pipeline_for_jpeg_upload(
 ) -> None:
     """Common JPEG / PNG / WebP uploads land ready-to-play — never
     enqueue a normalisation task for them."""
-    from datetime import datetime, timezone as _tz
+    from datetime import datetime
 
     from anthias_server.api.serializers.v2 import CreateAssetSerializerV2
 
@@ -1820,8 +3297,8 @@ def test_prepare_asset_skips_pipeline_for_jpeg_upload(
             'ext': '.jpg',
             'mimetype': 'image',
             'duration': 10,
-            'start_date': datetime(2026, 1, 1, tzinfo=_tz.utc),
-            'end_date': datetime(2030, 1, 1, tzinfo=_tz.utc),
+            'start_date': datetime(2026, 1, 1, tzinfo=UTC),
+            'end_date': datetime(2030, 1, 1, tzinfo=UTC),
             'is_enabled': False,
         },
         unique_name=False,
@@ -1832,3 +3309,118 @@ def test_prepare_asset_skips_pipeline_for_jpeg_upload(
     ):
         assert serializer.is_valid(), serializer.errors
     assert serializer._pending_normalize is None
+
+
+@pytest.mark.django_db
+def test_unidentified_board_message_scopes_the_balena_advice(
+    asset_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The empty-codec-set message is selected for *any* empty set, not
+    just the generic arm64 keys: an unset or unrecognised DEVICE_TYPE
+    resolves to a key with no entry too. Those installs get no
+    host-agent or balena diagnosis, because neither applies to them —
+    telling an x86 operator with a typo'd DEVICE_TYPE to check balena
+    would send them somewhere with no answer."""
+    monkeypatch.setenv('DEVICE_TYPE', 'not-a-real-board')
+    src = path.join(asset_dir, 'sample.mp4')
+    with open(src, 'wb') as f:
+        f.write(b'\x00')
+    asset = _make_processing_asset('vid-unknown-key', src, mimetype='video')
+
+    fake_summary = {
+        'container': 'mp4',
+        'video_codec': 'h264',
+        'video_pixels': 32 * 32,
+        'video_width': 32,
+        'video_height': 32,
+        'video_fps': 10.0,
+        'audio_codec': 'aac',
+        'duration_seconds': 1,
+    }
+    with (
+        mock.patch.object(processing, '_notify'),
+        mock.patch.object(
+            processing, '_ffprobe_summary', return_value=fake_summary
+        ),
+        pytest.raises(processing.UnsupportedVideoCodecError) as excinfo,
+    ):
+        processing._run_video_normalisation(asset)
+
+    msg = str(excinfo.value).lower()
+    assert 'cannot certify that any codec plays here' in msg
+    assert 'balena' not in msg
+    assert 'device_type' in msg
+
+
+@pytest.mark.django_db
+def test_unidentified_board_message_survives_an_unknown_subtype(
+    asset_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A subtype Redis knows but the codec map doesn't — host_agent
+    ahead of the server during a rollout — is still an arm64 catch-all
+    deployment, and must still get the host-agent/balena diagnosis.
+
+    Branching on the resolved key instead would call it "DEVICE_TYPE
+    unset or unrecognised", which is both wrong and unactionable.
+    """
+    monkeypatch.setenv('DEVICE_TYPE', 'arm64')
+    src = path.join(asset_dir, 'sample.mp4')
+    with open(src, 'wb') as f:
+        f.write(b'\x00')
+    asset = _make_processing_asset('vid-future-subtype', src, mimetype='video')
+
+    fake_summary = {
+        'container': 'mp4',
+        'video_codec': 'h264',
+        'video_pixels': 32 * 32,
+        'video_width': 32,
+        'video_height': 32,
+        'video_fps': 10.0,
+        'audio_codec': 'aac',
+        'duration_seconds': 1,
+    }
+    with (
+        mock.patch.object(processing, '_notify'),
+        mock.patch.object(
+            processing, '_ffprobe_summary', return_value=fake_summary
+        ),
+        # A board the running server has never heard of.
+        mock.patch(
+            'anthias_common.board.get_board_subtype',
+            return_value='rk9999-from-the-future',
+        ),
+        pytest.raises(processing.UnsupportedVideoCodecError) as excinfo,
+    ):
+        processing._run_video_normalisation(asset)
+
+    msg = str(excinfo.value).lower()
+    assert 'anthias-host-agent' in msg
+    assert 'unset or unrecognised' not in msg
+
+
+class TestDescribeTaskFailure:
+    """``metadata.error_message`` is read by an operator, on a tooltip.
+
+    Celery's ``SoftTimeLimitExceeded`` stringifies as its own budget
+    tuple, so the default rendering would reach them as
+    "SoftTimeLimitExceeded: SoftTimeLimitExceeded(870,)".
+    """
+
+    def test_a_time_limit_reads_as_a_timeout(self) -> None:
+        message = processing.describe_task_failure(SoftTimeLimitExceeded(870))
+        assert 'Timed out' in message
+        assert '870' in message
+        assert 'SoftTimeLimitExceeded' not in message
+
+    def test_a_time_limit_without_a_budget_still_reads(self) -> None:
+        message = processing.describe_task_failure(SoftTimeLimitExceeded())
+        assert 'Timed out' in message
+        assert 'SoftTimeLimitExceeded' not in message
+
+    def test_other_failures_keep_the_type_and_message(self) -> None:
+        # The library errors the pipeline raises are already
+        # operator-readable this way.
+        message = processing.describe_task_failure(
+            FileNotFoundError('no such file')
+        )
+        assert message == 'FileNotFoundError: no such file'

@@ -7,11 +7,20 @@ from os import getenv, path
 from typing import Any
 
 import django
+import requests
 import sh
 from celery import Celery, Task
+from celery.exceptions import SoftTimeLimitExceeded
+from celery.signals import worker_init, worker_ready
 from django.apps import apps as _django_apps
 from PIL import UnidentifiedImageError
-from tenacity import Retrying, stop_after_attempt, wait_fixed
+from tenacity import (
+    RetryError,
+    Retrying,
+    retry_if_exception_type,
+    stop_after_delay,
+    wait_exponential,
+)
 
 # ``django.setup()`` is not reentrant — calling it while
 # ``apps.populate()`` is still running (e.g. when an ``AppConfig.ready``
@@ -30,10 +39,9 @@ if not _django_apps.apps_ready:
 
 # Place imports that uses Django in this block.
 
-from anthias_server.app.models import Asset  # noqa: E402
-from anthias_server.lib import diagnostics  # noqa: E402
-from anthias_server.lib.telemetry import send_telemetry  # noqa: E402
-from anthias_common.utils import (  # noqa: E402
+from anthias_common.utils import (
+    STAGED_UPLOAD_DIR,
+    STAGED_UPLOAD_MAX_AGE_MIN,
     connect_to_redis,
     get_video_duration,
     is_balena_app,
@@ -41,9 +49,20 @@ from anthias_common.utils import (  # noqa: E402
     shutdown_via_balena_supervisor,
     url_fails,
 )
-from anthias_common.youtube import youtube_destination_path  # noqa: E402
-from anthias_server.settings import settings  # noqa: E402
+from anthias_common.youtube import youtube_destination_path
+from anthias_server.app.models import Asset
+from anthias_server.lib import (
+    db_readiness,
+    diagnostics,
+    display_power,
+    soft_timeout_guard,
+    storage_watcher,
+    undervoltage_watcher,
+)
+from anthias_server.lib.telemetry import send_telemetry
+from anthias_server.settings import settings
 
+logger = logging.getLogger(__name__)
 
 __author__ = 'Screenly, Inc'
 __copyright__ = 'Copyright 2012-2026, Screenly, Inc'
@@ -57,6 +76,13 @@ CELERY_BROKER_URL = getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
 CELERY_TASK_RESULT_EXPIRES = timedelta(hours=6)
 
 r = connect_to_redis()
+
+# Must run before the worker forks its pool, which is why it sits at
+# import time next to the app rather than in a startup signal: the
+# children inherit the guard from this process. See the module
+# docstring for the race it closes.
+soft_timeout_guard.install()
+
 celery = Celery(
     'Anthias Celery Worker',
     backend=CELERY_RESULT_BACKEND,
@@ -111,12 +137,123 @@ RECONCILE_STUCK_LOCK_KEY = 'celery:reconcile_stuck_processing:lock'
 # back-to-back ffprobe runs (each up to 15s wall-clock under url_fails).
 RECHECK_COOLDOWN_S = 60
 
+# Time budget for a single on-demand probe. A legitimate worst case
+# under url_fails comfortably exceeds the previous 30s hard limit: a
+# hanging getaddrinfo against a broken resolver (no timeout knob
+# exists for it), then an HTTP HEAD (10s) plus the GET fallback
+# (10s). Tripping the *hard* limit SIGKILLs the pool child, which
+# Sentry reported as three separate issues per occurrence — the
+# "Hard time limit exceeded" error, the TimeLimitExceeded raise, and
+# the "ForkPoolWorker exited with signal 9" billiard log (ANTHIAS-A /
+# ANTHIAS-9 / ANTHIAS-B). The soft limit raises
+# ``SoftTimeLimitExceeded`` *inside* the task instead, which the task
+# records as an ordinary failed probe; the hard limit stays as the
+# backstop for a probe stuck in C code where the soft signal can't be
+# delivered.
+ASSET_RECHECK_SOFT_TIME_LIMIT_S = 60
+ASSET_RECHECK_TIME_LIMIT_S = 90
+
 # Hard ceiling on how long a single sweep is allowed to run. Set above
 # the periodic interval so a sweep that's running long doesn't get
 # guillotined while the next beat tick races to start a new one — the
 # Redis lock below is the primary overlap guard, the time_limit just
 # bounds pathological cases (broken DNS resolver, a stuck ffprobe).
 ASSET_REVALIDATION_TIME_LIMIT_S = 60 * 30
+
+# Soft companion to the sweep's hard limit: raise
+# ``SoftTimeLimitExceeded`` inside the loop a minute early so the
+# sweep can abort cleanly (release its lock, keep the rows updated so
+# far) instead of being SIGKILLed by the hard limit — the same
+# kill-versus-catch rationale as the on-demand probe limits above.
+ASSET_REVALIDATION_SOFT_TIME_LIMIT_S = ASSET_REVALIDATION_TIME_LIMIT_S - 60
+
+# Time budget for the lightweight periodic pokes — the display-power
+# CEC query and the telemetry POST. Both ran under a bare
+# ``time_limit=30`` and share the asset probe's failure mode: the CEC
+# query can wedge inside libcec, and the telemetry POST can stall in
+# getaddrinfo against a broken resolver (requests' ``timeout`` covers
+# connect/read but not DNS). Tripping the *hard* limit SIGKILLs the
+# pool child, which Sentry groups by the kill signature regardless of
+# task — so these two kept the ANTHIAS-A / ANTHIAS-9 / ANTHIAS-B trio
+# alive after #3017 fixed only the asset probe. The soft limit raises
+# ``SoftTimeLimitExceeded`` *inside* the task so it logs and skips the
+# tick cleanly; the hard limit stays as the backstop for a call stuck
+# in C code where the soft signal can't be delivered.
+PERIODIC_POKE_SOFT_TIME_LIMIT_S = 30
+PERIODIC_POKE_TIME_LIMIT_S = 60
+
+# Headroom between a media task's soft and hard time limit.
+#
+# Only the soft limit is survivable. It arrives as an exception inside
+# the task, so celery runs the task's ``on_failure`` — which is where
+# every media task clears ``is_processing`` and writes the row's error
+# message. The hard limit arrives as SIGKILL to the pool child: no
+# handler runs, the row is left at "Processing" with nothing to say
+# why, and the worker files three Sentry reports for the one event
+# (the hard-limit line, billiard's ``TimeLimitExceeded``, and the
+# ``signal 9 (SIGKILL)`` exit) before forking a replacement.
+#
+# So every bounded task wants both, with enough room between them for
+# the handler to finish one small SQLite write and a WebSocket nudge.
+# 30s is what #3180 used for the same purpose and is generous for that
+# work even on a Pi 1 under load.
+MEDIA_TASK_TIMEOUT_HEADROOM_S = 30
+
+# Normalisation ceilings. The image pass is Pillow work on one file;
+# the video pass is an ffprobe plus, at worst, a transcode handed off
+# to its own bounded helper.
+NORMALIZE_IMAGE_TIME_LIMIT_S = 300
+NORMALIZE_IMAGE_SOFT_TIME_LIMIT_S = (
+    NORMALIZE_IMAGE_TIME_LIMIT_S - MEDIA_TASK_TIMEOUT_HEADROOM_S
+)
+NORMALIZE_VIDEO_TIME_LIMIT_S = 120
+NORMALIZE_VIDEO_SOFT_TIME_LIMIT_S = (
+    NORMALIZE_VIDEO_TIME_LIMIT_S - MEDIA_TASK_TIMEOUT_HEADROOM_S
+)
+
+# How often the scheduled display-power tick runs. One minute is the
+# resolution of the schedule itself (times are HH:MM), so a coarser
+# interval would make the display switch late by up to that interval.
+DISPLAY_POWER_SCHEDULE_INTERVAL_S = 60
+
+# Redis key holding the last power state the scheduler actually applied
+# ('on'/'off'). The tick acts only when the desired state differs from
+# this, so a command goes out at the schedule boundary rather than every
+# single minute.
+DISPLAY_POWER_STATE_KEY = 'display_power_schedule_state'
+
+# ...but the key expires, so the state is re-asserted periodically.
+#
+# The viewer's blanked flag is an in-process global that is lost on
+# every viewer restart (OOM, upgrade, host reboot), and redis is
+# persisted across those restarts. Without an expiry, a viewer that
+# restarted at 22:00 would come back lit and playing while this key
+# still said 'off', and the tick would return early every minute until
+# morning — the screen stays on all night.
+#
+# Re-asserting is cheap and idempotent: a standby to an already-off TV
+# and a blank to an already-blank viewer are both no-ops. The cost is
+# that an operator who manually turns the screen on mid-off-period sees
+# it go back off within this window, which is the correct behaviour for
+# a schedule anyway.
+DISPLAY_POWER_STATE_TTL_S = 60 * 10
+
+# Time budget for the stuck-row reconciler sweep. It was the last
+# periodic task still carrying a bare ``time_limit=300`` with no soft
+# companion: its inner loop makes unbounded per-row calls (a SQLite
+# SELECT/UPDATE, a kombu ``.delay()`` publish to the Redis broker, and
+# ``r.set``/``r.eval``), so on a memory-pressured board a wedged Redis
+# publish or SQLite lock can push the sweep past 300s. Tripping the
+# *hard* limit SIGKILLs the pool child, which Sentry groups by the kill
+# signature — the same ANTHIAS-A / ANTHIAS-9 / ANTHIAS-B trio the sibling
+# pokes (#3017/#3063) already closed, leaving this task as the last
+# contributor. The soft limit raises ``SoftTimeLimitExceeded`` *inside*
+# the sweep so it aborts cleanly (releasing its Redis lock via the
+# existing ``finally``) and the next tick retries; the hard limit stays
+# as the backstop for a call stuck in C code where the soft signal can't
+# be delivered.
+RECONCILE_STUCK_TIME_LIMIT_S = 300
+RECONCILE_STUCK_SOFT_TIME_LIMIT_S = RECONCILE_STUCK_TIME_LIMIT_S - 30
 
 # Redis key for the sweep singleton lock. Whoever sets it first runs
 # the sweep; later beat ticks observe the key and exit. The TTL matches
@@ -164,6 +301,24 @@ def asset_recheck_lock_key(asset_id: str) -> str:
     return f'recheck:{asset_id}:lock'
 
 
+@worker_init.connect
+def wait_for_migrations(**kwargs: Any) -> None:
+    """Block worker startup until the server has applied migrations.
+
+    The celery container starts in parallel with anthias-server, whose
+    start script is still running its dbbackup → migrate pass (or the
+    dbrestore fallback, which drops and re-creates every table). A
+    task replayed off the Redis broker in that window dies with
+    ``OperationalError: no such table: assets`` (Sentry ANTHIAS-1 —
+    one burst per device on every upgrade/first boot). Tasks stay
+    queued in the broker while we wait, so nothing is lost — they run
+    as soon as the schema is in place.
+    """
+    db_readiness.wait_for_migrations(
+        description='celery worker startup', log=logger
+    )
+
+
 @celery.on_after_configure.connect
 def setup_periodic_tasks(sender: Any, **kwargs: Any) -> None:
     # Calls cleanup() every hour.
@@ -184,17 +339,225 @@ def setup_periodic_tasks(sender: Any, **kwargs: Any) -> None:
         reconcile_stuck_processing.s(),
         name='reconcile_stuck_processing',
     )
+    # Every minute, so a schedule boundary lands within 60s of the
+    # configured time. The task itself is nearly free when the schedule
+    # is disabled or the desired state has not changed.
+    sender.add_periodic_task(
+        DISPLAY_POWER_SCHEDULE_INTERVAL_S,
+        apply_display_power_schedule.s(),
+        name='display_power_schedule',
+    )
 
 
-@celery.task(time_limit=30)
+@worker_ready.connect
+def start_undervoltage_watcher(**kwargs: Any) -> None:
+    """Begin watching the hwmon under-voltage alarm.
+
+    ``worker_ready`` rather than ``worker_init``: the latter is
+    already occupied by ``wait_for_migrations``, which blocks
+    indefinitely, and handler ordering there is not guaranteed. The
+    watcher touches only sysfs and Redis, never the database, so
+    starting it after the migration wait costs nothing.
+
+    A no-op on hardware without the sensor, and it never raises: a
+    diagnostic that can take down the celery worker is worse than
+    the problem it reports.
+    """
+    try:
+        undervoltage_watcher.start(r)
+    except Exception:
+        logger.exception('Could not start the under-voltage watcher.')
+
+
+@worker_ready.connect
+def start_storage_watcher(**kwargs: Any) -> None:
+    """Begin watching the storage the device runs from.
+
+    Same placement and same reasoning as the under-voltage watcher
+    above: ``worker_ready`` because ``worker_init`` is occupied by
+    ``wait_for_migrations``, and swallowing the exception because a
+    diagnostic that can take down the celery worker is worse than
+    the problem it reports.
+
+    Pointed at the config directory rather than left to its own
+    default so the watcher measures the filesystem Anthias actually
+    depends on -- the one holding the SQLite database -- whatever
+    ``HOME`` happens to be in this container.
+    """
+    try:
+        storage_watcher.start(r, settings.get_configdir())
+    except Exception:
+        logger.exception('Could not start the storage-health watcher.')
+
+
+@celery.task(
+    soft_time_limit=PERIODIC_POKE_SOFT_TIME_LIMIT_S,
+    time_limit=PERIODIC_POKE_TIME_LIMIT_S,
+)
 def get_display_power() -> None:
-    r.set('display_power', diagnostics.get_display_power())
-    r.expire('display_power', 3600)
+    # diagnostics.get_display_power() returns ``str | bool`` — bool for a
+    # clean on/off reading, str for every diagnostic case. redis-py
+    # refuses a bool outright (``DataError: Invalid input of type:
+    # 'bool'``), so every *successful* power query used to crash this task
+    # and leave the key unset (Sentry ANTHIAS-2C); the ``str()`` below is
+    # what fixes that and is load-bearing, not decorative. The v2 System
+    # Info API exposes ``display_power`` as ``string | null`` and passes
+    # the value through, so 'True'/'False' and the diagnostic strings all
+    # fit. (Copilot review of #3264 caught this comment claiming the
+    # function had been changed to return str always — it was not.)
+    #
+    # Boards with no CEC adapter at all (x86 without a dongle) record a
+    # clear 'Not available' rather than asking. cec_available() is a
+    # single redis GET of the fact the viewer publishes at startup — it
+    # no longer counts /dev/vchiq and no longer probes device nodes from
+    # this container, so the boards that used to burn a full 10s libcec
+    # timeout on every tick (#3267) take this branch for free instead.
+    #
+    # The short-circuit is now a correctness nicety rather than a
+    # necessity: the query below is a redis round trip to the viewer,
+    # not a subprocess, so skipping it saves one hop rather than ten
+    # seconds. It stays because 'Not available' is a more honest reading
+    # than whatever a device with no hardware would report.
+    try:
+        if not diagnostics.cec_available():
+            # This SET used to sit outside the handler below, which made
+            # it the one unprotected blocking call in the task — on
+            # exactly the boards that take this branch (x86, Pi 5).
+            #
+            # It is not unbounded: redis-py 8.0.1 defaults
+            # socket_timeout=5. But the default Retry(retries=10) means a
+            # blackhole redis costs 11 x 5s plus backoff — measured at
+            # 58.83s on the x86 testbed. That blows the 30s soft limit
+            # and clears the 60s hard limit by only ~1.2s, and because
+            # the call was outside the try the soft limit escaped
+            # uncaught, failing the task and filing a Sentry event: the
+            # very noise this change set is removing.
+            r.set('display_power', 'Not available', ex=3600)
+            return
+        # Single SET with ex= so the value and its TTL are written
+        # atomically — a soft-limit signal landing between a separate
+        # SET and EXPIRE would otherwise leave the key without a TTL
+        # (a stale display_power that never expires).
+        r.set('display_power', str(diagnostics.get_display_power()), ex=3600)
+    except SoftTimeLimitExceeded:
+        # The CEC query bounds itself (each operation runs under
+        # lib.cec's own wall-clock guard, and the kernel bounds every
+        # transmit), so reaching this handler now points at redis rather
+        # than at CEC. Skip the tick either way rather than let the hard
+        # limit SIGKILL the worker (ANTHIAS-A / 9 / B); the next beat
+        # tick re-queries.
+        logger.warning(
+            'get_display_power: CEC query exceeded %ss; skipping this tick',
+            PERIODIC_POKE_SOFT_TIME_LIMIT_S,
+        )
 
 
-@celery.task(time_limit=30)
+@celery.task(
+    soft_time_limit=PERIODIC_POKE_SOFT_TIME_LIMIT_S,
+    time_limit=PERIODIC_POKE_TIME_LIMIT_S,
+)
+def apply_display_power_schedule() -> None:
+    """Turn the display on/off per the operator's daily schedule.
+
+    Edge-triggered: the desired state is compared against the last state
+    the scheduler applied (in Redis) and a command only goes out when
+    they differ. Re-asserting every minute would spam the CEC bus and,
+    worse, fight an operator who deliberately switched the screen on
+    outside its hours.
+    """
+    # Imported inside the task, matching the other Django-touching
+    # tasks in this module — see the app-registry note at the top.
+    from django.utils import timezone
+
+    try:
+        settings.load()
+        if not settings['display_power_schedule_enabled']:
+            # Turning the schedule off must not strand a screen the
+            # schedule had already switched off. Nothing else would ever
+            # bring it back: the manual controls are CEC-only and hidden
+            # entirely on a device with no CEC adapter, so a plain
+            # monitor would stay black with no way out of the UI.
+            if _decoded(r.get(DISPLAY_POWER_STATE_KEY)) == 'off':
+                display_power.apply_power(True)
+                logger.info(
+                    'Display power schedule disabled while off; '
+                    'restoring the display'
+                )
+            r.delete(DISPLAY_POWER_STATE_KEY)
+            return
+
+        desired = display_power.should_be_on(
+            timezone.localtime(),
+            display_power.parse_hhmm(settings['display_power_on_time']),
+            display_power.parse_hhmm(settings['display_power_off_time']),
+            display_power.parse_days(settings['display_power_days']),
+        )
+        if desired is None:
+            # Unusable schedule (missing or identical times). Leave the
+            # display alone rather than guessing at the operator's
+            # intent.
+            return
+
+        wanted = 'on' if desired else 'off'
+        if _decoded(r.get(DISPLAY_POWER_STATE_KEY)) == wanted:
+            return
+
+        how = display_power.apply_power(desired)
+        # Recorded only after the command was actually issued, so a
+        # failure mid-way (including a contended CEC bus, which raises)
+        # retries on the next tick instead of being latched as done.
+        r.set(DISPLAY_POWER_STATE_KEY, wanted, ex=DISPLAY_POWER_STATE_TTL_S)
+        logger.info('Display power schedule: turned %s via %s', wanted, how)
+    except SoftTimeLimitExceeded:
+        logger.warning(
+            'apply_display_power_schedule exceeded %ss; skipping this tick',
+            PERIODIC_POKE_SOFT_TIME_LIMIT_S,
+        )
+    except Exception:
+        # Deliberately warning, not exception: this runs every 60s, and
+        # because a failure does not latch the state the next tick
+        # retries immediately. Letting it raise would file an ERROR (and
+        # so a Sentry event) every single minute for as long as the
+        # underlying fault lasts — the same runaway-noise pattern
+        # #3017/#3063 removed from the sibling periodic tasks. The
+        # warning still reaches journald for diagnosis.
+        logger.warning(
+            'apply_display_power_schedule failed; will retry next tick',
+            exc_info=True,
+        )
+
+
+def _decoded(value: Any) -> str | None:
+    """Normalise a redis-py reply to ``str``.
+
+    ``decode_responses`` is not guaranteed to be set on the shared
+    connection, so the reply may arrive as ``bytes``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode('utf-8', errors='replace')
+    return str(value)
+
+
+@celery.task(
+    soft_time_limit=PERIODIC_POKE_SOFT_TIME_LIMIT_S,
+    time_limit=PERIODIC_POKE_TIME_LIMIT_S,
+)
 def send_telemetry_task() -> None:
-    send_telemetry()
+    try:
+        send_telemetry()
+    except SoftTimeLimitExceeded:
+        # requests' timeout doesn't cover a getaddrinfo stall against
+        # a broken resolver, so the POST can outlive the soft budget.
+        # Skip this tick instead of being SIGKILLed by the hard limit
+        # (ANTHIAS-A / 9 / B); send_telemetry didn't set its cooldown,
+        # so the next beat tick retries.
+        logger.warning(
+            'send_telemetry_task: telemetry POST exceeded %ss; '
+            'skipping this tick',
+            PERIODIC_POKE_SOFT_TIME_LIMIT_S,
+        )
 
 
 @celery.task
@@ -216,6 +579,21 @@ def cleanup() -> None:
         '+60',
         '-delete',
     )
+
+    # Partial chunked uploads, renamed out on the final chunk; see
+    # STAGED_UPLOAD_MAX_AGE_MIN.
+    staged_dir = path.join(asset_dir, STAGED_UPLOAD_DIR)
+    if path.isdir(staged_dir):
+        sh.find(
+            staged_dir,
+            '-name',
+            '*.part',
+            '-type',
+            'f',
+            '-mmin',
+            f'+{STAGED_UPLOAD_MAX_AGE_MIN}',
+            '-delete',
+        )
 
     # Orphaned asset files: forum 6636 / GH #2657. Asset rows can be
     # deleted while their file lingers (e.g. URI didn't match assetdir
@@ -260,7 +638,7 @@ def cleanup() -> None:
                 continue
             os.remove(entry.path)
         except OSError as e:
-            logging.warning('cleanup: could not remove %s: %s', entry.path, e)
+            logger.warning('cleanup: could not remove %s: %s', entry.path, e)
 
 
 class _ProbeVideoTask(Task):  # type: ignore[type-arg]
@@ -296,15 +674,24 @@ class _ProbeVideoTask(Task):  # type: ignore[type-arg]
 
             notify_asset_update(asset_id)
         except Exception:
-            logging.exception(
+            logger.exception(
                 'probe_video_duration on_failure cleanup failed for %s',
                 asset_id,
             )
 
 
+# ffprobe bounds itself (``_FFPROBE_TIMEOUT_S``); this is the wrapper's
+# own ceiling, covering the row lookup and write around it.
+PROBE_VIDEO_TIME_LIMIT_S = 120
+PROBE_VIDEO_SOFT_TIME_LIMIT_S = (
+    PROBE_VIDEO_TIME_LIMIT_S - MEDIA_TASK_TIMEOUT_HEADROOM_S
+)
+
+
 @celery.task(
     base=_ProbeVideoTask,
-    time_limit=120,
+    time_limit=PROBE_VIDEO_TIME_LIMIT_S,
+    soft_time_limit=PROBE_VIDEO_SOFT_TIME_LIMIT_S,
     autoretry_for=(sh.TimeoutException, sh.ErrorReturnCode, OSError),
     retry_backoff=10,
     retry_backoff_max=300,
@@ -353,7 +740,7 @@ def probe_video_duration(asset_id: str) -> None:
     except (sh.TimeoutException, sh.ErrorReturnCode, OSError):
         raise
     except Exception:
-        logging.exception(
+        logger.exception(
             'probe_video_duration: unexpected failure for %s', asset_id
         )
         td = None
@@ -377,25 +764,24 @@ def probe_video_duration(asset_id: str) -> None:
     notify_asset_update(asset_id)
 
 
-class _DownloadYoutubeTask(Task):  # type: ignore[type-arg]
-    """Custom Task subclass that funnels failures through the same
-    metadata-error contract as ``_NormalizeAssetTask``.
+class _DownloadAssetTask(Task):  # type: ignore[type-arg]
+    """Shared ``on_failure`` for the download tasks (YouTube +
+    generic remote video).
 
-    Sharing the failure path means a failed YouTube download lands in
-    the same operator-visible state as a failed HEIC conversion or
-    failed video transcode: ``is_processing=False`` *and* a populated
-    ``metadata.error_message`` that the asset table renders as a
-    "Failed" pill (with the message on the hover tooltip). Without
-    that unification, a yt-dlp DownloadError would clear the
-    Processing pill but leave no on-row diagnostic — the operator
-    couldn't tell a fresh download from a 404'd one.
+    Both surface a permanent failure to the operator the same way a
+    failed HEIC conversion does: ``is_processing=False`` and a
+    populated ``metadata.error_message`` that the asset table renders
+    as a "Failed" pill with the message on the hover tooltip. Without
+    that unification, a yt-dlp DownloadError (or a ``RemoteVideoDownload
+    Error``) would clear the Processing pill but leave no on-row
+    diagnostic — the operator couldn't tell a fresh download from a
+    404'd one.
 
-    The previous in-process daemon thread swallowed yt-dlp's exit
-    code, so a failed download silently left the row stuck at
-    "Processing" with an empty .mp4. Now any uncaught exception
-    (DownloadError, ExtractorError, ...) bubbles to celery and lands
-    here once retries are exhausted.
+    Subclasses override ``_failure_log_prefix`` so the worker log line
+    names the actual task that failed.
     """
+
+    _failure_log_prefix: str = 'download_asset'
 
     def on_failure(
         self,
@@ -409,23 +795,62 @@ class _DownloadYoutubeTask(Task):  # type: ignore[type-arg]
         if not asset_id:
             return
         try:
-            # Reuse the helpers in anthias_server.processing so the
-            # YouTube and normalize pipelines share the exact same
+            # Reuse the helpers in anthias_server.processing so every
+            # download / normalize task shares the exact same
             # "row failed" semantics — single source of truth for the
-            # error_message contract instead of two near-duplicate
-            # blocks that could drift.
+            # error_message contract instead of near-duplicate blocks
+            # that could drift.
             from anthias_server.processing import (
                 _notify,
                 _set_processing_error,
+                describe_task_failure,
             )
 
-            _set_processing_error(asset_id, f'{type(exc).__name__}: {exc}')
+            _set_processing_error(asset_id, describe_task_failure(exc))
             _notify(asset_id)
         except Exception:
-            logging.exception(
-                'download_youtube_asset on_failure cleanup failed for %s',
+            logger.exception(
+                '%s on_failure cleanup failed for %s',
+                self._failure_log_prefix,
                 asset_id,
             )
+
+
+class YoutubeDownloadError(Exception):
+    """Raised by ``download_youtube_asset`` when yt-dlp cannot deliver
+    the video.
+
+    The YouTube counterpart of ``RemoteVideoDownloadError``: the causes
+    yt-dlp reports (403, 404, age-gate, geo-block, deleted video, an
+    origin read timing out) are properties of the *URL the operator
+    pasted*, not faults in Anthias. They already land on
+    ``_DownloadAssetTask.on_failure``, which clears the Processing pill
+    and writes the message onto the row — the operator's answer is the
+    row, not an alert.
+
+    Having our own type is what lets the task list it in ``throws``:
+    sentry-sdk's CeleryIntegration skips ``task.throws`` exceptions and
+    Celery stops logging them at ERROR with a traceback, so a routine
+    YouTube rejection stops being reported as a crash. Wrapping is
+    needed because ``yt_dlp.utils.DownloadError`` can only be imported
+    by pulling in the whole yt-dlp package (hundreds of extractors),
+    which the task body deliberately defers to call time.
+    """
+
+
+class _DownloadYoutubeTask(_DownloadAssetTask):
+    """YouTube-specific download task. See ``_DownloadAssetTask`` for
+    the failure contract.
+
+    The previous in-process daemon thread swallowed yt-dlp's exit
+    code, so a failed download silently left the row stuck at
+    "Processing" with an empty .mp4. Now any uncaught exception
+    (``YoutubeDownloadError``, and anything yt-dlp raises outside its
+    own error handling) bubbles to celery and lands on the inherited
+    ``on_failure`` once retries are exhausted.
+    """
+
+    _failure_log_prefix = 'download_youtube_asset'
 
 
 # Bound the wall-clock cost of a single download attempt. 1080p videos
@@ -433,11 +858,15 @@ class _DownloadYoutubeTask(Task):  # type: ignore[type-arg]
 # generous ceiling that still fails fast enough for the operator to
 # notice via the "Processing" pill not clearing.
 YOUTUBE_DOWNLOAD_TIME_LIMIT_S = 60 * 15
+YOUTUBE_DOWNLOAD_SOFT_TIME_LIMIT_S = (
+    YOUTUBE_DOWNLOAD_TIME_LIMIT_S - MEDIA_TASK_TIMEOUT_HEADROOM_S
+)
 
 
 @celery.task(
     base=_DownloadYoutubeTask,
     time_limit=YOUTUBE_DOWNLOAD_TIME_LIMIT_S,
+    soft_time_limit=YOUTUBE_DOWNLOAD_SOFT_TIME_LIMIT_S,
     # Transient OSError covers IO-level hiccups (disk pressure,
     # connection reset surfacing as ConnectionResetError which is an
     # OSError). yt-dlp's own DownloadError is *not* retried: its
@@ -445,6 +874,11 @@ YOUTUBE_DOWNLOAD_TIME_LIMIT_S = 60 * 15
     # signature extraction breakage) are permanent and re-running
     # just burns the worker. Let on_failure clean up.
     autoretry_for=(OSError,),
+    # The operator-facing rejection — see ``YoutubeDownloadError``.
+    # ``on_failure`` still runs, so the row still shows the Failed pill
+    # with yt-dlp's message; this only stops a 403 on someone's
+    # pasted URL being reported as an Anthias crash.
+    throws=(YoutubeDownloadError,),
     retry_backoff=15,
     retry_backoff_max=300,
     retry_jitter=True,
@@ -514,15 +948,21 @@ def download_youtube_asset(asset_id: str, uri: str) -> None:
     from yt_dlp import YoutubeDL
     from yt_dlp.utils import DownloadError
 
+    from anthias_server.processing import preferred_download_vcodec
+
     ydl_opts = {
-        # ``format_sort`` mirrors the previous CLI's `-S
-        # vcodec:h264,fps,res:1080,acodec:m4a` — bias toward h264
-        # video and m4a audio, keep resolution at 1080p, prefer
-        # higher fps. yt-dlp still picks the *best matching* format,
-        # falling back to whatever is available if no exact match
-        # exists. Strict `format=` filters would reject videos that
-        # happen to have only vp9, which we don't want.
-        'format_sort': ['vcodec:h264', 'fps', 'res:1080', 'acodec:m4a'],
+        # ``format_sort`` biases toward the board's preferred codec,
+        # m4a audio, 1080p resolution, and higher fps. yt-dlp still
+        # picks the *best matching* format, falling back to whatever
+        # is available if no exact match exists. Strict ``format=``
+        # filters would reject videos that only have other codecs,
+        # which we don't want — normalize_video_asset handles that.
+        'format_sort': [
+            f'vcodec:{preferred_download_vcodec()}',
+            'fps',
+            'res:1080',
+            'acodec:m4a',
+        ],
         # Final filename — yt-dlp writes <location>.part during the
         # download and renames on success. cleanup() recognises
         # .part / .info.json sidecars and skips them inside the 1h
@@ -540,13 +980,17 @@ def download_youtube_asset(asset_id: str, uri: str) -> None:
         'noplaylist': True,
     }
 
+    # DownloadError is a permanent failure that bubbles to on_failure;
+    # autoretry_for excludes it specifically, so it is never retried.
+    # It is re-raised as YoutubeDownloadError purely so the task's
+    # ``throws`` can name it without importing yt-dlp at module scope —
+    # the message (and therefore the operator's Failed pill) is
+    # unchanged.
     try:
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(uri, download=True)
-    except DownloadError:
-        # Permanent failure surface — let it bubble to on_failure.
-        # autoretry_for excludes DownloadError specifically.
-        raise
+    except DownloadError as exc:
+        raise YoutubeDownloadError(str(exc)) from exc
 
     if info is None:
         # Should not happen with a successful extract_info, but
@@ -554,7 +998,7 @@ def download_youtube_asset(asset_id: str, uri: str) -> None:
         # row with a stale name and stale duration. on_failure path
         # via the explicit raise gives the operator the same
         # clear-flag-and-stop signal as a download error.
-        raise DownloadError(f'yt-dlp returned no info for {uri!r}')
+        raise YoutubeDownloadError(f'yt-dlp returned no info for {uri!r}')
 
     # ``noplaylist=True`` collapses single-video extractions; for
     # the playlist edge cases yt-dlp falls through to, the first
@@ -637,34 +1081,397 @@ def download_youtube_asset(asset_id: str, uri: str) -> None:
     dispatch_normalize_video(asset_id)
 
 
-@celery.task
+# ---------------------------------------------------------------------------
+# download_remote_video_asset — generic http(s) single-file video URLs
+# ---------------------------------------------------------------------------
+#
+# Mirrors the YouTube lifecycle for any ``http(s)://…`` URL whose
+# extension or Content-Type identifies it as a downloadable video
+# container (mp4 / webm / mov / mkv / ...). The serializer flips the
+# row to ``is_processing=True`` and points ``Asset.uri`` at a local
+# destination path; this task fetches the file, stamps metadata, and
+# chains into ``normalize_video_asset`` for the per-board HW-codec
+# gate — the same path YouTube downloads already follow. The win is
+# uniformity: a 4K H.264 URL on a Pi 5 no longer silently SW-decodes
+# at rotation time, origin downtime no longer turns into mid-rotation
+# black-screen slots, and operators see codec/dims/fps in the asset
+# table.
+#
+# Live streams (HLS / DASH / RTSP) are excluded by the serializer's
+# classify step — they reach this task only via mis-routing, which
+# the explicit Content-Type guard below catches and rejects.
+
+
+# Wall-clock cap on a single download attempt. Matches
+# YOUTUBE_DOWNLOAD_TIME_LIMIT_S so an operator who pastes a 1080p
+# clip URL gets the same patience as a YouTube link.
+REMOTE_VIDEO_DOWNLOAD_TIME_LIMIT_S = 60 * 15
+REMOTE_VIDEO_DOWNLOAD_SOFT_TIME_LIMIT_S = (
+    REMOTE_VIDEO_DOWNLOAD_TIME_LIMIT_S - MEDIA_TASK_TIMEOUT_HEADROOM_S
+)
+
+# Hard ceiling on the downloaded file size. 5 GiB covers >99% of
+# legitimate signage content (a 2-hour 4K H.264 at 5 Mbps is ~4.5 GB;
+# typical 5-minute 1080p clips are ~150 MB). The cap is enforced
+# *during* the stream — a malicious or misconfigured origin can't
+# blow out the device's SD card by advertising a small file and then
+# serving terabytes. Exceeding the cap raises a hard error so the
+# operator sees the row land as Failed with a clear message, rather
+# than silently truncating to the cap.
+REMOTE_VIDEO_MAX_BYTES = 5 * 1024**3
+
+# Connect / read timeouts. The connect timeout is short because a
+# legitimate origin establishes the TCP + TLS handshake in well under
+# a second; a 15s ceiling tolerates a slow DNS resolver or a sleepy
+# CDN edge. The read timeout is per-chunk — a stalled stream that
+# doesn't send any bytes for 60s gets killed rather than tying up
+# the worker for the full 15-minute time_limit.
+REMOTE_VIDEO_CONNECT_TIMEOUT_S = 15
+REMOTE_VIDEO_READ_TIMEOUT_S = 60
+
+# Chunk size for the streaming download. 1 MiB is the sweet spot for
+# the Pi-class SD-card writer: smaller chunks add per-write syscall
+# overhead, larger chunks tie up RAM that could be feeding the
+# kernel page cache. Same value used elsewhere in the codebase for
+# bulk file IO.
+_REMOTE_VIDEO_CHUNK_BYTES = 1024 * 1024
+
+# Manifest Content-Types we explicitly reject at GET time even though
+# the upfront HEAD probe in the serializer should have caught them.
+# Some origins serve different headers on HEAD vs GET (HEAD returns
+# 200 with ``video/mp4``, GET returns 200 with
+# ``application/vnd.apple.mpegurl``) — defence in depth rather than
+# trust the serializer's upstream classify.
+_REMOTE_VIDEO_MANIFEST_CONTENT_TYPES = frozenset(
+    {
+        'application/vnd.apple.mpegurl',
+        'application/x-mpegurl',
+        'application/dash+xml',
+    }
+)
+
+
+# Module-level session — same UA convention as the HEAD probe in
+# ``anthias_common.remote_video``. Tests patch ``_session.get``.
+# Lazy import so the symbol resolves after Django's apps_ready.
+from anthias_common.http import AnthiasSession
+
+_session = AnthiasSession()
+
+
+class RemoteVideoDownloadError(Exception):
+    """Raised by ``download_remote_video_asset`` for permanent
+    failures the operator needs to see on the row.
+
+    Covers: non-2xx HTTP response, wrong Content-Type, file exceeded
+    the size cap, zero-byte response. All four are conditions where
+    retrying would just keep failing — the row lands on
+    ``on_failure`` and the operator sees the message on the Failed
+    pill's hover tooltip.
+    """
+
+
+def _validate_remote_video_response(resp: Any, uri: str) -> None:
+    """Reject non-2xx responses, manifest Content-Types, and anything
+    that isn't ``video/*`` / ``application/octet-stream`` / empty.
+
+    Extracted from ``download_remote_video_asset`` so the task body
+    stays under SonarCloud's cognitive-complexity ceiling. The serializer
+    pre-classifies via HEAD, but some origins return different headers
+    on HEAD vs GET — these checks are the second line of defence.
+    """
+    if resp.status_code >= 400:
+        raise RemoteVideoDownloadError(
+            f'HTTP {resp.status_code} fetching {uri!r}'
+        )
+    content_type = (resp.headers.get('Content-Type') or '').lower()
+    base_type = content_type.split(';', 1)[0].strip()
+    if base_type in _REMOTE_VIDEO_MANIFEST_CONTENT_TYPES:
+        raise RemoteVideoDownloadError(
+            f'origin served streaming manifest '
+            f'({base_type!r}) instead of a downloadable file; '
+            'live streams are not auto-downloaded'
+        )
+    # Accept ``video/*`` and ``application/octet-stream`` (some CDNs
+    # serve video files this way). Reject everything else, including
+    # an empty Content-Type. Well-behaved origins always send one; a
+    # missing header is a stronger signal of a misbehaving origin
+    # than evidence of a real video — and accepting it would let an
+    # HTML error page land on disk as a multi-GB asset, where the
+    # row stays orphaned because the cleanup() sweep won't touch a
+    # file that's still referenced by an (errored) row.
+    if (
+        base_type.startswith('video/')
+        or base_type == 'application/octet-stream'
+    ):
+        return
+    raise RemoteVideoDownloadError(
+        f'unexpected Content-Type {base_type!r} from {uri!r}; '
+        'expected video/* or application/octet-stream'
+    )
+
+
+def _stream_remote_video_to_file(uri: str, staging: str) -> None:
+    """Fetch *uri* with the module-level session and stream it to
+    *staging*, enforcing the size cap and validating the response
+    headers. Raises ``RemoteVideoDownloadError`` on permanent
+    failures and lets transient ``OSError`` /
+    ``requests.RequestException`` (a subclass of ``OSError``)
+    propagate for the caller's ``autoretry_for``.
+
+    Caller is responsible for cleaning up the partial staging file
+    on any exception path.
+    """
+    with _session.get(
+        uri,
+        stream=True,
+        allow_redirects=True,
+        timeout=(
+            REMOTE_VIDEO_CONNECT_TIMEOUT_S,
+            REMOTE_VIDEO_READ_TIMEOUT_S,
+        ),
+    ) as resp:
+        _validate_remote_video_response(resp, uri)
+        written = 0
+        with open(staging, 'wb') as fh:
+            for chunk in resp.iter_content(
+                chunk_size=_REMOTE_VIDEO_CHUNK_BYTES
+            ):
+                if not chunk:
+                    # iter_content yields empty bytes for keep-alive
+                    # padding on some servers; skip rather than
+                    # treating as EOF.
+                    continue
+                written += len(chunk)
+                if written > REMOTE_VIDEO_MAX_BYTES:
+                    raise RemoteVideoDownloadError(
+                        f'download exceeded size cap of '
+                        f'{REMOTE_VIDEO_MAX_BYTES} bytes for {uri!r}'
+                    )
+                fh.write(chunk)
+        if written == 0:
+            raise RemoteVideoDownloadError(
+                f'origin returned zero bytes for {uri!r}'
+            )
+
+
+class _DownloadRemoteVideoTask(_DownloadAssetTask):
+    """Generic remote-video download task. Inherits the failure
+    contract from ``_DownloadAssetTask`` — only the log prefix
+    differs.
+    """
+
+    _failure_log_prefix = 'download_remote_video_asset'
+
+
+@celery.task(
+    base=_DownloadRemoteVideoTask,
+    time_limit=REMOTE_VIDEO_DOWNLOAD_TIME_LIMIT_S,
+    soft_time_limit=REMOTE_VIDEO_DOWNLOAD_SOFT_TIME_LIMIT_S,
+    # Transient network / IO hiccups retry; permanent classes
+    # (RemoteVideoDownloadError covers HTTP 4xx, content-type
+    # mismatch, size cap) bubble straight to on_failure.
+    autoretry_for=(OSError,),
+    retry_backoff=15,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    max_retries=2,
+)
+def download_remote_video_asset(asset_id: str, uri: str) -> None:
+    """Fetch *uri* into the row's persisted ``Asset.uri`` and chain
+    into ``normalize_video_asset``.
+
+    The row is created upstream with ``mimetype='video'``,
+    ``is_processing=True``, and ``uri`` pointing at
+    ``<assetdir>/<asset_id>.<ext>`` (the eventual local path). On
+    success this task lands the file at that path, stamps
+    ``metadata['source']='remote_url'`` so the origin URL is
+    recoverable after a row edit, then dispatches
+    ``normalize_video_asset`` for the per-board HW-codec gate. The
+    row stays ``is_processing=True`` across the chain so the table
+    shows a single Processing → Done transition.
+
+    Failure surface:
+      * non-2xx response → ``RemoteVideoDownloadError`` → on_failure
+        writes ``metadata.error_message`` and clears the flag.
+      * wrong Content-Type on GET (manifest, HTML error page) →
+        same.
+      * downloaded bytes > ``REMOTE_VIDEO_MAX_BYTES`` → same.
+      * transient network / IO hiccup → ``autoretry_for`` retries
+        twice with backoff; persistent failure lands on on_failure.
+
+    Cleans up ``.part`` on every failure path so a partially-written
+    download doesn't linger as orphan content for the cleanup sweep
+    to deal with an hour later.
+    """
+    try:
+        asset = Asset.objects.get(asset_id=asset_id)
+    except Asset.DoesNotExist:
+        return
+
+    if not asset.is_processing:
+        # Already finalised by a previous invocation, or operator-
+        # edited. Don't re-download or clobber state.
+        return
+
+    # The serializer stamps ``Asset.uri`` at the eventual local
+    # destination path before dispatching this task (the extension
+    # is picked from the URL or the HEAD probe's Content-Type).
+    # Trust that value rather than recomputing — recomputing the
+    # extension here from the URL alone would diverge from what
+    # the serializer chose for a HEAD-probed extensionless URL
+    # (``video/webm`` → ``.webm`` at the serializer vs. ``.mp4``
+    # default here). A row reaching this task with an empty uri is
+    # a programming error (broken dispatch site, hand-edited row),
+    # not something to paper over with a guess.
+    if not asset.uri:
+        raise RemoteVideoDownloadError(
+            f'asset {asset_id!r} has no destination uri — refusing '
+            'to download without a serializer-stamped path'
+        )
+    location = asset.uri
+    staging = f'{location}.part'
+
+    # Stream the response, then atomically swap into place. Both
+    # phases share the cleanup contract: a partial ``.part`` left
+    # behind would otherwise wait for the hourly ``cleanup()`` sweep
+    # to clear — meanwhile an operator's next upload could trip a
+    # "disk full" if the partial was multi-GB. ``OSError`` covers
+    # both filesystem failures and ``requests.RequestException``
+    # (which is an ``IOError``/``OSError`` subclass), so the single
+    # ``except OSError`` re-raise is sufficient for the
+    # ``autoretry_for`` to pick up.
+    try:
+        _stream_remote_video_to_file(uri, staging)
+        os.replace(staging, location)
+    except (OSError, RemoteVideoDownloadError):
+        try:
+            os.remove(staging)
+        except OSError:
+            pass
+        raise
+
+    metadata = dict(asset.metadata or {})
+    metadata.update(
+        {
+            'source': 'remote_url',
+            'source_url': uri,
+        }
+    )
+    metadata.pop('error_message', None)
+
+    update: dict[str, Any] = {
+        # ``is_processing`` deliberately stays True — the chained
+        # normalize_video_asset below clears it once its probe
+        # finishes. Single Processing → Done transition reads
+        # better than the previous two-step.
+        'metadata': metadata,
+    }
+    # Same uri-backfill rule as download_youtube_asset: write the
+    # row's uri only if it was empty on entry, otherwise leave the
+    # operator-set value alone.
+    if not asset.uri:
+        update['uri'] = location
+    Asset.objects.filter(asset_id=asset_id).update(**update)
+
+    from anthias_server.processing import (
+        _notify,
+        dispatch_normalize_video,
+    )
+
+    # Dashboard nudge so the operator's table picks up the row's
+    # progress without waiting for the 5s poll. Viewer reload is
+    # deferred to the normalize chain (same as YouTube) — the row is
+    # still ``is_processing=True`` and the on-device viewer would
+    # just reload to a row it can't display.
+    _notify(asset_id, reload_viewer=False)
+
+    dispatch_normalize_video(asset_id)
+
+
+# Retry budget for the balena supervisor power commands. The
+# supervisor is routinely down for a stretch exactly when these fire —
+# a reboot often follows an OTA apply, which restarts the supervisor
+# itself — so the old 5 x 1s window was far too tight and the task
+# died in an unhandled RetryError with the command silently dropped
+# (Sentry ANTHIAS-3F). Each HTTP attempt is individually bounded so a
+# hung supervisor socket can't pin the worker, and the task-level
+# limits below stay comfortably above window + one full attempt as
+# the SIGKILL backstop.
+SUPERVISOR_CMD_RETRY_WINDOW_S = 120
+SUPERVISOR_CMD_REQUEST_TIMEOUT_S = 10
+SUPERVISOR_CMD_WAIT_MAX_S = 15
+SUPERVISOR_CMD_SOFT_TIME_LIMIT_S = (
+    SUPERVISOR_CMD_RETRY_WINDOW_S + 2 * SUPERVISOR_CMD_REQUEST_TIMEOUT_S
+)
+SUPERVISOR_CMD_TIME_LIMIT_S = SUPERVISOR_CMD_SOFT_TIME_LIMIT_S + 30
+
+
+def _run_supervisor_command(command: Any, action: str) -> None:
+    """Post a power command to the balena supervisor, retrying with
+    backoff while it's down/restarting. Terminal failure is logged at
+    warning — a down supervisor is an expected transient (the operator
+    can retry from the UI), not a crash worth a Sentry event.
+    """
+    try:
+        for attempt in Retrying(
+            stop=stop_after_delay(SUPERVISOR_CMD_RETRY_WINDOW_S),
+            wait=wait_exponential(multiplier=1, max=SUPERVISOR_CMD_WAIT_MAX_S),
+            # Only transport/HTTP failures are retryable. Anything
+            # else (a TypeError, celery's SoftTimeLimitExceeded)
+            # must propagate immediately instead of being masked as
+            # "supervisor didn't accept the command" — retrying it
+            # would also pin the worker until the hard limit.
+            retry=retry_if_exception_type(
+                requests.exceptions.RequestException
+            ),
+        ):
+            with attempt:
+                response = command(timeout=SUPERVISOR_CMD_REQUEST_TIMEOUT_S)
+                # A 5xx from a half-started supervisor must retry too,
+                # not read as "command accepted".
+                response.raise_for_status()
+    except RetryError as exc:
+        # Surface the terminal failure's cause (connection refused vs
+        # an HTTP 503, say) — it's the difference between "supervisor
+        # restarting" and "supervisor misconfigured" when diagnosing.
+        last_error = exc.last_attempt.exception()
+        logger.warning(
+            'Balena supervisor did not accept the %s command within '
+            '%s seconds (last error: %r); giving up. The supervisor '
+            'may be restarting (e.g. mid-OTA) — retry from the UI if '
+            'the device does not %s on its own.',
+            action,
+            SUPERVISOR_CMD_RETRY_WINDOW_S,
+            last_error,
+            action,
+        )
+
+
+@celery.task(
+    soft_time_limit=SUPERVISOR_CMD_SOFT_TIME_LIMIT_S,
+    time_limit=SUPERVISOR_CMD_TIME_LIMIT_S,
+)
 def reboot_anthias() -> None:
     """
     Background task to reboot Anthias
     """
     if is_balena_app():
-        for attempt in Retrying(
-            stop=stop_after_attempt(5),
-            wait=wait_fixed(1),
-        ):
-            with attempt:
-                reboot_via_balena_supervisor()
+        _run_supervisor_command(reboot_via_balena_supervisor, 'reboot')
     else:
         r.publish('hostcmd', 'reboot')
 
 
-@celery.task
+@celery.task(
+    soft_time_limit=SUPERVISOR_CMD_SOFT_TIME_LIMIT_S,
+    time_limit=SUPERVISOR_CMD_TIME_LIMIT_S,
+)
 def shutdown_anthias() -> None:
     """
     Background task to shutdown Anthias
     """
     if is_balena_app():
-        for attempt in Retrying(
-            stop=stop_after_attempt(5),
-            wait=wait_fixed(1),
-        ):
-            with attempt:
-                shutdown_via_balena_supervisor()
+        _run_supervisor_command(shutdown_via_balena_supervisor, 'shutdown')
     else:
         r.publish('hostcmd', 'shutdown')
 
@@ -675,16 +1482,26 @@ def _check_asset_reachability(asset: Asset) -> bool:
     Local files: existence check. Remote URIs: defer to ``url_fails``,
     which knows about both HTTP(S) and streaming (RTSP/RTMP) probes.
     Trust ``skip_asset_check`` — operator opted out of validation.
+
+    TLS verification for the remote probe composes the device-wide
+    ``verify_ssl`` setting with the per-asset ``skip_ssl_verify``
+    override: verification is skipped when the global setting is off OR
+    the asset opts out, so a trusted self-signed host isn't marked
+    unreachable (which would make the viewer silently skip the asset).
     """
     if asset.skip_asset_check:
         return True
     uri = asset.uri or ''
     if uri.startswith('/'):
         return path.isfile(uri)
-    return not url_fails(uri)
+    verify_ssl = settings['verify_ssl'] and not asset.skip_ssl_verify
+    return not url_fails(uri, verify_ssl=verify_ssl)
 
 
-@celery.task(time_limit=ASSET_REVALIDATION_TIME_LIMIT_S)
+@celery.task(
+    time_limit=ASSET_REVALIDATION_TIME_LIMIT_S,
+    soft_time_limit=ASSET_REVALIDATION_SOFT_TIME_LIMIT_S,
+)
 def revalidate_asset_urls() -> None:
     """Refresh ``Asset.is_reachable`` for every enabled asset.
 
@@ -721,7 +1538,7 @@ def revalidate_asset_urls() -> None:
         nx=True,
         ex=ASSET_REVALIDATION_TIME_LIMIT_S,
     ):
-        logging.info(
+        logger.info(
             'revalidate_asset_urls: previous sweep still running, skipping'
         )
         return
@@ -742,10 +1559,16 @@ def revalidate_asset_urls() -> None:
                 continue
             try:
                 reachable = _check_asset_reachability(asset)
+            except SoftTimeLimitExceeded:
+                # Out of budget for the whole sweep — handled by the
+                # outer except below. Re-raise past the blanket
+                # Exception arm that would otherwise swallow it and
+                # keep the sweep running into the hard limit.
+                raise
             except Exception:
                 # url_fails should swallow its own exceptions, but a
                 # surprise from sh/requests shouldn't kill the whole sweep.
-                logging.exception(
+                logger.exception(
                     'revalidate_asset_urls: probe crashed for %s',
                     asset.asset_id,
                 )
@@ -754,6 +1577,19 @@ def revalidate_asset_urls() -> None:
                 is_reachable=reachable,
                 last_reachability_check=timezone.now(),
             )
+    except SoftTimeLimitExceeded:
+        # The soft signal is delivered asynchronously, so it can fire
+        # anywhere in the loop — during a probe or during the DB
+        # update — which is why the whole sweep body is covered, not
+        # just _check_asset_reachability. Abort cleanly (the
+        # ``finally`` below releases the lock; rows updated so far
+        # keep their fresh state) instead of letting the hard limit
+        # SIGKILL the pool child. The next beat tick starts over.
+        logger.warning(
+            'revalidate_asset_urls: sweep exceeded %ss; '
+            'aborting until the next beat tick',
+            ASSET_REVALIDATION_SOFT_TIME_LIMIT_S,
+        )
     finally:
         # Compare-and-delete: only release if the lock still holds
         # *our* token. If the TTL expired and someone else acquired
@@ -791,7 +1627,10 @@ def _parse_processing_started_at(value: Any) -> datetime | None:
     return parsed
 
 
-@celery.task(time_limit=300)
+@celery.task(
+    time_limit=RECONCILE_STUCK_TIME_LIMIT_S,
+    soft_time_limit=RECONCILE_STUCK_SOFT_TIME_LIMIT_S,
+)
 def reconcile_stuck_processing() -> None:
     """Recover ``Asset`` rows stuck at ``is_processing=True``.
 
@@ -855,9 +1694,9 @@ def reconcile_stuck_processing() -> None:
         RECONCILE_STUCK_LOCK_KEY,
         token,
         nx=True,
-        ex=300,  # matches the task's time_limit
+        ex=RECONCILE_STUCK_TIME_LIMIT_S,  # matches the task's hard time_limit
     ):
-        logging.info(
+        logger.info(
             'reconcile_stuck_processing: previous sweep still running, '
             'skipping'
         )
@@ -890,7 +1729,7 @@ def reconcile_stuck_processing() -> None:
             # Stuck past the threshold. Route by mimetype.
             mimetype = (asset.mimetype or '').lower()
             if mimetype == 'image':
-                logging.warning(
+                logger.warning(
                     'reconcile_stuck_processing: re-dispatching image '
                     'normalize for %s (stuck since %s)',
                     asset.asset_id,
@@ -898,7 +1737,7 @@ def reconcile_stuck_processing() -> None:
                 )
                 dispatch_normalize_image(asset.asset_id)
             elif mimetype == 'video':
-                logging.warning(
+                logger.warning(
                     'reconcile_stuck_processing: re-dispatching video '
                     'normalize for %s (stuck since %s)',
                     asset.asset_id,
@@ -916,7 +1755,7 @@ def reconcile_stuck_processing() -> None:
                 # original watch URL on a backup-restored YouTube
                 # row, but video-pipeline re-dispatch is the best we
                 # can do without re-querying yt-dlp.
-                logging.warning(
+                logger.warning(
                     'reconcile_stuck_processing: clearing flag on '
                     'unknown-mimetype row %s '
                     '(mimetype=%r, stuck since %s)',
@@ -929,6 +1768,17 @@ def reconcile_stuck_processing() -> None:
                     'Processing stalled past threshold; flag cleared '
                     'by reconciler. Re-upload the asset to retry.',
                 )
+    except SoftTimeLimitExceeded:
+        # A per-row Redis publish or SQLite lock wedged the sweep past
+        # the soft budget. Abort this tick rather than let the hard
+        # limit SIGKILL the worker (ANTHIAS-A / 9 / B); the finally
+        # below still releases the lock and the next beat tick resumes
+        # from wherever the rows now stand.
+        logger.warning(
+            'reconcile_stuck_processing: sweep exceeded %ss; '
+            'skipping the rest of this tick',
+            RECONCILE_STUCK_SOFT_TIME_LIMIT_S,
+        )
     finally:
         # Compare-and-delete via the shared Lua script: only release
         # if the lock still holds *our* token. If our TTL expired and
@@ -937,7 +1787,10 @@ def reconcile_stuck_processing() -> None:
         r.eval(_LOCK_RELEASE_LUA, 1, RECONCILE_STUCK_LOCK_KEY, token)
 
 
-@celery.task(time_limit=30)
+@celery.task(
+    time_limit=ASSET_RECHECK_TIME_LIMIT_S,
+    soft_time_limit=ASSET_RECHECK_SOFT_TIME_LIMIT_S,
+)
 def revalidate_asset_url(asset_id: str) -> None:
     """On-demand probe for a single asset.
 
@@ -954,7 +1807,28 @@ def revalidate_asset_url(asset_id: str) -> None:
     ``is_processing`` / ``skip_asset_check`` — probing a disabled or
     in-flight youtube_asset row would write misleading state, and
     skip_asset_check rows are explicitly opted out of validation.
+
+    The soft-limit guard wraps the *whole* body rather than just the
+    probe. The prologue is not free — the SELECT below can block on a
+    contended SQLite write lock and the cooldown SETNX is a redis round
+    trip — and a soft signal landing there used to escape as a task
+    failure (Sentry ANTHIAS-5K, whose traceback lands on the SELECT).
+    Nothing has been probed or written at that point, so the right
+    answer is to drop the tick; the viewer re-requests a recheck the
+    next time it fails to display the asset.
     """
+    try:
+        _revalidate_asset_url(asset_id)
+    except SoftTimeLimitExceeded:
+        logger.warning(
+            'revalidate_asset_url: soft time limit hit during the '
+            'recheck for %s; giving up this tick',
+            asset_id,
+        )
+
+
+def _revalidate_asset_url(asset_id: str) -> None:
+    """Body of :func:`revalidate_asset_url`, minus the soft-limit guard."""
     from django.utils import timezone
 
     try:
@@ -988,11 +1862,29 @@ def revalidate_asset_url(asset_id: str) -> None:
 
     try:
         reachable = _check_asset_reachability(asset)
+    except SoftTimeLimitExceeded:
+        # A probe that can't finish inside the soft budget gets
+        # the same verdict url_fails gives an HTTP timeout:
+        # unreachable. Recording the verdict (rather than
+        # bailing) keeps the viewer's _asset_is_displayable in
+        # sync with reality and the cooldown lock prevents an
+        # immediate re-probe storm.
+        logger.warning(
+            'revalidate_asset_url: probe for %s exceeded %ss; '
+            'marking unreachable',
+            asset_id,
+            ASSET_RECHECK_SOFT_TIME_LIMIT_S,
+        )
+        reachable = False
     except Exception:
-        logging.exception(
+        logger.exception(
             'revalidate_asset_url: probe crashed for %s', asset_id
         )
         return
+
+    # A soft signal landing between the probe returning and the UPDATE
+    # committing is caught by the caller's guard, which drops the tick
+    # rather than failing the task.
     Asset.objects.filter(asset_id=asset_id).update(
         is_reachable=reachable,
         last_reachability_check=timezone.now(),
@@ -1009,12 +1901,13 @@ def revalidate_asset_url(asset_id: str) -> None:
 # directly without going through Celery). The thin wrappers below are
 # the actual celery.task entry points so the task names register on
 # the worker and ``apply_async`` works out of the box.
-from anthias_server import processing  # noqa: E402
+from anthias_server import processing
 
 
 @celery.task(
     base=processing._NormalizeAssetTask,
-    time_limit=300,
+    time_limit=NORMALIZE_IMAGE_TIME_LIMIT_S,
+    soft_time_limit=NORMALIZE_IMAGE_SOFT_TIME_LIMIT_S,
     autoretry_for=(OSError,),
     # Two OSError subclasses are permanent and must NOT trigger a
     # retry — they'd just keep the row in ``is_processing=True``
@@ -1027,6 +1920,20 @@ from anthias_server import processing  # noqa: E402
     #     autoretry_for filter would otherwise sweep it up; listing
     #     it explicitly here makes the failure surface immediately.
     dont_autoretry_for=(FileNotFoundError, UnidentifiedImageError),
+    # Both of these are outcomes rather than faults, so neither should
+    # reach the error tracker as a crash. ``throws`` only stops celery
+    # logging at ERROR with a traceback and makes sentry-sdk's
+    # CeleryIntegration skip the event; ``on_failure`` still runs, so
+    # the row still shows the Failed pill and the reason.
+    #
+    #   * ``ImageTooLargeError`` — the pixel cap's deliberate,
+    #     operator-facing rejection, the image counterpart of
+    #     ``UnsupportedVideoCodecError`` below. A 144 MP scan is a
+    #     large upload, not a crash.
+    #   * ``FileNotFoundError`` — the source is gone because the row
+    #     was deleted, or ``cleanup()`` swept the upload, between
+    #     dispatch and pickup (ANTHIAS-1J / ANTHIAS-20).
+    throws=(processing.ImageTooLargeError, FileNotFoundError),
     retry_backoff=10,
     retry_backoff_max=300,
     retry_jitter=True,
@@ -1052,16 +1959,30 @@ def normalize_image_asset(asset_id: str) -> None:
     asset = processing._row_or_none(asset_id)
     if asset is None:
         return
-    processing._run_image_normalisation(asset)
+    processing._run_unless_deleted(processing._run_image_normalisation, asset)
 
 
 @celery.task(
     base=processing._NormalizeAssetTask,
-    time_limit=120,
+    time_limit=NORMALIZE_VIDEO_TIME_LIMIT_S,
+    soft_time_limit=NORMALIZE_VIDEO_SOFT_TIME_LIMIT_S,
     autoretry_for=(OSError,),
     # Same rationale as normalize_image_asset above: a missing source
     # file is permanent and should land on on_failure right away.
     dont_autoretry_for=(FileNotFoundError,),
+    # ``UnsupportedVideoCodecError`` is the codec/resolution gate's
+    # deliberate, operator-facing rejection (Failed pill + re-encode
+    # recipe via _NormalizeAssetTask.on_failure) — an expected outcome,
+    # not a fault. Listing it in ``throws`` keeps Celery from logging it
+    # at ERROR with a traceback, and sentry-sdk's CeleryIntegration
+    # skips ``task.throws`` exceptions, so the gate stops flooding
+    # Sentry (ANTHIAS-1J, ANTHIAS-20). on_failure still runs.
+    #
+    # ``FileNotFoundError`` joins it for the reason given on
+    # normalize_image_asset above: the source going missing between
+    # dispatch and pickup is an expected outcome that the row already
+    # reports (Sentry ANTHIAS-1G).
+    throws=(processing.UnsupportedVideoCodecError, FileNotFoundError),
     retry_backoff=15,
     retry_backoff_max=300,
     retry_jitter=True,
@@ -1081,4 +2002,4 @@ def normalize_video_asset(asset_id: str) -> None:
     asset = processing._row_or_none(asset_id)
     if asset is None:
         return
-    processing._run_video_normalisation(asset)
+    processing._run_unless_deleted(processing._run_video_normalisation, asset)

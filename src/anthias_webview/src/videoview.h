@@ -1,8 +1,12 @@
 #pragma once
 
+#include <QAtomicInteger>
 #include <QAudioDevice>
+#include <QByteArray>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QImage>
+#include <QMutex>
 #include <QHBoxLayout>
 #include <QMediaPlayer>
 #include <QString>
@@ -10,13 +14,14 @@
 #include <QTimer>
 #include <QUrl>
 #include <QVariantMap>
+#include <QVideoFrame>
 #include <QWidget>
 
 class QAudioOutput;
-class QGraphicsScene;
-class QGraphicsVideoItem;
-class QGraphicsView;
+class QQuickItem;
+class QQuickWidget;
 class QVideoSink;
+class RasterVideoWidget;
 
 // VideoView owns the Qt 6 multimedia playback pipeline for the Qt6
 // boards (issue #2904). An earlier revision embedded libmpv via
@@ -40,18 +45,26 @@ class QVideoSink;
 // on Pi 5, rkvdec on Rock Pi 4) without any per-codec dispatch
 // from the application.
 //
-// QGraphicsView + QGraphicsScene + QGraphicsVideoItem is the
-// rendering substrate (not QVideoWidget). The graphics-item path
-// is what lets ``video-rotate`` actually rotate the displayed
-// frames — ``QGraphicsItem::setRotation`` is honoured by the
-// painter, whereas QVideoWidget has no rotation property and a
-// dynamic property attached via ``setProperty`` is read by
-// nothing (review of PR #2905 caught this as a silent Pi 4
-// regression for any operator whose Settings page screen_rotation
-// was non-zero). All three boards run the same path so the
-// transformation is testable in CI; the cage boards still inherit
-// rotation from wlr-randr at the compositor level and so ignore
-// the option dict's ``video-rotate`` value.
+// The rendering substrate is a QML ``VideoOutput`` hosted in a
+// ``QQuickWidget`` (issue #2967). The previous substrate —
+// ``QGraphicsVideoItem`` on a default (raster) ``QGraphicsView``
+// viewport — hardware-decoded perfectly but presented at 8–12 fps:
+// every frame went ``QVideoFrame::toImage()`` → ``qImageFromVideoFrame``
+// (an RHI offscreen render **plus GPU→CPU readback**), then a
+// smooth-scaled CPU raster blit into the widget backing store,
+// which eglfs/wayland re-uploaded to the GPU to composite. Two
+// GPU/CPU crossings per frame saturated the GUI thread (~80% on
+// Pi 4) while ``playback-stats.log`` — which counts sink
+// deliveries, not paints — still read "dropped≈0". VideoOutput's
+// frames stay on the GPU: the scene graph samples the decoded
+// planes as textures and converts YUV→RGB in a fragment shader at
+// composite time. QQuickWidget renders through QQuickRenderControl
+// into an FBO inside the app's single native window — the same
+// machinery QWebEngineView already uses here, so it is proven on
+// eglfs (single-native-window constraint) and proven to inherit
+// QT_QPA_EGLFS_ROTATION / wlr-randr whole-screen rotation (#2971).
+// A ``QVideoWidget`` would NOT satisfy the eglfs constraint: it
+// wraps a ``QVideoWindow`` — a second native window.
 //
 // The MainWindow D-Bus surface (``playVideo`` / ``stopVideo`` /
 // ``videoEnded``) and the Python option-dict contract are
@@ -71,12 +84,11 @@ public:
     //   * ``audio-device`` — ALSA device name (the same string the
     //     mpv era used; QAudioDevice consumes the ``CARD=<name>``
     //     portion).
-    //   * ``video-rotate`` — int as string (0/90/180/270), Pi 4 only
-    //     (cage / wayland boards inherit rotation from wlr-randr).
-    //     Applied to the QGraphicsVideoItem so the painter rotates
-    //     the visible frames; the rotated bounding box is mapped
-    //     back to the viewport so a 90° rotation of 1920x1080 fits
-    //     inside the 1080-tall surface without clipping.
+    //   * ``video-rotate`` — int as string (0/90/180/270). Defensive
+    //     no-op: no board sends it any more (every platform rotates
+    //     the whole screen at the compositor / QPA layer). Applied
+    //     to the VideoOutput item's ``orientation`` property so an
+    //     old caller still gets rotated frames instead of an error.
     //
     // ``hwdec`` / ``vd-lavc-threads`` / ``video-sync`` from the
     // libmpv option set are deliberately ignored — libavcodec
@@ -88,9 +100,6 @@ public:
     // the next ``play()`` is a cheap setSource + play, not a
     // pipeline rebuild.
     void stop();
-
-protected:
-    void resizeEvent(QResizeEvent* event) override;
 
 signals:
     // Fires on ``QMediaPlayer::EndOfMedia``. Re-emitted by
@@ -109,13 +118,159 @@ private slots:
     // file is playing.
     void sampleStats();
 
-    // Counts frames delivered to QVideoSink so the SAMPLE / END_FILE
-    // log lines can compare ``actually displayed`` against
-    // ``decoder-expected`` and report a dropped-frame estimate.
-    // ``videoFrameChanged`` fires per display tick on the
-    // QGraphicsVideoItem's underlying sink; counting those is the
-    // most direct measurement QtMultimedia exposes.
-    void onVideoFrameDelivered();
+    // Receives every frame the pipeline hands to ``pacingSink`` (the
+    // *decode-side* rate, counted as ``frames-delivered``) and
+    // forwards it to the QML VideoOutput's sink only when the scene
+    // graph has composited the previously forwarded frame. Without
+    // the gate, a 60 fps source schedules a scene render per
+    // delivery on a GUI thread that sustains ~45 renders/s at 1080p
+    // on a Pi 4 — the resulting overload presented 22.6 fps with the
+    // playback position falling to ~0.6x realtime (issue #2987).
+    // Dropping early self-paces delivery to render capacity: 30 fps
+    // sources are untouched (render finishes well inside the frame
+    // interval), 60 fps sources settle into an even ~half cadence.
+    void onVideoFrameDelivered(const QVideoFrame& frame);
+
+    // Counts scene-graph render passes
+    // (``QQuickWindow::afterRendering``). The Quick scene only
+    // re-renders on damage, and during video playback the
+    // VideoOutput's frame updates are the damage — so this is the
+    // *presentation-side* rate. Issue #2967 existed precisely
+    // because the stats log had no such counter: sink deliveries
+    // read "dropped≈0" while ~70% of frames never reached the
+    // screen. SAMPLE / END_FILE now log both ends of the pipe.
+    void onSceneRendered();
+
+private:
+    // Wire onSceneRendered to the VideoOutput item's QQuickWindow.
+    // Idempotent; called from the constructor and re-tried from
+    // play() so a hypothetical late item→window attachment can't
+    // leave the presentation counter permanently at 0 (which would
+    // read as a total presentation failure — the inverse of the
+    // #2967 blind spot).
+    void connectRenderCounter();
+
+    // --- Pi 3 (VideoCore IV) CPU-raster presenter ------------------
+    // pi3-64's GLES2-only GPU can't present the QML VideoOutput RHI
+    // path: the scene renders but the QQuickWidget FBO never reaches
+    // the eglfs scanout, so every video black-screens (issue #3084)
+    // while images/webpages — which composite through the widget
+    // backing store — render fine. When ANTHIAS_VIDEO_RASTER is set
+    // (by the Python side for pi3-64 only, see _build_webview_env),
+    // frames are presented instead by ``QVideoFrame::toImage()`` +
+    // a backing-store blit — the same path images use, and the
+    // pre-#2967 substrate that was visible (if slow, 8–12 fps) on
+    // this GPU. rasterWidget replaces quickWidget in the layout;
+    // videoOutputItem / videoSink stay null.
+    //
+    // presentRasterFrame converts + shows one frame and closes the
+    // one-frame pacing gate; onRasterPainted (called by
+    // RasterVideoWidget::paintEvent) re-opens it and forwards any
+    // frame parked in pendingFrame while the paint was in flight.
+    void presentRasterFrame(const QVideoFrame& frame);
+    void onRasterPainted();
+    friend class RasterVideoWidget;
+
+#ifdef ANTHIAS_GSTREAMER
+public:
+    // GUI-thread drain slot: blits the newest frame the appsink has
+    // stashed in gstLatestFrame. Coalesced — the appsink callback only
+    // posts one invocation until this runs, so a GUI thread slower than
+    // the pipeline drops intermediate frames (keeping the freshest)
+    // instead of growing an unbounded event queue and OOM'ing the 1 GB
+    // board. Q_INVOKABLE so the streaming-thread callback can
+    // QMetaObject::invokeMethod it across the thread boundary.
+    Q_INVOKABLE void onGstFrame();
+    // Streaming-thread entry point: the appsink callback hands each
+    // ISP-converted RGB frame here; it stashes the newest under
+    // gstFrameMutex and posts a single coalesced onGstFrame() drain.
+    void pushGstFrame(const QImage& frame);
+    // Flushing-seek the pipeline to zero to loop the clip, on EOS. Called
+    // from the pipeline bus watch (anthias_gst_bus_loop), which GLib
+    // services on the GUI thread, so the seek never races stop().
+    Q_INVOKABLE void gstRestartLoop();
+    // Reduced-seam loop via SEGMENT seeks: gstSegmentSeek re-arms a pipeline's
+    // segment (flush only on the first, to enter segment mode); the
+    // *SegmentDone hooks are called from the bus watches on SEGMENT_DONE.
+    // Returns the seek result: in segment mode no EOS is posted, so a
+    // failed re-arm would stall the pipeline forever — callers fall back
+    // to the flushing loop when it returns false.
+    bool gstSegmentSeek(struct _GstElement* pipe, bool flush);
+    void gstVideoSegmentDone();
+    void gstAudioSegmentDone();
+    // Enter segment mode on the first ASYNC_DONE (preroll done). Idempotent
+    // via gstSegmentArmed / gstAudioSegmentArmed. Called from the bus
+    // watches on GST_MESSAGE_ASYNC_DONE.
+    void gstArmVideoSegment();
+    void gstArmAudioSegment();
+    // Overlay-path instrumentation (streaming thread). onOverlayBuffer:
+    // count each frame reaching kmssink + latch the source framerate from
+    // the pad caps. logOverlayQos: record kmssink's authoritative
+    // rendered/dropped tallies from a bus QoS message.
+    void onOverlayBuffer(struct _GstPad* pad);
+    void logOverlayQos(quint64 rendered, quint64 dropped);
+    // Latch the source frame rate (once) from the appsink's negotiated
+    // caps, so the appsink-raster path's SAMPLE can compute
+    // expected/dropped instead of reporting -1. Called from the appsink
+    // new-sample callback (streaming thread); setContainerFps is atomic.
+    void latchSourceFps(int fpsNum, int fpsDen);
+    // Best-effort audio in its OWN pipeline, decoupled from the video
+    // overlay pipeline so no audio fault can stall the video. gstStartAudio
+    // builds+plays it; gstLoopAudio/gstStopAudio are driven from the audio
+    // bus watch (loop on EOS, tear down on error) and gstStop/gstRestart.
+    void gstStartAudio(const QString& location, const QString& alsaDev);
+    void gstLoopAudio();
+    void gstStopAudio();
+    // Record an AUDIO status/error line to the readable stats log (public
+    // so the audio bus-watch free function can report errors there).
+    void logAudio(const QString& msg);
+
+private:
+    // In-process GStreamer HW video path for pi3-64 (issue #3084):
+    // filesrc ! qtdemux ! h264parse ! v4l2h264dec ! v4l2convert(ISP) !
+    // RGB16 ! appsink. The bcm2835 ISP does the SAND→RGB conversion in
+    // hardware — the CPU can't (~600 ms/frame, [[toImage]] wall) — so the
+    // decode+convert stays fully on the VideoCore IV hardware and only a
+    // ready-made RGB frame reaches Qt, which rasterWidget blits (~26 fps,
+    // 0 drops measured). Active when rasterMode is built with
+    // ANTHIAS_GSTREAMER; every other board keeps the VideoOutput path.
+    bool gstPlay(const QString& uri, const QVariantMap& options);
+    // HW overlay-plane path (ANTHIAS_VIDEO_OVERLAY): render decoded frames
+    // straight onto a vc4 DRM overlay plane via kmssink, using eglfs's own
+    // DRM master fd / CRTC / connector — the display controller composites
+    // it with the eglfs UI plane in hardware, bypassing the GL compositor
+    // (which caps at ~9 fps on VideoCore IV). Returns false (caller falls
+    // back to the appsink→raster path) if the eglfs DRM resources or a
+    // free overlay plane can't be resolved.
+    bool gstPlayOverlay(const QString& uri);
+    void gstStop();
+    bool gstOverlayMode = false;
+    bool gstOverlayActive = false;
+    struct _GstElement* gstPipeline = nullptr;
+    struct _GstElement* gstAudioPipeline = nullptr;
+    struct _GstElement* gstAppSink = nullptr;
+    bool gstMode = false;
+    // Enter segment mode ONCE, from ASYNC_DONE (preroll complete) rather
+    // than synchronously after set_state(PLAYING) — a segment seek issued
+    // while the pipeline is still prerolling returns FALSE, so the pipeline
+    // never enters segment mode and looping falls back to the flushing EOS
+    // restart (which fully re-primes the decoder, roughly double the
+    // loop-point drop this change reduces to). These guard against
+    // re-arming on the extra ASYNC_DONE the flushing seek itself posts.
+    // Reset in gstPlay/gstStop.
+    bool gstSegmentArmed = false;
+    bool gstAudioSegmentArmed = false;
+    // Single-slot handoff: the appsink callback (streaming thread) writes
+    // the newest frame under gstFrameMutex and, if no drain is already
+    // queued (gstDrainPending), posts one onGstFrame() to the GUI thread.
+    QImage gstLatestFrame;
+    QMutex gstFrameMutex;
+    QAtomicInt gstDrainPending{0};
+    // Raw appsink delivery count (streaming thread) — logged alongside the
+    // painted count so SAMPLE shows the pipeline's own rate vs what the
+    // GUI actually presented.
+    QAtomicInteger<qint64> gstRawSamples{0};
+#endif
 
 private:
     // Resolve an ALSA device name (``alsa/sysdefault:CARD=vc4hdmi0``,
@@ -130,10 +285,12 @@ private:
     // boards; this routine extracts ``CARD=`` and matches that
     // segment specifically).
     QAudioDevice resolveAlsaDevice(const QString& alsaSpec) const;
-    // Apply (or clear) the rotation on the QGraphicsVideoItem and
-    // resize the viewport so the rotated frame fills the surface
-    // without clipping. ``angle`` is normalised to {0, 90, 180, 270};
-    // anything else snaps to 0.
+    // Apply (or clear) the rotation on the VideoOutput item's
+    // ``orientation`` property. ``angle`` is normalised to
+    // {0, 90, 180, 270}; anything else snaps to 0. VideoOutput
+    // handles the 90/270 bounding-box swap itself (the property
+    // exists for camera-orientation use), so there is no manual
+    // transform-origin / transpose bookkeeping here.
     void applyRotation(int angle);
     // Append ``ISO-8601 KIND detail`` to
     // ``/data/.anthias/playback-stats.log``. Renamed from the
@@ -149,20 +306,46 @@ private:
     // called per-line — the cost-per-line stays an append + flush.
     void openStatsLog();
 
-    // Rotation is applied around the centre so 90/270 swap the
-    // bounding box around the same on-screen midpoint as 0/180.
-    void positionVideoItem();
-
     QMediaPlayer* player = nullptr;
     QAudioOutput* audioOutput = nullptr;
-    QGraphicsView* graphicsView = nullptr;
-    QGraphicsScene* graphicsScene = nullptr;
-    QGraphicsVideoItem* videoItem = nullptr;
+    QQuickWidget* quickWidget = nullptr;
+    // The QML VideoOutput item (owned by the QQuickWidget's root
+    // object) and its sink. Both are guaranteed non-null past the
+    // constructor: a failed QML load (missing qml6-module-* runtime
+    // packages) is a qFatal there, because decode-but-render-nowhere
+    // is a silent black screen on a kiosk while crash-respawn is
+    // loud and supervised.
+    QQuickItem* videoOutputItem = nullptr;
+    QVideoSink* videoSink = nullptr;
     QHBoxLayout* videoLayout = nullptr;
+    QMetaObject::Connection renderCounterConnection;
     int currentRotation = 0;
 
-    // Stats state. Same shape as the libmpv version so log
-    // consumers don't have to change schemas. ``playStartedAt`` is
+    // Raster path (ANTHIAS_VIDEO_RASTER). rasterWidget is non-null and
+    // owns the on-screen surface only when rasterMode is true; it is
+    // mutually exclusive with quickWidget/videoOutputItem/videoSink.
+    RasterVideoWidget* rasterWidget = nullptr;
+    bool rasterMode = false;
+    // One-frame pacing gate for the raster path (the analogue of
+    // sceneReadyForFrame for the VideoOutput path): true once the last
+    // shown frame has been painted, so the next delivery converts and
+    // shows immediately; otherwise the freshest frame parks in
+    // pendingFrame until onRasterPainted() forwards it. Starts true so
+    // the first frame always shows.
+    bool rasterReady = true;
+    // Raster-path instrumentation: total QVideoFrame::toImage() time
+    // (µs) and count since the last SAMPLE, so a per-second RASTER line
+    // exposes the per-frame conversion cost — the suspected VideoCore
+    // IV bottleneck. Reset each SAMPLE.
+    qint64 rasterConvertUsAccum = 0;
+    qint64 rasterConvertCount = 0;
+
+    // Stats state. Extends the libmpv-era line shape with a
+    // ``frames-rendered=`` field (the presentation-side counter
+    // #2967 was missing); all fields are key=value tagged, so
+    // consumers must key on field names, not positions —
+    // positional parsers of STOP/SAMPLE/END_FILE lines break on
+    // this revision. ``playStartedAt`` is
     // restarted on ``LoadedMedia`` (not in play()) so the elapsed
     // window measures real playback wall-clock, not decoder init —
     // review of #2905 flagged that the init delay inflated drop
@@ -173,7 +356,39 @@ private:
     QString currentUri;
     QElapsedTimer playStartedAt;
     qint64 framesDelivered = 0;
-    qreal containerFps = 0.0;
+    qint64 framesForwarded = 0;
+    qint64 framesRendered = 0;
+    // Source frame rate as fps×1000. On the overlay path it's latched from
+    // a GStreamer pad probe (streaming thread) and read by sampleStats
+    // (GUI thread), so the handoff is atomic — a plain double would be a
+    // data race / UB. Access via containerFps() / setContainerFps().
+    QAtomicInteger<int> containerFpsMilli { 0 };
+    qreal containerFps() const
+    {
+        return containerFpsMilli.loadRelaxed() / 1000.0;
+    }
+    void setContainerFps(qreal fps)
+    {
+        containerFpsMilli.storeRelaxed(qRound(fps * 1000.0));
+    }
+
+    // Intermediate sink between QMediaPlayer and the QML
+    // VideoOutput's sink — the pacing gate's tap point (see
+    // onVideoFrameDelivered). Owned by this widget.
+    QVideoSink* pacingSink = nullptr;
+    // True when the scene graph has rendered since the last frame
+    // was forwarded — i.e. the VideoOutput is ready for new damage.
+    // Starts true so the first frame always shows. All touch points
+    // (onSceneRendered, onVideoFrameDelivered) run on the GUI thread:
+    // QQuickWidget renders via QQuickRenderControl on the GUI thread
+    // and the queued videoFrameChanged delivery lands there too, so
+    // plain members are race-free.
+    bool sceneReadyForFrame = true;
+    // Single-slot mailbox: the newest frame that arrived while the
+    // scene was still rendering. Forwarded (and cleared) from
+    // onSceneRendered() so renders chain back-to-back at capacity
+    // instead of idling until the next sink delivery.
+    QVideoFrame pendingFrame;
 
     // Cap on /data/.anthias/playback-stats.log size. 8 MB ≈ a full
     // 24 h burn-in's worth of SAMPLE lines at 1 Hz; past that we

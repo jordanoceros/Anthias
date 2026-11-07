@@ -1,7 +1,17 @@
 // =============================================================================
-// _styles.scss — Anthias UI design system
+// _styles.scss — Anthias UI components
 //
-// Layered as: tokens → base → components → page-specific bits.
+// Layered as: base → components → page-specific bits. There is no token
+// layer here: this file READS tokens and never declares one.
+//
+// That is not a style preference, it is the cascade. anthias.css loads
+// after tailwind.css and both are unlayered, so any :root declaration
+// here beats the same name in @theme no matter what @theme says. A
+// duplicate does not merge, it wins silently. Declare tokens in
+// static/src/tailwind.css (roles), css/palette.css (primitives) or
+// css/base.css (no @theme namespace); read them here with var().
+// tests/test_design_tokens.py enforces this.
+//
 // Everything is project-namespaced (.app-btn, .app-input, .app-tabs,
 // .surface, .modal-card, .schedule-chip, .stat-card, .app-toast,
 // .resource-pie, .loadavg-row, …) — there is no Bootstrap (or any
@@ -9,119 +19,9 @@
 // one-off spacing/flex.
 // =============================================================================
 
-// Brand colour tokens — referenced via #{$anthias-...} in this file
-// to seed the CSS-custom-property design tokens declared further down.
-@import "variables";
-
 // -----------------------------------------------------------------------------
-// 1. Design tokens
+// 1. Base
 // -----------------------------------------------------------------------------
-:root {
-  // Spacing — 4 px base, doubled tier above 16 px so layouts stay tidy.
-  --space-1: 0.25rem;   //  4
-  --space-2: 0.5rem;    //  8
-  --space-3: 0.75rem;   // 12
-  --space-4: 1rem;      // 16
-  --space-5: 1.5rem;    // 24
-  --space-6: 2rem;      // 32
-  --space-7: 3rem;      // 48
-  --space-8: 4rem;      // 64
-
-  // Radii
-  --radius-sm: 4px;
-  --radius-md: 8px;
-  --radius-lg: 12px;
-  --radius-xl: 16px;
-  --radius-pill: 999px;
-
-  // Shadows — soft, layered, modern. Use --shadow-md as the default card lift.
-  --shadow-sm: 0 1px 2px var(--scrim-4), 0 1px 3px var(--scrim-6);
-  --shadow-md: 0 2px 6px var(--scrim-4), 0 8px 24px var(--scrim-8);
-  --shadow-lg: 0 4px 12px var(--scrim-6), 0 16px 48px var(--scrim-14);
-
-  // Transitions
-  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
-  --t-fast: 120ms var(--ease-out);
-  --t-med: 200ms var(--ease-out);
-
-  // Colour roles. Backgrounds, surfaces, text — referenced by name through
-  // the rest of the file so tweaks happen in one place.
-  --color-bg: #{$anthias-purple-1};
-  --color-bg-deep: #0f0019;          // splash / extreme dark
-  --color-bg-elevated: #{$anthias-purple-3};
-  --color-surface: #ffffff;
-  --color-surface-soft: #fafafa;
-  --color-surface-tint: #f4f1f6;
-  --color-active: #{$anthias-purple-2};
-  --color-active-tint: #503061;      // gradient stop above $anthias-purple-2
-  --color-text: #1f002a;
-  --color-text-muted: #5e5868;
-  --color-text-on-dark: #ffffff;
-  --color-text-on-dark-muted: rgba(255, 255, 255, 0.65);
-  --color-text-on-dark-faint: rgba(255, 255, 255, 0.45);
-  --color-border: rgba(0, 0, 0, 0.08);
-  --color-border-on-dark: rgba(255, 255, 255, 0.12);
-  --color-accent: #{$anthias-yellow-3};
-  --color-accent-soft: #{$anthias-yellow-4};
-  --color-accent-text: #1f002a;
-  --color-accent-wash: rgba(255, 225, 26, 0.16);     // chip bg
-  --color-accent-edge: rgba(255, 225, 26, 0.32);     // chip border
-  --color-accent-hover: rgba(255, 225, 26, 0.10);    // hover tint
-  --color-danger: #dc3545;
-  --color-danger-hover: #c82333;
-  --color-danger-active: #bd2130;
-
-  // Functional status colours (success / warning) used by chips,
-  // load-average bars, resource-pie slices, and toasts. Hex baseline
-  // + alpha variants for chip/wash/ring use.
-  --color-success: #34d399;
-  --color-success-wash: rgba(52, 211, 153, 0.22);
-  --color-success-wash-strong: rgba(52, 211, 153, 0.4);
-  --color-success-edge: rgba(52, 211, 153, 0.45);
-  --color-success-edge-strong: rgba(52, 211, 153, 0.6);
-  --color-success-ring: rgba(52, 211, 153, 0.18);
-  --color-success-ring-pulse: rgba(52, 211, 153, 0.32);
-  --color-success-text-on-wash: #0e4a30;             // WCAG-AA on wash
-  --color-success-text-on-wash-strong: #ecfff5;      // WCAG-AA on dark
-  --color-success-bright: #4ade80;                   // active dot
-  --color-warning: #f59e0b;
-  --color-warning-ring: rgba(245, 158, 11, 0.18);
-
-  // Anchors on light surfaces — kept readable against white cards
-  // (the brand yellow we use for accents has too little contrast).
-  --color-link: #6633a0;
-  --color-link-hover: #4a1f80;
-  --color-link-wash: rgba(102, 51, 160, 0.08);       // chip bg
-  --color-link-edge: rgba(102, 51, 160, 0.22);       // chip border
-  --color-link-ring: rgba(102, 51, 160, 0.18);
-
-  // Focus ring — used at every input/button focus state.
-  --color-focus-ring: rgba(136, 25, 199, 0.35);
-  --ring-width: 3px;
-
-  // Scrim ladder — neutral overlays for hovers, borders, dividers,
-  // tints. Two contexts: light surface and dark surface. Pick the
-  // closest tier instead of inventing a new alpha at the use site.
-  --scrim-2:  rgba(0, 0, 0, 0.02);   // row hover
-  --scrim-4:  rgba(0, 0, 0, 0.04);
-  --scrim-5:  rgba(0, 0, 0, 0.05);
-  --scrim-6:  rgba(0, 0, 0, 0.06);
-  --scrim-8:  rgba(0, 0, 0, 0.08);   // = --color-border
-  --scrim-10: rgba(0, 0, 0, 0.10);
-  --scrim-14: rgba(0, 0, 0, 0.14);   // shadow-lg outer
-  --scrim-18: rgba(0, 0, 0, 0.18);   // outline border
-  --scrim-25: rgba(0, 0, 0, 0.25);   // dashed dropzone
-  --scrim-40: rgba(0, 0, 0, 0.40);   // outline hover-border
-  --scrim-on-dark-4:  rgba(255, 255, 255, 0.04);
-  --scrim-on-dark-5:  rgba(255, 255, 255, 0.05);
-  --scrim-on-dark-6:  rgba(255, 255, 255, 0.06);
-  --scrim-on-dark-8:  rgba(255, 255, 255, 0.08);
-  --scrim-on-dark-10: rgba(255, 255, 255, 0.10);
-  --scrim-on-dark-12: rgba(255, 255, 255, 0.12);   // = --color-border-on-dark
-  --scrim-on-dark-15: rgba(255, 255, 255, 0.15);
-  --scrim-on-dark-18: rgba(255, 255, 255, 0.18);
-  --scrim-on-dark-30: rgba(255, 255, 255, 0.30);
-}
 
 // Default anchor styling; overridden in dark contexts (.surface--active,
 // app-nav, footer) where the link colour switches to white-ish.
@@ -131,11 +31,12 @@ a {
   &:hover { color: var(--color-link-hover); text-decoration: underline; }
 }
 
-// -----------------------------------------------------------------------------
-// 2. Base
-// -----------------------------------------------------------------------------
-::-moz-selection { color: #000; background: var(--color-accent); }
-::selection      { color: #000; background: var(--color-accent); }
+// ::selection lives in css/base.css. The -moz- prefixed twin has no
+// standard alias to pair with, so it stays here and mirrors it.
+::-moz-selection {
+  color: var(--color-accent-text);
+  background: var(--color-accent);
+}
 
 html {
   position: relative;
@@ -143,34 +44,34 @@ html {
 }
 
 body {
-  background-color: var(--color-bg);
+  background-color: var(--color-canvas);
   margin: 0;
-  padding-top: 4.5rem;          // app-nav height
+  padding-top: var(--nav-height);
   font-family: "Plus Jakarta Sans", Helvetica, Arial, sans-serif;
   font-size: 1rem;
   line-height: 1.5;
-  color: var(--color-text-on-dark);
+  color: var(--color-on-canvas);
   -webkit-font-smoothing: antialiased;
 }
 
 main {
   display: block;
-  min-height: calc(100vh - 4.5rem - 13rem);   // app-nav + footer
-  padding: var(--space-6) 0 var(--space-7);
+  min-height: var(--content-min-height);
+  padding: calc(var(--spacing) * 8) 0 calc(var(--spacing) * 12);
 }
 
 label { text-align: left; }
 
 
 // -----------------------------------------------------------------------------
-// 3. Typography helpers
+// 2. Typography helpers
 // -----------------------------------------------------------------------------
 .page-header {
   font-size: 1.875rem;          // 30px
   font-weight: 700;
   letter-spacing: -0.02em;
   margin: 0;
-  color: var(--color-text-on-dark);
+  color: var(--color-on-canvas);
   // 30px swallows two lines of vertical space on a narrow phone for
   // a single-word title. Drop to 24px below the sm breakpoint so the
   // header bar (title + lede + actions) fits the same vertical
@@ -182,20 +83,20 @@ label { text-align: left; }
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-4);
-  margin-bottom: var(--space-6);
+  gap: calc(var(--spacing) * 4);
+  margin-bottom: calc(var(--spacing) * 8);
 
   .page-header-bar__title { flex: 1 1 auto; min-width: 0; }
   .page-header-bar__lede {
-    margin: var(--space-1) 0 0;
-    color: var(--color-text-on-dark-muted);
+    margin: calc(var(--spacing) * 1) 0 0;
+    color: var(--color-on-canvas-muted);
     font-size: 0.95rem;
   }
   .page-header-bar__actions {
     flex: 0 0 auto;
     display: flex;
     flex-wrap: wrap;
-    gap: var(--space-2);
+    gap: calc(var(--spacing) * 2);
   }
 }
 
@@ -208,11 +109,11 @@ label { text-align: left; }
 
 .muted-label {
   font-size: 0.8125rem;
-  color: var(--color-text-muted);
+  color: var(--color-fg-muted);
 }
 
 // -----------------------------------------------------------------------------
-// 4. Surface (card) component
+// 3. Surface (card) component
 //
 // `.surface` declares a *context*, not just a background — it exposes
 // --surface-* CSS custom properties (text colour, muted text, scrim
@@ -223,48 +124,48 @@ label { text-align: left; }
 // -----------------------------------------------------------------------------
 .surface {
   --surface-bg: var(--color-surface);
-  --surface-text: var(--color-text);
-  --surface-text-muted: var(--color-text-muted);
-  --surface-text-faint: var(--color-text-muted);
+  --surface-text: var(--color-fg);
+  --surface-text-muted: var(--color-fg-muted);
+  --surface-text-faint: var(--color-fg-muted);
   --surface-divider: var(--color-border);
-  --surface-scrim-2: var(--scrim-2);
-  --surface-scrim-5: var(--scrim-5);
-  --surface-scrim-8: var(--scrim-6);
-  --surface-scrim-10: var(--scrim-10);
+  --surface-scrim-2: var(--color-scrim-2);
+  --surface-scrim-5: var(--color-scrim-5);
+  --surface-scrim-8: var(--color-scrim-8);
+  --surface-scrim-10: var(--color-scrim-10);
   --surface-anchor: var(--color-link);
   --surface-anchor-hover: var(--color-link-hover);
 
   background: var(--surface-bg);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-md);
-  padding: var(--space-6);
+  padding: calc(var(--spacing) * 8);
   color: var(--surface-text);
 }
 
 .surface--active {
-  --surface-bg: linear-gradient(180deg, var(--color-active-tint) 0%, var(--color-active) 100%);
-  --surface-text: var(--color-text-on-dark);
-  --surface-text-muted: var(--color-text-on-dark-muted);
-  --surface-text-faint: var(--color-text-on-dark-faint);
-  --surface-divider: var(--color-border-on-dark);
-  --surface-scrim-2: var(--scrim-on-dark-4);
-  --surface-scrim-5: var(--scrim-on-dark-8);
-  --surface-scrim-8: var(--scrim-on-dark-10);
-  --surface-scrim-10: var(--scrim-on-dark-15);
+  --surface-bg: linear-gradient(180deg, var(--color-feature-from) 0%, var(--color-feature-to) 100%);
+  --surface-text: var(--color-on-feature);
+  --surface-text-muted: var(--color-on-feature-muted);
+  --surface-text-faint: var(--color-on-feature-faint);
+  --surface-divider: var(--color-feature-divider);
+  --surface-scrim-2: var(--color-paper-4);
+  --surface-scrim-5: var(--color-paper-8);
+  --surface-scrim-8: var(--color-paper-10);
+  --surface-scrim-10: var(--color-paper-15);
   --surface-anchor: var(--color-accent);
   --surface-anchor-hover: var(--color-accent);
 }
 
 .surface--inset {
-  padding: var(--space-5);
+  padding: calc(var(--spacing) * 6);
 }
 
 .surface__header {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: var(--space-3);
-  margin-bottom: var(--space-4);
+  gap: calc(var(--spacing) * 3);
+  margin-bottom: calc(var(--spacing) * 4);
 
   h2 {
     font-size: 1.0625rem;
@@ -280,21 +181,21 @@ label { text-align: left; }
 }
 
 // -----------------------------------------------------------------------------
-// 5. Buttons
+// 4. Buttons
 // -----------------------------------------------------------------------------
 .app-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 0.4em;
-  padding: 0.5625rem var(--space-4);
+  padding: 0.5625rem calc(var(--spacing) * 4);
   font: inherit;
   font-weight: 600;
   line-height: 1.4;
   border: 1px solid transparent;
   border-radius: var(--radius-md);
   background: transparent;
-  color: var(--color-text);
+  color: var(--color-fg);
   cursor: pointer;
   text-decoration: none;
   transition: transform var(--t-fast), box-shadow var(--t-fast),
@@ -313,43 +214,49 @@ label { text-align: left; }
 }
 
 .app-btn-primary {
-  background-image: $anthias-yellow-gradient;
-  background-color: $anthias-yellow-3;
+  background-image: var(--gradient-accent);
+  background-color: var(--color-accent);
   border-color: transparent;
   color: var(--color-accent-text);
   font-weight: 700;
 
   &:hover, &:focus {
-    background-image: $anthias-yellow-gradient;
+    background-image: var(--gradient-accent);
     color: var(--color-accent-text);
     box-shadow: var(--shadow-md);
   }
-  &:active { background-color: $anthias-yellow-2; }
+  &:active { background-color: var(--color-accent-strong); }
 }
 
 .app-btn-light {
   background: var(--color-surface);
-  border-color: var(--scrim-6);
-  color: var(--color-text);
-  &:hover { background: var(--color-surface-soft); color: var(--color-text); }
+  border-color: var(--color-scrim-6);
+  color: var(--color-fg);
+  &:hover { background: var(--color-surface-soft); color: var(--color-fg); }
 }
 
+// --color-danger-fill, NOT --color-danger. The two are split precisely
+// for this: the ink lightens in dark mode so it stays readable on a dark
+// surface, and a fill that lightens strands the white label at 2.75:1.
+// The fill stays dark in both themes and carries white at 6.47:1.
+// Graphical uses that carry no text — the load bar, the legend swatch,
+// the map pin — correctly keep --color-danger and do lighten.
 .app-btn-danger {
-  background: var(--color-danger);
-  border-color: var(--color-danger);
-  color: var(--color-text-on-dark);
+  background: var(--color-danger-fill);
+  border-color: var(--color-danger-fill);
+  color: var(--color-on-danger);
   &:hover {
-    background: var(--color-danger-hover);
-    border-color: var(--color-danger-active);
-    color: var(--color-text-on-dark);
+    background: var(--color-danger-fill-hover);
+    border-color: var(--color-danger-fill-active);
+    color: var(--color-on-danger);
   }
 }
 
 .app-btn-link {
-  color: var(--color-text-muted);
+  color: var(--color-fg-muted);
   text-decoration: none;
   font-weight: 600;
-  &:hover { color: var(--color-text); text-decoration: underline; }
+  &:hover { color: var(--color-fg); text-decoration: underline; }
 }
 
 // Icon-only square button — reads surface context, so the same markup
@@ -357,8 +264,8 @@ label { text-align: left; }
 // card without any parent-selector override.
 .app-btn-icon {
   padding: 0.5rem;
-  width: 2.25rem;
-  height: 2.25rem;
+  width: var(--btn-icon-size);
+  height: var(--btn-icon-size);
   flex: none;
   font-size: 0.95rem;
   background: transparent;
@@ -373,13 +280,13 @@ label { text-align: left; }
 
 // On-light outline (settings page — Backup / Reboot etc.)
 .app-btn-outline-dark {
-  color: var(--color-text);
-  border-color: var(--scrim-18);
+  color: var(--color-fg);
+  border-color: var(--color-scrim-18);
   background: transparent;
   &:hover {
-    background: var(--scrim-4);
-    border-color: var(--scrim-40);
-    color: var(--color-text);
+    background: var(--color-scrim-4);
+    border-color: var(--color-scrim-40);
+    color: var(--color-fg);
   }
 }
 
@@ -390,7 +297,7 @@ label { text-align: left; }
 }
 
 // -----------------------------------------------------------------------------
-// 6. Asset table
+// 5. Asset table
 // -----------------------------------------------------------------------------
 .asset-table {
   width: 100%;
@@ -403,7 +310,7 @@ label { text-align: left; }
     font-weight: 700;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    padding: var(--space-3) var(--space-3);
+    padding: calc(var(--spacing) * 3) calc(var(--spacing) * 3);
     border-bottom: 1px solid var(--surface-divider);
     background: transparent;
     color: var(--surface-text-muted);
@@ -411,7 +318,7 @@ label { text-align: left; }
   }
 
   tbody td {
-    padding: var(--space-4) var(--space-3);
+    padding: calc(var(--spacing) * 4) calc(var(--spacing) * 3);
     border-bottom: 1px solid var(--surface-divider);
     vertical-align: middle;
     color: var(--surface-text);
@@ -447,7 +354,7 @@ label { text-align: left; }
 
     tbody tr {
       display: block;
-      padding: var(--space-3) 0;
+      padding: calc(var(--spacing) * 3) 0;
       border-bottom: 1px solid var(--surface-divider);
     }
     tbody tr:last-child { border-bottom: none; }
@@ -455,7 +362,7 @@ label { text-align: left; }
     tbody td,
     tbody th {
       display: block;
-      padding: var(--space-1) 0;
+      padding: calc(var(--spacing) * 1) 0;
       border: 0;
       text-align: left;
 
@@ -477,23 +384,34 @@ label { text-align: left; }
       &[data-no-label]::before { display: none; }
     }
 
-    // Home rows: 2-column grid. Name spans both, schedule + duration
-    // share row 2, toggle + actions share row 3. Right-aligned cells
-    // align their labels to match.
+    // Home rows: 2-column grid. The select checkbox (child 1) is
+    // lifted out of flow into the top-left corner; name (child 2)
+    // spans both columns, schedule + duration share row 2, toggle +
+    // actions share row 3. Right-aligned cells align their labels to
+    // match.
     tbody tr[data-asset-id] {
       display: grid;
       grid-template-columns: 1fr auto;
-      gap: var(--space-2) var(--space-3);
+      gap: calc(var(--spacing) * 2) calc(var(--spacing) * 3);
+      position: relative;
+      padding-left: 1.9rem;
 
-      td:nth-child(1) { grid-column: 1 / -1; }
-      td:nth-child(2) { grid-column: 1 / 2; }
-      td:nth-child(3) {
+      td.asset-select-col {
+        position: absolute;
+        left: 0;
+        top: calc(var(--spacing) * 3);
+        padding: 0;
+        &::before { display: none; }
+      }
+      td:nth-child(2) { grid-column: 1 / -1; }
+      td:nth-child(3) { grid-column: 1 / 2; }
+      td:nth-child(4) {
         grid-column: 2 / 3;
         text-align: right;
         &::before { text-align: right; }
       }
-      td:nth-child(4) { grid-column: 1 / 2; align-self: center; }
-      td:nth-child(5) {
+      td:nth-child(5) { grid-column: 1 / 2; align-self: center; }
+      td:nth-child(6) {
         grid-column: 2 / 3;
         align-self: center;
         &::before { text-align: right; }
@@ -506,10 +424,59 @@ label { text-align: left; }
   }
 }
 
+// Bulk-selection chrome (#3046): the leading checkbox column, the
+// per-section select-all in the surface header, and the selected-row
+// highlight. The checkbox itself reuses .app-check-input from the
+// forms section; .asset-select is just the clickable hit-area wrapper.
+.asset-select-col {
+  width: 2.75rem;
+  text-align: center;
+}
+
+// The actions column is sized from what it holds, not as a share of
+// the table. `table-layout: fixed` does not grow a column that is too
+// narrow for its content — it lets the content overflow — so the old
+// `width: 14%` put the four icon buttons past the table's right edge
+// at every viewport: 14% tops out at ~167px (the container caps at
+// --container-page) against the ~185px the buttons and the cell's
+// side padding actually need. The last button's hover background made
+// the overflow visible, and below ~1120px it cleared the .surface
+// card entirely and drew on the page background.
+.asset-actions-col {
+  width: calc(
+    4 * var(--btn-icon-size) + 3 * var(--action-group-gap) +
+      var(--spacing) * 6
+  );
+}
+
+.asset-select {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  margin: 0;
+
+  .app-check-input { margin: 0; cursor: pointer; }
+}
+
+.surface__header-left {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 3);
+  min-width: 0;
+}
+
+.asset-table tbody tr.is-selected td {
+  background: var(--color-accent-wash);
+}
+.asset-table tbody tr.is-selected:hover td {
+  background: var(--color-accent-wash);
+}
+
 .asset-cell-name {
   display: flex;
   align-items: center;
-  gap: var(--space-3);
+  gap: calc(var(--spacing) * 3);
   min-width: 0;
 
   .drag-handle {
@@ -546,12 +513,12 @@ label { text-align: left; }
   }
 }
 // -----------------------------------------------------------------------------
-// 7. Schedule chip
+// 6. Schedule chip
 // -----------------------------------------------------------------------------
 .schedule-chips {
   display: inline-flex;
   flex-wrap: wrap;
-  gap: var(--space-1);
+  gap: calc(var(--spacing) * 1);
   vertical-align: middle;
 }
 // Chip palette is exposed through context tokens so each surface picks
@@ -560,14 +527,14 @@ label { text-align: left; }
 // .surface--active block down in section 4 flips them to the dark-
 // surface chip palette (yellow accent, deeper-green --all variant).
 .surface {
-  --chip-neutral-bg:     var(--scrim-5);
-  --chip-neutral-text:   var(--color-text-muted);
-  --chip-neutral-edge:   var(--scrim-6);
+  --chip-neutral-bg:     var(--color-scrim-5);
+  --chip-neutral-text:   var(--color-fg-muted);
+  --chip-neutral-edge:   var(--color-scrim-6);
   --chip-day-bg:         var(--color-link-wash);
   --chip-day-text:       var(--color-link);
   --chip-day-edge:       var(--color-link-edge);
   --chip-all-bg:         var(--color-success-wash);
-  --chip-all-text:       var(--color-success-text-on-wash);
+  --chip-all-text:       var(--color-success-on-wash);
   --chip-all-edge:       var(--color-success-edge);
 }
 .surface--active {
@@ -578,7 +545,7 @@ label { text-align: left; }
   --chip-neutral-text:   var(--color-accent);
   --chip-neutral-edge:   var(--color-accent-edge);
   --chip-all-bg:         var(--color-success-wash-strong);
-  --chip-all-text:       var(--color-success-text-on-wash-strong);
+  --chip-all-text:       var(--color-success-on-wash-strong);
   --chip-all-edge:       var(--color-success-edge-strong);
   // --chip-day-* inherits the light-surface defaults; that palette
   // already reads cleanly on the gradient.
@@ -617,7 +584,7 @@ label { text-align: left; }
 .schedule-window {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-2);
+  gap: calc(var(--spacing) * 2);
   min-width: 0;
 }
 // Schedule-window state-color set is also exposed through chip-style
@@ -626,12 +593,12 @@ label { text-align: left; }
 // regular --color-success). Sets default to light-surface palette;
 // .surface--active flips just the live-state pair.
 .surface {
-  --window-dot-default-ring: var(--scrim-4);
+  --window-dot-default-ring: var(--color-scrim-4);
   --window-live-fill: var(--color-success);
   --window-live-ring: var(--color-success-ring);
 }
 .surface--active {
-  --window-dot-default-ring: var(--scrim-on-dark-5);
+  --window-dot-default-ring: var(--color-paper-5);
   --window-live-fill: var(--color-success-bright);
   --window-live-ring: var(--color-success-wash);
 }
@@ -690,7 +657,7 @@ label { text-align: left; }
 }
 
 // -----------------------------------------------------------------------------
-// 8. Activity toggle (form switch) sizing
+// 7. Activity toggle (form switch) sizing
 // -----------------------------------------------------------------------------
 .app-switch.activity-toggle .app-check-input {
   width: 2.4em;
@@ -703,16 +670,16 @@ label { text-align: left; }
 // explicit fill because a transparent off-state vanishes against the
 // purple gradient.
 .surface--active .app-check-input:not(:checked) {
-  background-color: var(--scrim-on-dark-18);
-  border-color: var(--scrim-on-dark-30);
+  background-color: var(--color-paper-18);
+  border-color: var(--color-paper-30);
 }
 
 // -----------------------------------------------------------------------------
-// 9. Action group (icon buttons) and processing label
+// 8. Action group (icon buttons) and processing label
 // -----------------------------------------------------------------------------
 .action-group {
   display: inline-flex;
-  gap: 0.35rem;
+  gap: var(--action-group-gap);
 }
 
 .processing-pill {
@@ -744,14 +711,14 @@ label { text-align: left; }
   border-radius: var(--radius-pill);
   font-size: 0.72rem;
   font-weight: 600;
-  background: var(--color-warning-soft, #fef3c7);
-  color: var(--color-warning-strong, #92400e);
+  background: var(--color-warning-wash);
+  color: var(--color-warning-on-wash);
   cursor: pointer;
   transition: background 120ms ease, transform 120ms ease;
 
   &:hover,
   &:focus-visible {
-    background: color-mix(in oklab, var(--color-warning-soft, #fef3c7) 80%, #000);
+    background: color-mix(in oklab, var(--color-warning-wash) 80%, #000);
     outline: none;
   }
   &:active {
@@ -764,11 +731,11 @@ label { text-align: left; }
 // pattern with something the operator can read, copy from, and
 // dismiss by editing the row.
 .modal-alert {
-  border: 1px solid var(--color-warning-strong, #92400e);
+  border: 1px solid var(--color-warning-on-wash);
   border-radius: var(--radius-md, 0.5rem);
   padding: 0.85rem 1rem;
-  background: var(--color-warning-soft, #fef3c7);
-  color: var(--color-warning-strong, #92400e);
+  background: var(--color-warning-wash);
+  color: var(--color-warning-on-wash);
 
   .modal-alert__head {
     display: flex;
@@ -813,38 +780,79 @@ label { text-align: left; }
     flex-shrink: 0;
     align-self: flex-start;
   }
+  // GUI alternative to the ffmpeg recipe: numbered HandBrake steps for
+  // operators who'd rather not use a terminal.
+  .modal-alert__handbrake {
+    margin-top: 0.7rem;
+  }
+  .modal-alert__handbrake-lead {
+    margin: 0 0 0.35rem;
+    line-height: 1.4;
+
+    a {
+      color: inherit;
+      font-weight: 600;
+      text-decoration: underline;
+    }
+  }
+  .modal-alert__steps {
+    margin: 0;
+    padding-left: 1.2rem;
+    line-height: 1.4;
+
+    li {
+      margin-bottom: 0.25rem;
+
+      &:last-child {
+        margin-bottom: 0;
+      }
+    }
+  }
 }
 
 // -----------------------------------------------------------------------------
-// 10. Empty state
+// 9. Empty state
 // -----------------------------------------------------------------------------
 .empty-state {
   text-align: center;
-  padding: var(--space-7) var(--space-4);
+  padding: calc(var(--spacing) * 12) calc(var(--spacing) * 4);
   color: var(--surface-text-muted);
 
   .empty-state__icon {
     font-size: 2rem;
     opacity: 0.45;
-    margin-bottom: var(--space-2);
+    margin-bottom: calc(var(--spacing) * 2);
   }
   .empty-state__title {
     font-weight: 600;
-    margin-bottom: var(--space-1);
+    margin-bottom: calc(var(--spacing) * 1);
   }
   .empty-state__description {
     font-size: 0.9rem;
-    margin: 0 0 var(--space-3);
+    margin: 0 0 calc(var(--spacing) * 3);
   }
-  a {
+  // The call-to-action is an action (opens the Add modal), not
+  // navigation, so it's a <button> styled as a link.
+  a,
+  .empty-state__action {
+    font: inherit;
     font-weight: 600;
+    padding: 0;
+    border: none;
+    background: none;
+    cursor: pointer;
     color: var(--surface-anchor);
     &:hover { color: var(--surface-anchor-hover); }
+    &:focus-visible {
+      outline: none;
+      border-radius: var(--radius-sm);
+      box-shadow: 0 0 0 var(--ring-width) var(--color-focus-ring);
+    }
   }
 }
 
 // -----------------------------------------------------------------------------
-// 11. Modal
+// 10. Modal
 // -----------------------------------------------------------------------------
 .modal-overlay {
   display: flex;
@@ -852,12 +860,22 @@ label { text-align: left; }
   justify-content: center;
   position: fixed;
   inset: 0;
-  padding: var(--space-5);
+  padding: calc(var(--spacing) * 6);
   overflow-y: auto;
   background: rgba(15, 0, 25, 0.55);
   backdrop-filter: blur(6px) saturate(120%);
   -webkit-backdrop-filter: blur(6px) saturate(120%);
-  z-index: 1050;
+  z-index: var(--z-modal);
+}
+
+// An overlay opened from inside another modal: preview, bulk delete,
+// delete confirm. A modifier rather than a `z-(--z-modal-nested)`
+// utility in the markup, because that utility would tie with
+// .modal-overlay on specificity (0,1,0) and lose on order — anthias.css
+// loads after tailwind.css. The old inline style="z-index: 1060" only
+// worked because inline beats every stylesheet.
+.modal-overlay--nested {
+  z-index: var(--z-modal-nested);
 }
 
 .modal-card {
@@ -867,9 +885,17 @@ label { text-align: left; }
   width: 100%;
   max-width: 720px;
   margin: auto;
-  overflow: hidden;
-  color: var(--color-text);
-  animation: modal-in 220ms var(--ease-out) both;
+  // Cap the card to the viewport (minus the overlay's space-5 padding
+  // top + bottom) and scroll inside it, so a tall modal — the
+  // bulk-edit form with every group expanded, or the Edit modal with
+  // the failure alert + Advanced open — never pushes its footer below
+  // the fold. The header/footer pin via position: sticky so the title
+  // and the Save/Apply buttons stay reachable while the body scrolls.
+  // (overflow-y: auto still clips children to the rounded corners.)
+  max-height: calc(100vh - calc(var(--spacing) * 6) * 2);
+  overflow-y: auto;
+  color: var(--color-fg);
+  animation: modal-in 220ms var(--ease-standard) both;
 }
 
 @keyframes modal-in {
@@ -880,8 +906,15 @@ label { text-align: left; }
 .modal-card--sm { max-width: 480px; }
 
 .modal-card__header {
-  padding: var(--space-5) var(--space-6);
+  padding: calc(var(--spacing) * 6) calc(var(--spacing) * 8);
   border-bottom: 1px solid var(--color-border);
+  // Pin to the top of the scrolling card so the title + close button
+  // stay put while a tall body scrolls underneath. Opaque background
+  // so scrolled content doesn't bleed through.
+  position: sticky;
+  top: 0;
+  z-index: var(--z-raised);
+  background: var(--color-surface);
   display: flex;
   // Top-aligned across every modal: only the preview modal can carry
   // a long title (the asset name), but `flex-start` is also fine for
@@ -891,7 +924,7 @@ label { text-align: left; }
   // button down.
   align-items: flex-start;
   justify-content: space-between;
-  gap: var(--space-3);
+  gap: calc(var(--spacing) * 3);
 
   h2 {
     margin: 0;
@@ -910,14 +943,14 @@ label { text-align: left; }
   height: 2rem;
   border-radius: var(--radius-md);
   border: none;
-  background: var(--scrim-5);
-  color: var(--color-text-muted);
+  background: var(--color-scrim-5);
+  color: var(--color-fg-muted);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
   transition: background var(--t-fast), color var(--t-fast);
-  &:hover { background: var(--scrim-10); color: var(--color-text); }
+  &:hover { background: var(--color-scrim-10); color: var(--color-fg); }
   &:focus-visible {
     outline: none;
     box-shadow: 0 0 0 var(--ring-width) var(--color-focus-ring);
@@ -931,7 +964,7 @@ label { text-align: left; }
   border-bottom: 1px solid var(--color-border);
 
   .app-tab-link {
-    color: var(--color-text-muted);
+    color: var(--color-fg-muted);
     background: transparent;
     border: none;
     border-bottom: 2px solid transparent;
@@ -942,26 +975,31 @@ label { text-align: left; }
     transition: color var(--t-fast), border-color var(--t-fast);
 
     &:hover {
-      color: var(--color-text);
+      color: var(--color-fg);
       border-bottom-color: var(--color-border);
     }
     &.active {
-      color: var(--color-text);
+      color: var(--color-fg);
       background: transparent;
-      border-bottom-color: var(--color-text);
+      border-bottom-color: var(--color-fg);
     }
   }
 }
 
-.modal-card__body  { padding: var(--space-6); }
+.modal-card__body  { padding: calc(var(--spacing) * 8); }
 .modal-card__footer {
-  padding: var(--space-4) var(--space-6);
+  padding: calc(var(--spacing) * 4) calc(var(--spacing) * 8);
   border-top: 1px solid var(--color-border);
   background: var(--color-surface-soft);
+  // Pin to the bottom of the scrolling card so Save / Apply / Cancel
+  // stay reachable no matter how tall the body grows.
+  position: sticky;
+  bottom: 0;
+  z-index: var(--z-raised);
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: var(--space-2);
+  gap: calc(var(--spacing) * 2);
   // Wrap is set on every modal footer but only kicks in when the row
   // can't fit. The preview modal is the one that actually exercises
   // it (link + blurb + Done at 390px); other modals' two-button
@@ -975,7 +1013,7 @@ label { text-align: left; }
 // button with a rotating chevron; auto-open is wired in the template
 // when the asset has any non-default value in the Advanced block.
 .modal-section {
-  margin-bottom: var(--space-5);
+  margin-bottom: calc(var(--spacing) * 6);
 
   &:last-child { margin-bottom: 0; }
 }
@@ -986,32 +1024,32 @@ label { text-align: left; }
   font-size: 0.95rem;
   font-weight: 700;
   letter-spacing: -0.01em;
-  color: var(--color-text);
+  color: var(--color-fg);
 }
 
 .modal-section__hint {
-  margin: var(--space-1) 0 var(--space-3);
-  color: var(--color-text-muted);
+  margin: calc(var(--spacing) * 1) 0 calc(var(--spacing) * 3);
+  color: var(--color-fg-muted);
   font-size: 0.8125rem;
   line-height: 1.45;
 }
 
 .modal-section--collapsible {
   border-top: 1px solid var(--color-border);
-  padding-top: var(--space-3);
+  padding-top: calc(var(--spacing) * 3);
 }
 
 .modal-section__toggle {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--space-3);
+  gap: calc(var(--spacing) * 3);
   width: 100%;
   background: none;
   border: 0;
-  padding: var(--space-1) 0;
+  padding: calc(var(--spacing) * 1) 0;
   cursor: pointer;
-  color: var(--color-text);
+  color: var(--color-fg);
   text-align: left;
 
   &:focus-visible {
@@ -1023,7 +1061,7 @@ label { text-align: left; }
 
 .modal-section__chevron {
   font-size: 1.1rem;
-  color: var(--color-text-muted);
+  color: var(--color-fg-muted);
   transition: transform var(--t-fast);
 
   .modal-section--collapsible.is-open & {
@@ -1032,28 +1070,28 @@ label { text-align: left; }
 }
 
 .modal-section__body {
-  padding-top: var(--space-3);
+  padding-top: calc(var(--spacing) * 3);
 }
 
 .modal-section__divider {
   height: 1px;
   background: var(--color-border);
-  margin: var(--space-4) 0;
+  margin: calc(var(--spacing) * 4) 0;
 }
 
 // Flatpickr in modal — keep the popup above the modal overlay's
-// stacking context (the overlay is z-index 1050) so the calendar /
-// time wheels render on top of the modal-card body. The default
-// flatpickr z-index is 99999 in its own stylesheet, but our import
-// order can lose to local rules — pin it explicitly here.
-.flatpickr-calendar.open { z-index: 1100; }
+// stacking context (--z-modal, and --z-modal-nested above it) so the
+// calendar / time wheels render on top of the modal-card body. The
+// default flatpickr z-index is 99999 in its own stylesheet, but our
+// import order can lose to local rules — pin it explicitly here.
+.flatpickr-calendar.open { z-index: var(--z-datepicker); }
 
 // Preview modal — wider card, dark stage so transparent images stay
 // readable and videos sit on a neutral surround.
 .modal-card--preview { max-width: 960px; }
 .modal-card__body--preview {
   padding: 0;
-  background: var(--color-bg-deep);
+  background: var(--color-canvas-deep);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1076,10 +1114,35 @@ label { text-align: left; }
   max-height: calc(100vh - 12rem);
   border: 0;
   background: var(--color-surface);
+
+  // A drag that crosses into an iframe belongs to the frame: drag
+  // events do not cross a browsing-context boundary, so the page-wide
+  // drop handlers in home.ts never see it and the frame falls back to
+  // the browser default — it navigates away from the preview to the
+  // dropped file. Taking the frame out of hit-testing for the length
+  // of the drag hands those events back to the page underneath, which
+  // refuses the drop without navigating anything.
+  //
+  // Only while a drag is in flight; the frame has to stay interactive
+  // the rest of the time. Arming it costs nothing in practice: the
+  // frame never touches the viewport edge (the nested overlay's
+  // padding and the card header sit between), so a drag arriving from
+  // the desktop crosses the page's own document first and sets
+  // pageDragActive on the way in.
+  //
+  // Known residual, accepted deliberately: drag events are sampled, so
+  // a fast enough flick can land its first sampled position inside the
+  // frame and skip the parent entirely. The frame then takes the drop
+  // and navigates itself — it is sandboxed without allow-top-navigation,
+  // so the page behind it is untouched and closing the preview restores
+  // it. Closing that last gap means either giving up preview
+  // interactivity outright or a click-to-interact shim with its own
+  // pointer plumbing, both of which cost more than the glitch does.
+  &.is-drag-shielded { pointer-events: none; }
 }
 
 // -----------------------------------------------------------------------------
-// 12. Forms — token-driven form components.
+// 11. Forms — token-driven form components.
 // -----------------------------------------------------------------------------
 .app-input,
 .app-select {
@@ -1089,7 +1152,7 @@ label { text-align: left; }
   font-size: 1rem;
   font-weight: 400;
   line-height: 1.4;
-  color: var(--color-text);
+  color: var(--color-fg);
   background-color: var(--color-surface);
   background-clip: padding-box;
   border: 1px solid var(--color-border);
@@ -1104,10 +1167,10 @@ label { text-align: left; }
   &:disabled,
   &[readonly] {
     background-color: var(--color-surface-tint);
-    color: var(--color-text-muted);
+    color: var(--color-fg-muted);
   }
   &::placeholder {
-    color: var(--color-text-muted);
+    color: var(--color-fg-muted);
     opacity: 0.7;
   }
 }
@@ -1133,19 +1196,27 @@ label { text-align: left; }
     inset: 0 auto auto 0;
     padding: 0.85rem;
     pointer-events: none;
-    color: var(--color-text-muted);
+    color: var(--color-fg-muted);
     font-size: 0.95rem;
     transition: opacity var(--t-fast), transform var(--t-fast),
       font-size var(--t-fast);
     transform-origin: 0 0;
     font-weight: 500;
   }
+  // A floating label and a visible placeholder claim the same spot. The
+  // label only lifts on :not(:placeholder-shown), which is false exactly
+  // while a placeholder is on screen, so a field carrying a real
+  // placeholder renders the label on top of the placeholder text. Fields
+  // that want the placeholder as a worked example opt into --lifted and
+  // keep the label raised from the start. The 1.4rem block padding above
+  // already reserves the room, so the placeholder lands clear of it.
   > .app-input:focus ~ label,
   > .app-input:not(:placeholder-shown) ~ label,
-  > .app-select ~ label {
+  > .app-select ~ label,
+  &.app-floating--lifted > label {
     transform: translateY(-0.55rem);
     font-size: 0.72rem;
-    color: var(--color-text-muted);
+    color: var(--color-fg-muted);
     letter-spacing: 0.04em;
     font-weight: 600;
   }
@@ -1154,7 +1225,7 @@ label { text-align: left; }
 .app-check {
   display: flex;
   align-items: center;
-  gap: var(--space-2);
+  gap: calc(var(--spacing) * 2);
   min-height: 1.5rem;
 }
 .app-check-input {
@@ -1174,6 +1245,16 @@ label { text-align: left; }
     background-color: var(--color-link);
     border-color: var(--color-link);
     background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%23fff' stroke-linecap='round' stroke-linejoin='round' stroke-width='3' d='m4 8.5 3 3 5-7'/%3e%3c/svg%3e");
+    background-size: 0.85rem 0.85rem;
+    background-position: center;
+    background-repeat: no-repeat;
+  }
+  // Partial selection (the section select-all when only some rows are
+  // ticked). Mirrors :checked but draws a dash instead of a tick.
+  &:indeterminate {
+    background-color: var(--color-link);
+    border-color: var(--color-link);
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%23fff' stroke-linecap='round' stroke-width='3' d='M4 8h8'/%3e%3c/svg%3e");
     background-size: 0.85rem 0.85rem;
     background-position: center;
     background-repeat: no-repeat;
@@ -1205,18 +1286,19 @@ label { text-align: left; }
 .app-form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--space-4);
+  gap: calc(var(--spacing) * 4);
   @media (max-width: 720px) { grid-template-columns: 1fr; }
 }
 
 .weekday-picker {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--space-2);
+  gap: calc(var(--spacing) * 2);
 
   .weekday {
     --bg: var(--color-surface-tint);
-    --fg: var(--color-text);
+    --fg: var(--color-fg);
+    position: relative;
     border: 1px solid var(--color-border);
     background: var(--bg);
     color: var(--fg);
@@ -1226,22 +1308,41 @@ label { text-align: left; }
     cursor: pointer;
     user-select: none;
     transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
-    input { display: none; }
+
+    // Visually hidden but still focusable and still announced. This was
+    // `display: none`, which drops the control out of the tab order and
+    // the accessibility tree entirely — the chips could only be operated
+    // with a pointer. Clipping instead keeps them keyboard- and
+    // screen-reader-reachable while looking identical.
+    input {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      margin: 0;
+      opacity: 0;
+      pointer-events: none;
+    }
   }
   .weekday:has(input:checked) {
-    --bg: #{$anthias-yellow-3};
+    --bg: var(--color-accent);
     --fg: var(--color-accent-text);
-    border-color: $anthias-yellow-2;
+    border-color: var(--color-accent-strong);
+  }
+  // The input itself is invisible, so the ring has to be drawn on the
+  // chip. Mirrors .app-check-input's focus treatment.
+  .weekday:has(input:focus-visible) {
+    outline: none;
+    box-shadow: 0 0 0 var(--ring-width) var(--color-focus-ring);
   }
 }
 
 // -----------------------------------------------------------------------------
-// 13. Stat card (system info)
+// 12. Stat card (system info)
 // -----------------------------------------------------------------------------
 .stat-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: var(--space-4);
+  gap: calc(var(--spacing) * 4);
 
   @media (max-width: 1100px) { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   @media (max-width: 540px)  { grid-template-columns: 1fr; }
@@ -1250,12 +1351,12 @@ label { text-align: left; }
 .stat-card {
   background: var(--color-surface);
   border-radius: var(--radius-lg);
-  padding: var(--space-5);
+  padding: calc(var(--spacing) * 6);
   box-shadow: var(--shadow-sm);
-  color: var(--color-text);
+  color: var(--color-fg);
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
+  gap: calc(var(--spacing) * 2);
   // Equal-height cards within a row of the stat-grid so a 1-line
   // value next to a 3-line memory donut doesn't jump heights.
   height: 100%;
@@ -1265,7 +1366,7 @@ label { text-align: left; }
     font-weight: 700;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: var(--color-text-muted);
+    color: var(--color-fg-muted);
     margin: 0;
   }
   // Two-line layout: label on top, value-block flex-grows so cards
@@ -1292,15 +1393,316 @@ label { text-align: left; }
   }
   .stat-card__meta {
     font-size: 0.78rem;
-    color: var(--color-text-muted);
+    color: var(--color-fg-muted);
     margin-top: 0;
   }
-  .stat-card__meta a { color: $anthias-purple-5; text-decoration: none; }
+  .stat-card__meta a { color: var(--color-link); text-decoration: none; }
   .stat-card__meta a:hover { text-decoration: underline; }
+  // Variant for advisory/warning text inside a stat card. Used by the
+  // low-RAM badge on Memory, and only there: the Power supply and
+  // Storage cards carry their severity on a coloured verdict and an
+  // icon instead, so tinting their body copy as well said the same
+  // thing a third time and cost legibility. The badge has no verdict
+  // above it, so its icon, its bold lead-in and this tint are the
+  // whole signal.
+  //
+  // The -on-wash ink, NOT --color-warning. The fill colour is
+  // #f59e0b, which on a white .stat-card measures 2.15:1 — under half
+  // the 4.5:1 AA needs for body text, and visibly unreadable at this
+  // size. The token next to it exists precisely for text and measures
+  // 9.15:1. Same hue family, same signal, legible.
+  //
+  // Measured on a live device, not eyeballed: the amber paragraph on
+  // the Storage card was the worst thing on the page.
+  .stat-card__meta--warn {
+    color: var(--color-warning-on-wash);
+    margin-top: 0.5rem;
+    line-height: 1.5;
+  }
 }
 
 .stat-card--span-2 { grid-column: span 2; @media (max-width: 540px) { grid-column: span 1; } }
 .stat-card--span-full { grid-column: 1 / -1; }
+
+// Status line for the diagnostic cards (Power supply, Memory card).
+// Sized off .stat-card__value so it keeps the card rhythm, but
+// recoloured by severity. These are the cards whose headline value is
+// a verdict rather than a measurement. Uses the -text-on-wash tokens
+// rather than the base fill colours: these sit on a white .stat-card,
+// where --color-danger lands at ~4:1 and --color-success at ~1.6:1.
+.status-verdict {
+  display: inline-flex;
+  align-items: center;
+
+  &--critical { color: var(--color-danger-on-wash); }
+  &--warn     { color: var(--color-warning-on-wash); }
+  &--ok       { color: var(--color-success-on-wash); }
+}
+
+// The evidence block on a diagnostic card. Not a disclosure and not
+// muted: this is System Info, a page whose whole job is showing
+// exactly this, so hiding it behind a click and greying it out
+// inverted the emphasis — the prose got the weight and the numbers
+// someone came for got buried. It is simply present, in ordinary
+// text.
+.stat-card__details {
+  margin-top: calc(var(--spacing) * 3);
+  font-size: 0.78rem;
+  color: var(--color-fg);
+
+  p { margin: calc(var(--spacing) * 2) 0 0; line-height: 1.5; }
+
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    // 1em, not 0.95em. A monospace face set fractionally smaller than
+    // the prose around it reads as a typo rather than a distinction,
+    // and inline code appeared often enough in the storage detail to
+    // make the whole paragraph look like mixed type. The family
+    // already carries the distinction.
+    font-size: 1em;
+  }
+}
+
+// Key/value readout inside a .stat-card__details. Replaces what was a
+// paragraph of prose with monospace fragments embedded in it: at this
+// size the mixed families and the wrapping made a support engineer
+// hunt for the one number they came for. A two-column list puts every
+// label in the same place and every value on the same left edge, so
+// the block is scanned rather than read.
+//
+// This is the one place in the card allowed to look technical, and
+// it is shown outright rather than behind a toggle: System Info
+// exists to display it, and its audience is whoever is reading a
+// screenshot during a support call.
+.readout {
+  display: grid;
+  // Labels size to the longest one and then stop, so the values all
+  // share a left edge instead of stepping raggedly per row.
+  grid-template-columns: minmax(6.5rem, max-content) 1fr;
+  gap: calc(var(--spacing) * 1) calc(var(--spacing) * 3);
+  margin: calc(var(--spacing) * 2) 0 0;
+
+  &__key {
+    color: var(--color-fg-muted);
+    // The label column is deliberately NOT bolded or capitalised: it
+    // is scaffolding, and the value is the thing being looked up.
+    font-weight: 400;
+  }
+
+  &__value {
+    color: var(--color-fg);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    // Long values (a mount path, a SMART summary) wrap inside their
+    // own column rather than pushing the grid wider.
+    overflow-wrap: anywhere;
+  }
+
+  // Deliberately no severity variant. Every card here already spends
+  // its colour twice, on an icon and a coloured verdict; tinting rows
+  // of the readout as well would be a third place saying the same
+  // thing, and would put a coloured typeface under body-sized text
+  // where it reads worst.
+
+  // Below the narrow breakpoint the two columns would leave the value
+  // column too tight to read, so stack them.
+  @media (max-width: 420px) {
+    grid-template-columns: 1fr;
+    gap: 0 0;
+
+    .readout__key { margin-top: calc(var(--spacing) * 2); }
+  }
+}
+
+// Trailing caveat under a readout — the one sentence that qualifies a
+// number rather than being one.
+// Scoped under .stat-card__details deliberately. The generic
+// `.stat-card__details p` rule is (0,1,1) and a bare `.readout__note`
+// is (0,1,0), so the margin here silently lost and the note sat at
+// --space-2. Same specificity trap that made an earlier
+// `.device-alerts > * + *` rule dead code; matching the descendant
+// shape is what makes it actually apply.
+.stat-card__details .readout__note {
+  margin: calc(var(--spacing) * 3) 0 0;
+  line-height: 1.5;
+  // The one genuinely secondary line in the block: it explains a
+  // number rather than being one, so it is the only thing the muted
+  // ink is used for here.
+  color: var(--color-fg-muted);
+}
+
+// -----------------------------------------------------------------------------
+// Device alert banners (_device_alerts.html and the per-diagnostic
+// templates it includes: _power_warning.html, _storage_warning.html)
+//
+// Sit between the fixed navbar and <main> on every page. Light
+// surface rather than the page's dark ground so they read as an
+// interruption rather than as chrome. An operator should notice one
+// before they notice their content.
+// -----------------------------------------------------------------------------
+// One component, not one per diagnostic. The under-voltage and
+// memory-card warnings are the two failures a Raspberry Pi actually
+// dies of, they can be true at the same time, and they are the same
+// kind of statement to the operator: something physical is wrong,
+// here is what to do about it. Giving them a shared block is what
+// keeps a stack of two from looking like two different products.
+.device-alerts {
+  // No gap rule here on purpose. `> * + *` and `.device-alert` have
+  // identical specificity (0,1,0) and .device-alert is declared
+  // later, so its own margin-top wins and any value set here would be
+  // dead code describing spacing that never happened. The banners
+  // keep their own margin, which also means a single one renders
+  // identically to how the under-voltage banner did before it had
+  // company.
+}
+
+// Built on --color-surface like every .stat-card, so it reads as part
+// of the product rather than as a foreign alert widget dropped onto
+// the purple ground. All the alarm is carried by one element: a solid
+// severity rail down the leading edge, picked up by the icon chip and
+// the title. Everything else stays the standard card treatment;
+// spending the boldness in one place is what keeps a permanent banner
+// legible instead of exhausting.
+.device-alert {
+  // Severity is switched once here and consumed by the parts below,
+  // matching the --chip-* local-custom-property pattern used by the
+  // schedule chips rather than restating colours per element.
+  --alert-accent: var(--color-danger);
+  --alert-wash: var(--color-danger-wash);
+  --alert-edge: var(--color-danger-edge);
+  --alert-ink: var(--color-danger-on-wash);
+
+  display: flex;
+  align-items: flex-start;
+  gap: calc(var(--spacing) * 4);
+  margin-top: calc(var(--spacing) * 6);
+  padding: calc(var(--spacing) * 4) calc(var(--spacing) * 6);
+  background: var(--color-surface);
+  color: var(--color-fg);
+  border: 1px solid var(--alert-edge);
+  border-left: 0.375rem solid var(--alert-accent);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+
+  // Amber for a condition that has proven itself but isn't failing
+  // this second: power that dipped and recovered, a card carrying old
+  // errors that still writes fine. Using the same red for both would
+  // flatten a distinction the operator can act on differently.
+  &--warning {
+    --alert-accent: var(--color-warning);
+    --alert-wash: var(--color-warning-wash);
+    --alert-edge: var(--color-warning-edge);
+    --alert-ink: var(--color-warning-on-wash);
+  }
+
+  &__icon {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2.5rem;
+    height: 2.5rem;
+    border-radius: 50%;
+    font-size: 1.375rem;
+    background: var(--alert-wash);
+    color: var(--alert-ink);
+  }
+
+  &__body { flex: 1 1 auto; min-width: 0; }
+
+  &__title {
+    margin: 0;
+    font-size: 1.0625rem;
+    font-weight: 700;
+    line-height: 1.3;
+    color: var(--alert-ink);
+  }
+
+  // Body copy stays --color-fg, not the severity ink: tinting a
+  // whole paragraph red costs legibility and buys no extra signal
+  // once the rail, chip and title have carried it.
+  &__lede {
+    margin: calc(var(--spacing) * 2) 0 0;
+    font-size: 0.9375rem;
+    line-height: 1.5;
+  }
+
+  &__advice-label {
+    margin: calc(var(--spacing) * 4) 0 calc(var(--spacing) * 2);
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;      // matches .stat-card__label
+    color: var(--color-fg-muted);
+  }
+
+  &__advice {
+    margin: 0;
+    padding-left: 1.1rem;
+    list-style: disc;
+    font-size: 0.9375rem;
+    line-height: 1.5;
+    color: var(--color-fg);
+
+    // Slightly more air between items than the usual list rhythm:
+    // the first item carries a bolded recommendation and needs to
+    // separate cleanly from the secondary checks below it.
+    li + li { margin-top: calc(var(--spacing) * 2); }
+    &::marker { color: var(--alert-accent); }
+
+    // The one recommendation that actually resolves this, lifted out
+    // of the body colour so it survives a skim.
+    strong { color: var(--alert-ink); }
+  }
+
+  &__link {
+    flex: 0 0 auto;
+    // Top-aligned, not centred. `align-self: center` put it at the
+    // vertical midpoint of a banner whose height varies with the copy,
+    // so it floated beside an arbitrary bullet with no relationship to
+    // anything. Sitting on the title's optical line makes it read as
+    // the action belonging to that heading. The small offset accounts
+    // for the button's own padding so the two cap-heights align rather
+    // than the two boxes.
+    align-self: flex-start;
+    margin-top: -0.0625rem;
+    display: inline-flex;
+    align-items: center;
+    white-space: nowrap;
+    // Matches the lede and the advice list. The banner was running
+    // four prose sizes (title 1.0625, body 0.9375, this 0.875, label
+    // 0.7); one body size for everything that is a sentence leaves the
+    // title and the eyebrow as the only deliberate steps.
+    font-size: 0.9375rem;
+    font-weight: 600;
+    color: var(--alert-ink);
+    text-decoration: none;
+    padding: calc(var(--spacing) * 2) calc(var(--spacing) * 3);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--alert-edge);
+    transition: background var(--t-fast);
+
+    &:hover { background: var(--alert-wash); }
+
+    &:focus-visible {
+      box-shadow: 0 0 0 var(--ring-width) var(--color-focus-ring);
+      outline: none;
+    }
+  }
+
+  // Stack below the lg breakpoint the navbar already uses. The advice
+  // list is the payload, so it keeps full width and the Details
+  // affordance drops beneath it, indented to the body's text column
+  // rather than squeezing the copy into a narrow gutter.
+  @media (max-width: 720px) {
+    flex-wrap: wrap;
+    padding: calc(var(--spacing) * 4);
+
+    .device-alert__link {
+      align-self: flex-start;
+      margin-left: calc(2.5rem + calc(var(--spacing) * 4));
+    }
+  }
+}
 
 // Version line on System Info — calver `v2026.5.0` is the headline
 // number; the git-meta `(08c26f3, vanilla-django)` sits underneath
@@ -1312,12 +1714,12 @@ label { text-align: left; }
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: var(--space-1);
+  gap: calc(var(--spacing) * 1);
 }
 .version-line__head { font-size: 1.05rem; line-height: 1.2; }
 .version-line__meta {
   font-size: 0.78rem;
-  color: var(--color-text-muted);
+  color: var(--color-fg-muted);
   font-weight: 400;
   letter-spacing: 0;
 }
@@ -1328,7 +1730,7 @@ label { text-align: left; }
   padding: 0.2rem 0.6rem;
   border-radius: 999px;
   background: var(--color-accent);
-  color: var(--color-text);
+  color: var(--color-fg);
   font-family: var(--font-sans);
   font-size: 0.75rem;
   font-weight: 700;
@@ -1343,29 +1745,29 @@ label { text-align: left; }
 // Display / Anthias) so the eye lands on a heading instead of a wall
 // of stat-cards. Header eyebrow + lede mirrors the settings sections.
 .info-section {
-  margin-bottom: var(--space-7);
+  margin-bottom: calc(var(--spacing) * 12);
   &:last-child { margin-bottom: 0; }
 }
 .info-section__header {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  margin-bottom: var(--space-4);
+  margin-bottom: calc(var(--spacing) * 4);
 
   h2 {
     margin: 0;
-    color: var(--color-text-on-dark);
+    color: var(--color-on-canvas);
     font-size: 1.05rem;
     font-weight: 700;
     letter-spacing: -0.01em;
     display: inline-flex;
     align-items: center;
-    i { color: var(--color-text-on-dark-muted); font-size: 0.95em; }
+    i { color: var(--color-on-canvas-muted); font-size: 0.95em; }
   }
 }
 .info-section__lede {
   margin: 0;
-  color: var(--color-text-on-dark-muted);
+  color: var(--color-on-canvas-muted);
   font-size: 0.875rem;
 }
 
@@ -1377,35 +1779,35 @@ label { text-align: left; }
 .loadavg-card {
   display: grid;
   grid-template-columns: 1fr auto;
-  gap: var(--space-5);
+  gap: calc(var(--spacing) * 6);
   align-items: center;
-  margin-top: var(--space-2);
+  margin-top: calc(var(--spacing) * 2);
   @media (max-width: 540px) {
     grid-template-columns: 1fr;
-    gap: var(--space-3);
+    gap: calc(var(--spacing) * 3);
   }
 }
 .loadavg-rows {
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
+  gap: calc(var(--spacing) * 2);
   min-width: 0;
 }
 .loadavg-row {
   display: grid;
   grid-template-columns: 3rem 1fr 3.5rem;
-  gap: var(--space-3);
+  gap: calc(var(--spacing) * 3);
   align-items: center;
   font-size: 0.875rem;
 }
 .loadavg-row__label {
   font-weight: 600;
-  color: var(--color-text-muted);
+  color: var(--color-fg-muted);
 }
 .loadavg-row__bar {
   position: relative;
   height: 0.55rem;
-  background: var(--scrim-6);
+  background: var(--color-scrim-6);
   border-radius: var(--radius-pill);
   overflow: hidden;
 }
@@ -1414,7 +1816,7 @@ label { text-align: left; }
   height: 100%;
   border-radius: var(--radius-pill);
   background: var(--color-success);
-  transition: width 200ms var(--ease-out);
+  transition: width 200ms var(--ease-standard);
 }
 .loadavg-row--warn .loadavg-row__fill { background: var(--color-warning); }
 .loadavg-row--high .loadavg-row__fill { background: var(--color-danger); }
@@ -1422,19 +1824,19 @@ label { text-align: left; }
   font-variant-numeric: tabular-nums;
   font-weight: 700;
   text-align: right;
-  color: var(--color-text);
+  color: var(--color-fg);
 }
 
 .loadavg-trend {
   display: flex;
   align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-3) var(--space-4);
-  background: var(--scrim-4);
+  gap: calc(var(--spacing) * 3);
+  padding: calc(var(--spacing) * 3) calc(var(--spacing) * 4);
+  background: var(--color-scrim-4);
   border-radius: var(--radius-md);
   min-width: 12rem;
 
-  i { font-size: 1.6rem; flex: none; color: var(--color-text-muted); }
+  i { font-size: 1.6rem; flex: none; color: var(--color-fg-muted); }
 }
 .loadavg-trend--up i { color: var(--color-danger); }
 .loadavg-trend--down i { color: var(--color-success); }
@@ -1446,7 +1848,7 @@ label { text-align: left; }
 .loadavg-trend__secondary {
   margin: 0;
   font-size: 0.78rem;
-  color: var(--color-text-muted);
+  color: var(--color-fg-muted);
 }
 
 // Resource donut + legend (memory and disk on System Info). Slice
@@ -1457,16 +1859,16 @@ label { text-align: left; }
 .resource-card {
   display: grid;
   grid-template-columns: 11rem 1fr;
-  gap: var(--space-5);
+  gap: calc(var(--spacing) * 6);
   align-items: center;
-  margin-top: var(--space-2);
+  margin-top: calc(var(--spacing) * 2);
   // Drop to a stacked layout on narrow viewports / when the host
   // card is span-1 in a 4-col grid — donut + legend can't share a
   // row at < 30rem of inner width without crowding.
   @media (max-width: 880px) {
     grid-template-columns: 1fr;
     justify-items: center;
-    gap: var(--space-4);
+    gap: calc(var(--spacing) * 4);
   }
 }
 .resource-pie {
@@ -1483,14 +1885,14 @@ label { text-align: left; }
   );
   position: relative;
   flex: none;
-  box-shadow: inset 0 0 0 1px var(--scrim-6), var(--shadow-sm);
+  box-shadow: inset 0 0 0 1px var(--color-scrim-6), var(--shadow-sm);
 }
-// Disk uses different slice colours (red-ish for used, green for free)
-// so a near-full drive reads as a warning at a glance.
-.resource-pie--disk {
-  --slice-1-color: var(--color-danger);
-  --slice-3-color: var(--color-success);
-}
+// Disk deliberately carries no slice-colour overrides: it shares the
+// memory pie's scheme so "used" means the same colour on both charts.
+// It previously painted slice 1 with --color-danger so a near-full drive
+// read as a warning, but that made the same quantity red here and blue
+// there, and the storage-health panel directly below already raises an
+// actual alert when the drive needs attention.
 .resource-pie__inner {
   position: absolute;
   inset: 18%;
@@ -1501,20 +1903,20 @@ label { text-align: left; }
   align-items: center;
   justify-content: center;
   text-align: center;
-  padding: 0 var(--space-2);
+  padding: 0 calc(var(--spacing) * 2);
 }
 .resource-pie__total {
   font-size: 1.6rem;
   font-weight: 700;
   letter-spacing: -0.02em;
-  color: var(--color-text);
+  color: var(--color-fg);
   line-height: 1;
 }
 .resource-pie__unit {
   font-size: 0.72rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--color-text-muted);
+  color: var(--color-fg-muted);
   margin-top: 0.35rem;
 }
 
@@ -1524,64 +1926,63 @@ label { text-align: left; }
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
+  gap: calc(var(--spacing) * 2);
   font-size: 0.875rem;
   min-width: 0;
 }
 .resource-legend__row {
   display: grid;
   grid-template-columns: 0.85rem 1fr auto;
-  gap: var(--space-2);
+  gap: calc(var(--spacing) * 2);
   align-items: center;
 }
 .resource-legend__swatch {
   width: 0.85rem;
   height: 0.85rem;
   border-radius: 0.25rem;
-  background: var(--color-text-muted);
+  background: var(--color-fg-muted);
   flex: none;
 }
-.resource-legend__name { color: var(--color-text); font-weight: 600; }
+.resource-legend__name { color: var(--color-fg); font-weight: 600; }
 .resource-legend__value {
-  color: var(--color-text-muted);
+  color: var(--color-fg-muted);
   font-variant-numeric: tabular-nums;
 }
 .resource-legend__row--slice-1 .resource-legend__swatch { background: var(--color-link); }
 .resource-legend__row--slice-2 .resource-legend__swatch { background: var(--color-warning); }
 .resource-legend__row--slice-3 .resource-legend__swatch { background: var(--color-success); }
-.resource-pie--disk ~ .resource-legend .resource-legend__row--slice-1 .resource-legend__swatch { background: var(--color-danger); }
 .resource-legend__row--ghost .resource-legend__swatch {
   background: transparent;
-  border: 1.5px dashed var(--scrim-25);
+  border: 1.5px dashed var(--color-scrim-25);
 }
 .resource-legend__row--ghost .resource-legend__name {
-  color: var(--color-text-muted);
+  color: var(--color-fg-muted);
   font-weight: 500;
 }
 
 // -----------------------------------------------------------------------------
-// 14. Settings sections
+// 13. Settings sections
 // -----------------------------------------------------------------------------
 .settings-stack {
   display: flex;
   flex-direction: column;
-  gap: var(--space-5);
+  gap: calc(var(--spacing) * 6);
 }
 
 .settings-section {
   background: var(--color-surface);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-md);
-  padding: var(--space-6);
-  color: var(--color-text);
+  padding: calc(var(--spacing) * 8);
+  color: var(--color-fg);
 
   > header {
     display: flex;
     flex-wrap: wrap;
     align-items: baseline;
     justify-content: space-between;
-    gap: var(--space-3);
-    margin-bottom: var(--space-5);
+    gap: calc(var(--spacing) * 3);
+    margin-bottom: calc(var(--spacing) * 6);
   }
 
   h2 {
@@ -1591,22 +1992,40 @@ label { text-align: left; }
     margin: 0;
   }
   .settings-section__lede {
-    margin: var(--space-1) 0 0;
-    color: var(--color-text-muted);
+    margin: calc(var(--spacing) * 1) 0 0;
+    color: var(--color-fg-muted);
     font-size: 0.875rem;
     max-width: 60ch;
   }
   .settings-section__actions {
     display: flex;
-    gap: var(--space-2);
+    gap: calc(var(--spacing) * 2);
+  }
+
+  // Same shape as `> header`: description on the left, actions on the
+  // right. The class was in settings.html with no rule behind it, so
+  // each import provider's button stacked under its description
+  // instead of sitting beside it.
+  .settings-section__row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: calc(var(--spacing) * 3);
+
+    + .settings-section__row {
+      margin-top: calc(var(--spacing) * 4);
+      padding-top: calc(var(--spacing) * 4);
+      border-top: 1px solid var(--color-divider);
+    }
   }
   .settings-section__badge {
     display: inline-block;
-    margin-left: var(--space-2);
+    margin-left: calc(var(--spacing) * 2);
     padding: 0.125rem 0.5rem;
     border-radius: var(--radius-md);
-    background: var(--color-warning-soft, #fef3c7);
-    color: var(--color-warning-strong, #92400e);
+    background: var(--color-warning-wash);
+    color: var(--color-warning-on-wash);
     font-size: 0.6875rem;
     font-weight: 600;
     letter-spacing: 0.03em;
@@ -1619,8 +2038,8 @@ label { text-align: left; }
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--space-3);
-  padding: var(--space-3) 0;
+  gap: calc(var(--spacing) * 3);
+  padding: calc(var(--spacing) * 3) 0;
   border-bottom: 1px solid var(--color-border);
   &:last-child { border-bottom: none; }
 
@@ -1630,21 +2049,21 @@ label { text-align: left; }
   }
   .toggle-row__hint {
     font-size: 0.8125rem;
-    color: var(--color-text-muted);
+    color: var(--color-fg-muted);
     margin: 2px 0 0;
   }
 }
 
 // -----------------------------------------------------------------------------
-// 15. Navbar (component partial reuses these classes)
+// 14. Navbar (component partial reuses these classes)
 // -----------------------------------------------------------------------------
 .app-nav {
-  height: 4.5rem;
+  height: var(--nav-height);
   padding: 0;
-  background: rgba(15, 0, 25, 0.7) !important;
+  background: var(--color-chrome) !important;
   backdrop-filter: blur(10px) saturate(140%);
   -webkit-backdrop-filter: blur(10px) saturate(140%);
-  border-bottom: 1px solid var(--scrim-on-dark-6);
+  border-bottom: 1px solid var(--color-paper-6);
 
   // Below the lg breakpoint (1024px, matching Tailwind's `lg:`) the
   // menu is gated by the hamburger toggle. Without intervention the
@@ -1662,11 +2081,11 @@ label { text-align: left; }
       top: 100%;
       left: 0;
       right: 0;
-      padding: var(--space-2) var(--space-4) var(--space-3);
-      background: rgba(15, 0, 25, 0.97);
+      padding: calc(var(--spacing) * 2) calc(var(--spacing) * 4) calc(var(--spacing) * 3);
+      background: var(--color-chrome-scrim);
       backdrop-filter: blur(10px) saturate(140%);
       -webkit-backdrop-filter: blur(10px) saturate(140%);
-      border-bottom: 1px solid var(--scrim-on-dark-6);
+      border-bottom: 1px solid var(--color-paper-6);
       box-shadow: var(--shadow-md);
     }
     .app-nav-items {
@@ -1682,12 +2101,12 @@ label { text-align: left; }
     padding: 0;
     display: flex;
     align-items: center;
-    gap: var(--space-3);
+    gap: calc(var(--spacing) * 3);
     img { height: 28px; }
   }
 
   .app-tab-link {
-    color: var(--color-text-on-dark-muted) !important;
+    color: var(--color-on-chrome-muted) !important;
     padding: 0.45rem 0.85rem !important;
     border-radius: var(--radius-md);
     font-weight: 500;
@@ -1700,65 +2119,63 @@ label { text-align: left; }
     i { font-size: 0.95em; opacity: 0.85; }
 
     &:hover {
-      color: var(--color-text-on-dark) !important;
-      background: var(--scrim-on-dark-6);
+      color: var(--color-on-chrome) !important;
+      background: var(--color-paper-6);
     }
     &.active {
-      color: var(--color-text-on-dark) !important;
-      background: var(--scrim-on-dark-10);
+      color: var(--color-on-chrome) !important;
+      background: var(--color-paper-10);
     }
   }
 
   .divider-vertical {
     width: 1px;
     height: 1.5rem;
-    background: var(--color-border-on-dark);
-    margin: 0 var(--space-2);
+    background: var(--color-paper-12);
+    margin: 0 calc(var(--spacing) * 2);
   }
 
   .app-nav-toggler {
-    border: 1px solid var(--scrim-on-dark-15);
-    color: var(--color-text-on-dark);
+    border: 1px solid var(--color-paper-15);
+    color: var(--color-on-chrome);
     padding: 0.4rem 0.55rem;
     &:focus { box-shadow: 0 0 0 var(--ring-width) var(--color-focus-ring); }
   }
 }
 
 // -----------------------------------------------------------------------------
-// 16. Footer
+// 15. Footer
 // -----------------------------------------------------------------------------
-$footer-height: 13rem;
-
 #footer {
-  margin-top: var(--space-8);
-  background: rgba(15, 0, 25, 0.5);
-  border-top: 1px solid var(--scrim-on-dark-6);
-  color: var(--color-text-on-dark-muted);
+  margin-top: calc(var(--spacing) * 16);
+  background: var(--color-chrome-soft);
+  border-top: 1px solid var(--color-paper-6);
+  color: var(--color-on-chrome-muted);
 
   .links a {
-    color: var(--color-text-on-dark-muted);
+    color: var(--color-on-chrome-muted);
     text-transform: uppercase;
     font-size: 0.7rem;
     font-weight: 700;
     letter-spacing: 0.1em;
     text-decoration: none;
     transition: color var(--t-fast);
-    &:hover { color: var(--color-text-on-dark); }
+    &:hover { color: var(--color-on-chrome); }
   }
 
   a.brand { color: var(--color-accent); text-decoration: none; }
-  a.brand:hover { color: var(--color-text-on-dark); }
+  a.brand:hover { color: var(--color-on-chrome); }
 
   .copy {
-    margin-top: var(--space-5);
-    border-top: 1px solid var(--scrim-on-dark-5);
-    color: var(--color-text-on-dark-faint);
+    margin-top: calc(var(--spacing) * 6);
+    border-top: 1px solid var(--color-paper-5);
+    color: var(--color-on-chrome-faint);
     font-size: 0.7rem;
   }
 }
 
 // -----------------------------------------------------------------------------
-// 17. Splash page — full-bleed gradient + elevated card with a QR slot.
+// 16. Splash page — full-bleed gradient + elevated card with a QR slot.
 //     Kept conservative for the device webview: no backdrop-filter (Qt5
 //     on Pi 1-4 is on an older Chromium and silently no-ops it), no
 //     CSS variables that don't already exist in :root.
@@ -1776,12 +2193,12 @@ $footer-height: 13rem;
   padding: 0;
   min-height: 100vh;
   font-family: var(--font-sans, "Plus Jakarta Sans", system-ui, sans-serif);
-  color: var(--color-text-on-dark);
-  background-color: var(--color-bg-deep);
+  color: var(--color-on-canvas);
+  background-color: var(--color-canvas-deep);
   background-image:
     radial-gradient(at 20% 10%, rgba(124, 48, 205, 0.45), transparent 55%),
     radial-gradient(at 85% 90%, rgba(91, 32, 144, 0.4), transparent 55%),
-    linear-gradient(160deg, #{$anthias-purple-1} 0%, var(--color-bg-deep) 100%);
+    linear-gradient(160deg, var(--color-canvas) 0%, var(--color-canvas-deep) 100%);
 }
 
 .splash-shell {
@@ -1818,7 +2235,7 @@ $footer-height: 13rem;
     justify-self: center;
     background: #ffffff;
     border-radius: var(--radius-lg);
-    padding: var(--space-4);
+    padding: calc(var(--spacing) * 4);
     text-align: center;
     box-shadow: var(--shadow-md);
   }
@@ -1840,13 +2257,13 @@ $footer-height: 13rem;
 .splash-status {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-2);
-  margin: 0 0 var(--space-4) 0;
-  padding: var(--space-1) var(--space-3);
+  gap: calc(var(--spacing) * 2);
+  margin: 0 0 calc(var(--spacing) * 4) 0;
+  padding: calc(var(--spacing) * 1) calc(var(--spacing) * 3);
   font-size: 0.875rem;
   font-weight: 600;
   letter-spacing: 0.02em;
-  color: var(--color-text-on-dark-muted);
+  color: var(--color-on-canvas-muted);
   background: rgba(255, 255, 255, 0.06);
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: var(--radius-pill);
@@ -1855,7 +2272,7 @@ $footer-height: 13rem;
     width: 0.5rem;
     height: 0.5rem;
     border-radius: 50%;
-    background: var(--color-text-on-dark-muted);
+    background: var(--color-on-canvas-muted);
     flex-shrink: 0;
   }
   &__dot--pulse {
@@ -1876,35 +2293,35 @@ $footer-height: 13rem;
 }
 
 .splash-headline {
-  margin: 0 0 var(--space-2) 0;
+  margin: 0 0 calc(var(--spacing) * 2) 0;
   font-size: clamp(1.5rem, 2.4vw + 1rem, 2.5rem);
   font-weight: 700;
   line-height: 1.15;
   letter-spacing: -0.01em;
-  color: var(--color-text-on-dark);
+  color: var(--color-on-canvas);
 }
 
 .splash-subhead {
-  margin: 0 0 var(--space-5) 0;
+  margin: 0 0 calc(var(--spacing) * 6) 0;
   font-size: clamp(0.95rem, 0.5vw + 0.85rem, 1.125rem);
-  color: var(--color-text-on-dark-muted);
+  color: var(--color-on-canvas-muted);
   max-width: 36rem;
 }
 
 .splash-ip-list {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--space-2);
+  gap: calc(var(--spacing) * 2);
 }
 
 .splash-ip-pill {
   display: inline-flex;
   align-items: center;
-  padding: var(--space-2) var(--space-4);
+  padding: calc(var(--spacing) * 2) calc(var(--spacing) * 4);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 1rem;
   font-weight: 600;
-  color: var(--color-text-on-dark);
+  color: var(--color-on-canvas);
   background: rgba(255, 255, 255, 0.08);
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: var(--radius-pill);
@@ -1915,7 +2332,7 @@ $footer-height: 13rem;
   &:hover {
     background: rgba(255, 255, 255, 0.14);
     border-color: rgba(255, 255, 255, 0.28);
-    color: var(--color-text-on-dark);
+    color: var(--color-on-canvas);
     text-decoration: none;
   }
   &:active { transform: translateY(1px); }
@@ -1942,12 +2359,12 @@ $footer-height: 13rem;
 }
 
 .splash-qr__caption {
-  margin: var(--space-3) 0 0 0;
+  margin: calc(var(--spacing) * 3) 0 0 0;
   font-size: 0.8rem;
   font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  color: var(--color-text);
+  color: var(--color-fg);
 }
 
 // -----------------------------------------------------------------------------
@@ -1962,23 +2379,26 @@ $footer-height: 13rem;
 // the gradient).
 body.auth-body {
   padding-top: 0;
-  background-color: var(--color-bg-deep);
-
-  main {
-    min-height: auto;
-    padding: 0;
-  }
+  background-color: var(--color-canvas-deep);
 }
+// The `main { min-height: auto; padding: 0 }` reset that used to live
+// inside the block above was neutralising the global `main` rule, but
+// `body.auth-body main` (0,1,2) also outranked `.auth-shell` (0,1,0) —
+// so the shell's `min-height: 100vh` never applied and the login and
+// error cards have been top-aligned rather than vertically centred.
+//
+// The reset is unnecessary: `.auth-shell` already outranks the bare
+// `main` selector (0,0,1) on its own, so it can just own its box.
 
 .auth-page {
   min-height: 100vh;
   font-family: var(--font-sans, "Plus Jakarta Sans", system-ui, sans-serif);
-  color: var(--color-text);
-  background-color: var(--color-bg-deep);
+  color: var(--color-fg);
+  background-color: var(--color-canvas-deep);
   background-image:
     radial-gradient(at 20% 10%, rgba(124, 48, 205, 0.45), transparent 55%),
     radial-gradient(at 85% 90%, rgba(91, 32, 144, 0.4), transparent 55%),
-    linear-gradient(160deg, #{$anthias-purple-1} 0%, var(--color-bg-deep) 100%);
+    linear-gradient(160deg, var(--color-canvas) 0%, var(--color-canvas-deep) 100%);
 }
 
 .auth-shell {
@@ -1997,12 +2417,12 @@ body.auth-body {
   padding: clamp(1.5rem, 4vw, 2.5rem);
   display: flex;
   flex-direction: column;
-  gap: var(--space-4);
+  gap: calc(var(--spacing) * 4);
 
   &__brand {
     display: flex;
     justify-content: center;
-    margin-bottom: var(--space-2);
+    margin-bottom: calc(var(--spacing) * 2);
   }
 }
 
@@ -2017,19 +2437,19 @@ body.auth-body {
   font-weight: 700;
   letter-spacing: -0.01em;
   text-align: center;
-  color: var(--color-text);
+  color: var(--color-fg);
 }
 
 .auth-subhead {
-  margin: calc(var(--space-2) * -1) 0 0 0;
+  margin: calc(calc(var(--spacing) * 2) * -1) 0 0 0;
   font-size: 0.95rem;
   text-align: center;
-  color: var(--color-text-muted);
+  color: var(--color-fg-muted);
 }
 
 .auth-alert {
   margin: 0;
-  padding: var(--space-3) var(--space-4);
+  padding: calc(var(--spacing) * 3) calc(var(--spacing) * 4);
   list-style: disc inside;
   border: 1px solid #fecaca;
   background: #fef2f2;
@@ -2038,17 +2458,17 @@ body.auth-body {
   font-size: 0.875rem;
   display: flex;
   flex-direction: column;
-  gap: var(--space-1);
+  gap: calc(var(--spacing) * 1);
 }
 
 .auth-form {
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
+  gap: calc(var(--spacing) * 3);
 }
 
 .auth-submit {
-  margin-top: var(--space-2);
+  margin-top: calc(var(--spacing) * 2);
   width: 100%;
   justify-content: center;
 }
@@ -2079,7 +2499,7 @@ body.auth-body {
     font-weight: 700;
     letter-spacing: 0.16em;
     text-transform: uppercase;
-    color: var(--color-text-muted);
+    color: var(--color-fg-muted);
   }
 }
 
@@ -2091,23 +2511,96 @@ body.auth-body {
   text-align: center;
   border: 2px dashed var(--color-border);
   border-radius: var(--radius-lg);
-  padding: var(--space-6);
+  padding: calc(var(--spacing) * 8);
   cursor: pointer;
   background: var(--color-surface-tint);
   transition: border-color var(--t-fast), background var(--t-fast);
 
-  &:hover {
+  // The dashed border + cloud icon read as "drop files here", so the
+  // zone lights up while a file drag is over the page (pageDragActive
+  // in home.ts) as well as on hover.
+  &:hover,
+  &.is-dragover {
     border-color: var(--color-link);
-    background: #ece4f5;
+    // A role, not a literal: the #ece4f5 that was here is a light
+    // lavender, which stayed light in the dark theme and made the
+    // hovered zone the brightest thing on a dark page.
+    background: var(--color-link-wash);
   }
   &.is-disabled { pointer-events: none; opacity: 0.5; }
+}
+
+// Page-wide drop target (home.html). A drop anywhere on the Schedule
+// Overview uploads, so the feedback has to be page-wide too: a dashed
+// outline confined to the modal would keep implying the only target is
+// the one you have to open a modal to reach.
+//
+// Worn alongside .modal-overlay rather than redeclaring its veil,
+// blur and stacking rung — this dims the page for the same reason, and
+// the two must not read as different depths. Only the differences are
+// below; the two selectors tie on specificity and this block comes
+// later in the file, so these win.
+//
+// pointer-events: none is load-bearing, not tidiness. If the overlay
+// could become the drag's target, crossing into it would fire a
+// dragleave for the element underneath with no matching dragenter, and
+// the depth counter in home.ts would never return to zero.
+.upload-drop-overlay {
+  align-items: center;
+  overflow: hidden;
+  pointer-events: none;
+
+  &__card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: calc(var(--spacing) * 2);
+    text-align: center;
+    padding: calc(var(--spacing) * 10) calc(var(--spacing) * 12);
+    border: 2px dashed var(--color-link);
+    border-radius: var(--radius-xl);
+    background: var(--color-surface);
+    box-shadow: var(--shadow-lg);
+    color: var(--color-fg);
+    animation: modal-in 160ms var(--ease-standard) both;
+
+    i {
+      font-size: 2.75rem;
+      color: var(--color-link);
+      line-height: 1;
+    }
+  }
+
+  &__title {
+    margin: 0;
+    font-weight: 700;
+    font-size: 1.125rem;
+  }
+
+  // Worn when the Add modal is open behind it. That modal already
+  // dims and blurs the page, so keeping our own veil would stack two
+  // of them — darker than either was designed to be, over a form the
+  // operator can no longer read. The card alone carries the message;
+  // the drop still lands wherever it is released.
+  //
+  // Above --z-modal so the card clears the modal it is reporting on.
+  // Safe to sit on the nested rung: every overlay that uses that rung
+  // (preview, delete, bulk delete) refuses the drop, so this and they
+  // are never on screen together. Ties with .modal-overlay on
+  // specificity and wins on order, as the block above does.
+  &--layered {
+    background: none;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    z-index: var(--z-modal-nested);
+  }
 }
 
 .upload-progress {
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
-  padding: var(--space-5);
+  gap: calc(var(--spacing) * 3);
+  padding: calc(var(--spacing) * 6);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
   background: var(--color-surface-soft);
@@ -2115,7 +2608,7 @@ body.auth-body {
   .upload-progress__head {
     display: flex;
     align-items: center;
-    gap: var(--space-3);
+    gap: calc(var(--spacing) * 3);
     i { font-size: 1.5rem; color: var(--color-link); flex: none; }
   }
   .upload-progress__text { min-width: 0; flex: 1 1 auto; }
@@ -2130,7 +2623,7 @@ body.auth-body {
     height: 100%;
     background: var(--color-link);
     border-radius: var(--radius-pill);
-    transition: width 200ms var(--ease-out);
+    transition: width 200ms var(--ease-standard);
   }
   .upload-progress__fill--indeterminate {
     background: linear-gradient(
@@ -2160,32 +2653,32 @@ body.auth-body {
 // -----------------------------------------------------------------------------
 .app-toast-stack {
   position: fixed;
-  top: calc(4.5rem + var(--space-4));   // below the fixed app-nav
-  right: var(--space-5);
-  z-index: 1080;
+  top: calc(var(--nav-height) + calc(var(--spacing) * 4));
+  right: calc(var(--spacing) * 6);
+  z-index: var(--z-toast);
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
+  gap: calc(var(--spacing) * 2);
   pointer-events: none;
-  max-width: min(420px, calc(100vw - var(--space-5) * 2));
+  max-width: min(420px, calc(100vw - calc(var(--spacing) * 6) * 2));
 }
 // Named `.app-toast` rather than `.toast` so we don't collide with any
 // other framework's toast component if one ever lands underneath.
 //
-// The body background is anthias-purple-1 (#1f0029); the prior
-// `background: var(--color-text)` resolved to #1f002a — one hex
-// digit off, indistinguishable from the page. Use the surface white
-// instead so toasts stand out as a card notification on the dark
-// theme. Accent stays on the left-border + leading icon.
+// A toast must not share the page's colour. The prior
+// `background: var(--color-fg)` resolved to #1f002a, one hex digit off
+// the canvas, so a toast was indistinguishable from the page behind it.
+// Use the surface instead, so a toast reads as a card floating over the
+// canvas. Accent stays on the left border and the leading icon.
 .app-toast {
   pointer-events: auto;
   display: flex;
   align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-3) var(--space-4);
+  gap: calc(var(--spacing) * 3);
+  padding: calc(var(--spacing) * 3) calc(var(--spacing) * 4);
   border-radius: var(--radius-md);
   background: var(--color-surface);
-  color: var(--color-text);
+  color: var(--color-fg);
   box-shadow: var(--shadow-lg);
   font-size: 0.95rem;
   border-left: 4px solid var(--color-link);
@@ -2196,18 +2689,139 @@ body.auth-body {
     flex: none;
     background: transparent;
     border: none;
-    color: var(--color-text-muted);
+    color: var(--color-fg-muted);
     cursor: pointer;
-    padding: 0 var(--space-1);
+    padding: 0 calc(var(--spacing) * 1);
     line-height: 1;
     border-radius: var(--radius-sm);
     transition: color var(--t-fast), background var(--t-fast);
-    &:hover { color: var(--color-text); background: var(--scrim-8); }
+    &:hover { color: var(--color-fg); background: var(--color-scrim-8); }
   }
 }
 .app-toast--success { border-left-color: var(--color-success); > i { color: var(--color-success); } }
 .app-toast--error   { border-left-color: var(--color-danger); > i { color: var(--color-danger); } }
 .app-toast--info    { border-left-color: var(--color-link); > i { color: var(--color-accent); } }
+
+// Star-on-GitHub / Review-on-G2 nudge — a dismissible card pinned to
+// the bottom-right, clear of the top-right toast stack so a success
+// toast from the same asset-add can sit alongside it. Surfaced by the
+// `review-cta` HX-Trigger event (see _review_cta.html).
+.review-cta {
+  position: fixed;
+  bottom: calc(var(--spacing) * 6);
+  right: calc(var(--spacing) * 6);
+  z-index: var(--z-nudge);
+  width: min(360px, calc(100vw - calc(var(--spacing) * 6) * 2));
+  padding: calc(var(--spacing) * 4);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  color: var(--color-fg);
+  box-shadow: var(--shadow-lg);
+  border: 1px solid var(--color-border);
+
+  .review-cta__close {
+    position: absolute;
+    top: calc(var(--spacing) * 2);
+    right: calc(var(--spacing) * 2);
+    background: transparent;
+    border: none;
+    color: var(--color-fg-muted);
+    cursor: pointer;
+    padding: calc(var(--spacing) * 1);
+    line-height: 1;
+    border-radius: var(--radius-sm);
+    transition: color var(--t-fast), background var(--t-fast);
+    &:hover { color: var(--color-fg); background: var(--color-scrim-8); }
+  }
+
+  .review-cta__body {
+    display: flex;
+    gap: calc(var(--spacing) * 3);
+    padding-right: calc(var(--spacing) * 4); // clear of the close button
+  }
+  .review-cta__icon {
+    flex: none;
+    font-size: 1.5rem;
+    color: var(--color-accent);
+    line-height: 1.4;
+  }
+  .review-cta__title {
+    font-weight: 700;
+    margin: 0 0 calc(var(--spacing) * 1);
+  }
+  .review-cta__text {
+    margin: 0;
+    font-size: 0.9rem;
+    color: var(--color-fg-muted);
+  }
+
+  .review-cta__actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: calc(var(--spacing) * 2);
+    margin-top: calc(var(--spacing) * 4);
+    .app-btn { flex: 1 1 auto; }
+  }
+
+  .review-cta__later {
+    display: block;
+    width: 100%;
+    margin-top: calc(var(--spacing) * 2);
+    padding: calc(var(--spacing) * 1);
+    background: transparent;
+    border: none;
+    color: var(--color-fg-muted);
+    font: inherit;
+    font-size: 0.85rem;
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    transition: color var(--t-fast);
+    &:hover { color: var(--color-fg); }
+  }
+}
+
+// -----------------------------------------------------------------------------
+// 17. Progress bar
+// -----------------------------------------------------------------------------
+// A real <progress>, not a div with role="progressbar", so assistive
+// tech announces completion consistently.
+//
+// Lives here rather than in a page's <style> block because both wizards
+// (content import, Screenly migration) need it. They each carried their
+// own copy under a different class name, with a #e5e7eb track and a
+// #2563eb fill — a blue that appears nowhere else in the product.
+//
+// The vendor pseudo-elements cannot be set from an inline style, and
+// they do not merge: -webkit- and -moz- each need their own rule, and a
+// selector list containing an unknown pseudo-element is dropped whole.
+.app-progress {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  display: block;
+  width: 100%;
+  height: calc(var(--spacing) * 2);
+  border: none;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--color-surface-sunken);
+
+  &::-webkit-progress-bar {
+    background: var(--color-surface-sunken);
+    border-radius: var(--radius-sm);
+  }
+
+  &::-webkit-progress-value {
+    background: var(--color-link);
+    border-radius: var(--radius-sm);
+    transition: width var(--t-fast);
+  }
+
+  &::-moz-progress-bar {
+    background: var(--color-link);
+    border-radius: var(--radius-sm);
+  }
+}
 
 // -----------------------------------------------------------------------------
 // 18. Misc
@@ -2219,7 +2833,7 @@ body.auth-body {
   width: 1px;
   height: 1rem;
   background: var(--color-border);
-  margin: 0 var(--space-2);
+  margin: 0 calc(var(--spacing) * 2);
   vertical-align: middle;
 }
 
@@ -2232,16 +2846,23 @@ body.auth-body {
 // from the design-token CSS variables.
 // =============================================================================
 
-// --- Layout app-container — responsive max-widths ---
+// --- Layout app-container ---
+//
+// One fluid container, not a stepped ladder. The five tiers this
+// replaced (576/768/992/1200/1400 -> 540/720/960/1140/1320) were
+// Bootstrap 5's grid breakpoints, carried over verbatim, and were the
+// only reason those five widths existed anywhere in the codebase. A
+// stepped container also jumps visibly as you resize, which a fluid one
+// does not.
+//
+// Widest tier retained as the cap so large screens are unaffected;
+// intermediate viewports get wider. Padding scales with the viewport so
+// the extra width does not run the content to the edges.
 .app-container {
   width: 100%;
   margin-inline: auto;
-  padding-inline: var(--space-4);
-  @media (min-width: 576px)  { max-width: 540px; }
-  @media (min-width: 768px)  { max-width: 720px; }
-  @media (min-width: 992px)  { max-width: 960px; }
-  @media (min-width: 1200px) { max-width: 1140px; }
-  @media (min-width: 1400px) { max-width: 1320px; }
+  max-width: var(--container-page);
+  padding-inline: clamp(calc(var(--spacing) * 4), 4vw, calc(var(--spacing) * 8));
 }
 
 // --- Tabs (asset modal) ---
@@ -2260,7 +2881,7 @@ body.auth-body {
   padding: 0.45rem 0.85rem;
   background: transparent;
   border: none;
-  color: var(--color-text);
+  color: var(--color-fg);
   text-decoration: none;
   font: inherit;
   font-weight: 500;
@@ -2268,14 +2889,14 @@ body.auth-body {
   border-radius: var(--radius-md);
   transition: color var(--t-fast), background var(--t-fast);
 
-  &:hover { background: var(--scrim-4); }
+  &:hover { background: var(--color-scrim-4); }
 }
 
 .app-nav-toggler {
   cursor: pointer;
   background: transparent;
-  border: 1px solid var(--scrim-on-dark-15);
-  color: var(--color-text-on-dark);
+  border: 1px solid var(--color-paper-15);
+  color: var(--color-on-chrome);
   padding: 0.4rem 0.55rem;
   border-radius: var(--radius-md);
   font-size: 1.1rem;
@@ -2297,4 +2918,489 @@ body.auth-body {
   display: inline-flex;
   align-items: center;
   text-decoration: none;
+}
+
+// -----------------------------------------------------------------------------
+// Bulk asset actions (#3046)
+// -----------------------------------------------------------------------------
+// Floating bar pinned to the bottom of the viewport while a selection
+// is active. Sits below the modal overlays (z 1050+) so the bulk-edit
+// and bulk-delete dialogs render over it. The inner card carries the
+// dark elevated look the navbar/footer use so it stands clear of the
+// page surfaces.
+.bulk-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: calc(var(--spacing) * 6);
+  z-index: var(--z-bulk-bar);
+  display: flex;
+  justify-content: center;
+  padding-inline: calc(var(--spacing) * 4);
+  pointer-events: none;
+}
+.bulk-bar__inner {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 4);
+  flex-wrap: wrap;
+  justify-content: space-between;
+  width: 100%;
+  max-width: 720px;
+  padding: calc(var(--spacing) * 3) calc(var(--spacing) * 4);
+  background: var(--color-feature-from);
+  color: var(--color-on-feature);
+  border: 1px solid var(--color-feature-divider);
+  border-radius: var(--radius-pill);
+  box-shadow: var(--shadow-lg);
+}
+.bulk-bar__count {
+  display: inline-flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 2);
+  font-size: 0.9rem;
+  white-space: nowrap;
+  i { font-size: 1.1rem; opacity: 0.85; }
+  strong { font-variant-numeric: tabular-nums; }
+}
+.bulk-bar__actions {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 2);
+  flex-wrap: wrap;
+}
+.bulk-bar__clear {
+  color: var(--color-on-feature);
+  background: transparent;
+  border-color: var(--color-feature-divider);
+  // Set the utility "clear" apart from the destructive Delete it sits
+  // beside in the action row.
+  margin-left: calc(var(--spacing) * 2);
+}
+
+@media (max-width: 640px) {
+  .bulk-bar__inner {
+    flex-direction: column;
+    align-items: stretch;
+    border-radius: var(--radius-lg);
+    // Anchor the clear (×) to the top-right corner so it doesn't wrap
+    // onto a second row right next to the red Delete (mis-tap risk).
+    position: relative;
+  }
+  .bulk-bar__actions { justify-content: center; }
+  .bulk-bar__clear {
+    position: absolute;
+    top: calc(var(--spacing) * 3);
+    right: calc(var(--spacing) * 3);
+    margin-left: 0;
+  }
+}
+
+// Bulk-edit modal: each schedule field group is a card whose body is
+// only revealed once its "Change …" toggle is on. The is-on class
+// lifts the card so the active groups read as the ones being written.
+.bulk-field {
+  padding: calc(var(--spacing) * 4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  margin-bottom: calc(var(--spacing) * 3);
+  transition: border-color var(--t-fast), background var(--t-fast);
+
+  &.is-on {
+    border-color: var(--color-accent-edge);
+    background: var(--color-accent-wash);
+  }
+}
+.bulk-field__toggle { cursor: pointer; }
+
+// On/Off selector for the boolean flag groups (No cache / Skip asset
+// check) in the bulk-edit modal (#3137). A two-pill radio group makes
+// the target state explicit and keeps it visually distinct from the
+// group's opt-in switch above it — two identical switches would read as
+// duplicates. Shares the weekday pill vocabulary for a consistent look.
+.bulk-flag-choice {
+  display: inline-flex;
+  gap: calc(var(--spacing) * 2);
+
+  &__pill {
+    --bg: var(--color-surface-tint);
+    --fg: var(--color-fg);
+    border: 1px solid var(--color-border);
+    background: var(--bg);
+    color: var(--fg);
+    font-weight: 600;
+    padding: 0.4rem 1.1rem;
+    border-radius: var(--radius-pill);
+    cursor: pointer;
+    user-select: none;
+    transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+    input { position: absolute; opacity: 0; pointer-events: none; }
+  }
+  &__pill:has(input:checked) {
+    --bg: var(--color-accent);
+    --fg: var(--color-accent-text);
+    border-color: var(--color-accent-strong);
+  }
+  // Keyboard focus lands on the hidden radio — surface it on the pill so
+  // the control is navigable without a mouse.
+  &__pill:has(input:focus-visible) {
+    outline: 2px solid var(--color-accent-edge);
+    outline-offset: 2px;
+  }
+}
+
+// Reserve room at the bottom of the page while a selection is active so
+// the fixed bulk bar never covers the last rows or their action
+// buttons (it floats over them otherwise, blocking clicks on the very
+// assets a bulk selection targets). Bound to `selectedIds.length` in
+// home.html. The bar is taller when stacked on phones, hence the bump.
+.app-container.has-bulk-selection {
+  padding-bottom: 7rem;
+  @media (max-width: 640px) { padding-bottom: 11rem; }
+}
+
+// Selection checkboxes on the dark Enabled surface. The default
+// white-fill, faint-border checkbox and its purple checked/indeterminate
+// fill nearly vanish against the purple gradient — lift the border and
+// give the box a translucent-white ground so it reads as a control and
+// its state is legible. Scoped to .asset-select so the per-row activity
+// switch (also an .app-check-input) keeps its own track styling.
+.surface--active .asset-select .app-check-input {
+  border-color: rgba(255, 255, 255, 0.5);
+  background-color: rgba(255, 255, 255, 0.1);
+
+  &:checked,
+  &:indeterminate { border-color: rgba(255, 255, 255, 0.75); }
+}
+
+// Stack the ffmpeg recipe's copy button under the (horizontally
+// scrolling) command on narrow widths, instead of squeezing the code to
+// a thin strip beside it.
+@media (max-width: 480px) {
+  .modal-alert__recipe { flex-direction: column; }
+  .modal-alert__copy { align-self: stretch; }
+}
+
+// -----------------------------------------------------------------------------
+// Add → Apps tab: store catalog grid + manifest-driven config form.
+// The grid, cards and config controls are project-namespaced (.app-*)
+// to match the rest of the modal; the location-map wraps Leaflet.
+// -----------------------------------------------------------------------------
+
+// Centred loading / error / empty state inside the modal body.
+.app-cfg-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: calc(var(--spacing) * 2);
+  text-align: center;
+  min-height: 12rem;
+}
+
+.app-cfg-spin {
+  font-size: 2rem;
+  color: var(--color-fg-muted);
+  animation: app-cfg-spin 0.9s linear infinite;
+}
+
+@keyframes app-cfg-spin {
+  to { transform: rotate(360deg); }
+}
+
+// Responsive catalog grid — auto-fills as the modal widens.
+.app-grid {
+  display: grid;
+  gap: calc(var(--spacing) * 3);
+  grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+}
+
+.app-card {
+  display: flex;
+  gap: calc(var(--spacing) * 3);
+  align-items: flex-start;
+  padding: calc(var(--spacing) * 3);
+  text-align: left;
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  transition: border-color var(--t-fast), box-shadow var(--t-fast),
+    transform var(--t-fast);
+
+  &:hover {
+    border-color: var(--color-link);
+    box-shadow: var(--shadow-sm);
+    transform: translateY(-1px);
+  }
+  &:focus-visible {
+    outline: none;
+    border-color: var(--color-link);
+    box-shadow: 0 0 0 var(--ring-width) var(--color-focus-ring);
+  }
+}
+
+.app-card__icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 2.75rem;
+  height: 2.75rem;
+  border-radius: var(--radius-md);
+  background-color: var(--color-surface-tint);
+  color: var(--color-fg-muted);
+  overflow: hidden;
+
+  img { width: 100%; height: 100%; object-fit: cover; }
+  i { font-size: 1.5rem; }
+
+  &--lg {
+    width: 3.5rem;
+    height: 3.5rem;
+    i { font-size: 2rem; }
+  }
+}
+
+.app-card__body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.app-card__name {
+  font-weight: 600;
+  color: var(--color-fg);
+}
+
+.app-card__text {
+  font-size: 0.85rem;
+  color: var(--color-fg-muted);
+  // Clamp the summary to two lines so cards stay even.
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.app-card__tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: calc(var(--spacing) * 1);
+  margin-top: calc(var(--spacing) * 2);
+}
+
+.app-card__tag {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.1rem 0.45rem;
+  border-radius: var(--radius-pill);
+  color: var(--color-fg-muted);
+  background-color: var(--color-surface-tint);
+}
+
+// Config panel header (back link + app identity).
+.app-cfg-back {
+  display: inline-flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 1);
+  font-size: 0.85rem;
+  color: var(--color-fg-muted);
+  background: none;
+  border: none;
+  padding: 0;
+  margin-bottom: calc(var(--spacing) * 3);
+  cursor: pointer;
+
+  &:hover { color: var(--color-link); }
+}
+
+.app-cfg-head {
+  display: flex;
+  gap: calc(var(--spacing) * 3);
+  align-items: center;
+}
+
+.app-cfg-title {
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 600;
+}
+
+// Manifest-driven form controls.
+.app-cfg-fields { margin-top: calc(var(--spacing) * 4); }
+
+.app-cfg-field {
+  margin-bottom: calc(var(--spacing) * 4);
+  &:last-child { margin-bottom: 0; }
+}
+
+.app-cfg-label {
+  display: block;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-fg-muted);
+  margin-bottom: calc(var(--spacing) * 2);
+}
+
+.app-cfg-input {
+  @extend .app-input;
+}
+
+.app-cfg-help {
+  margin: calc(var(--spacing) * 2) 0 0;
+  font-size: 0.8rem;
+  color: var(--color-fg-muted);
+}
+
+.app-cfg-group {
+  margin: calc(var(--spacing) * 6) 0 calc(var(--spacing) * 3);
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--color-fg);
+}
+
+.app-cfg-toggle {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 3);
+  cursor: pointer;
+
+  input { flex: 0 0 auto; }
+  span { font-size: 0.95rem; color: var(--color-fg); }
+}
+
+// Repeated-group widget: one row per array item, each row a line of
+// equal-width sub-field inputs plus a remove button. Rows wrap on a
+// narrow modal so a four-field item (Menu Board) stays usable rather
+// than squeezing every input to nothing.
+.app-cfg-rows {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--spacing) * 2);
+}
+
+.app-cfg-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: calc(var(--spacing) * 2);
+}
+
+.app-cfg-row__field {
+  flex: 1 1 7rem;
+  min-width: 7rem;
+}
+
+// .app-btn-icon takes its colours from a .surface context, and the
+// modal body isn't one — the button would fall back to full-strength
+// text with no hover feedback at all. State both here.
+.app-cfg-row__remove {
+  flex: 0 0 auto;
+  color: var(--color-fg-muted);
+
+  &:hover:not(:disabled) {
+    background: var(--color-scrim-6);
+    color: var(--color-danger);
+  }
+}
+
+.app-cfg-empty {
+  margin: calc(var(--spacing) * 2) 0 0;
+  font-size: 0.8rem;
+  color: var(--color-fg-muted);
+}
+
+.app-cfg-add { margin-top: calc(var(--spacing) * 3); }
+
+.app-cfg-nosettings { margin-top: calc(var(--spacing) * 3); }
+
+// Location-map widget (Leaflet + OSM). A fixed centre pin over a
+// draggable map; the map canvas fills the frame and the pin/readout
+// float above it.
+.app-cfg-map {
+  position: relative;
+  height: 16rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border);
+  overflow: hidden;
+  background-color: var(--color-surface-tint);
+}
+
+.app-cfg-map__canvas {
+  // Fill the sized parent with explicit width/height rather than
+  // inset:0 — Leaflet stamps `.leaflet-container { position: relative }`
+  // on this same element, which beats our `position: absolute` in the
+  // cascade and would leave inset ignored and the canvas 0-height (so
+  // only a few tiles load and the map reads blank). 100% of the fixed
+  // 16rem parent is robust to whichever `position` wins.
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  // Leaflet needs an explicit z-index floor so its panes sit below the
+  // pin/readout but above the frame background. Positioned + z-index
+  // makes this a stacking context, which is why the 500s on the pin and
+  // readout below are local to the map and not rungs on the app's
+  // --z-* ladder: they are chosen to clear Leaflet's own internal panes
+  // (400-1000), and comparing them to --z-datepicker is meaningless.
+  z-index: var(--z-base);
+}
+
+.app-cfg-map__pin {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 1.5rem;
+  height: 1.5rem;
+  // Anchor the pin's tip (bottom-centre) on the map centre.
+  transform: translate(-50%, -100%);
+  pointer-events: none;
+  z-index: 500;
+  background-color: var(--color-danger);
+  border: 2px solid #fff;
+  border-radius: 50% 50% 50% 0;
+  box-shadow: var(--shadow-sm);
+  rotate: -45deg;
+}
+
+.app-cfg-map__readout,
+.app-cfg-map__hint {
+  position: absolute;
+  bottom: calc(var(--spacing) * 2);
+  left: calc(var(--spacing) * 2);
+  z-index: 500;
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  padding: 0.15rem 0.5rem;
+  border-radius: var(--radius-sm);
+  color: var(--color-on-canvas);
+  background-color: rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+}
+
+// Until the operator picks a point (or the map was seeded with a saved
+// pin), show the "Drag to set location" hint instead of coordinates —
+// the numbers would otherwise imply a location is set when it isn't.
+.app-cfg-map__readout { display: none; }
+.app-cfg-map__hint { display: block; }
+.app-cfg-map.is-touched {
+  .app-cfg-map__readout { display: block; }
+  .app-cfg-map__hint { display: none; }
+}
+
+.app-cfg-map--unavailable {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: calc(var(--spacing) * 4);
+  text-align: center;
+  font-size: 0.85rem;
+  color: var(--color-fg-muted);
+  height: auto;
+  min-height: 6rem;
 }

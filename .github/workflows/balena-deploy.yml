@@ -35,4 +35,5 @@ jobs:
         run: |
           balena login --token ${{ secrets.BALENA_TOKEN }}
           chmod +x ./bin/deploy_to_balena.sh
-          ./bin/deploy_to_balena.sh --board ${{ matrix.board }} --fleet ${{ matrix.fleet }}
+          # Pin both fleets to the published v2026.10.0 images.
+          ./bin/deploy_to_balena.sh --board ${{ matrix.board }} --fleet ${{ matrix.fleet }} --short-hash e45dd1d

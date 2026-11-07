@@ -7,18 +7,119 @@
 #include <QWebEnginePage>
 #include <QWebEngineProfile>
 #include <QWebEngineSettings>
+#include <QWebEngineUrlRequestInfo>
+#include <QWebEngineUrlRequestInterceptor>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QSslError>
+#include <QWebEngineCertificateError>
+#include <QWebEngineScript>
 #include <QImage>
 #include <QImageReader>
 #include <QPainter>
 #include <QMovie>
 #include <QBuffer>
 #include <QByteArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonValue>
+#include <QList>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QPair>
 #include <QtGlobal>
 
 #include "view.h"
+#include "image_fallback.h"
+#include "rotation.h"
+
+// Attaches the operator-configured per-asset request headers (#2215) to
+// requests whose origin matches the asset's own origin (scheme + host +
+// port; see originKey). Same-origin scoping is the security boundary: a
+// bearer token meant for a private Grafana dashboard must never ride
+// along on the requests that page makes to a third-party CDN, font host,
+// or analytics domain (nor across a scheme downgrade or a different port
+// on the same host). The main-frame navigation and same-origin
+// XHR/subresources (which a dashboard needs to carry the token to render
+// panels) get the headers; everything else is left untouched.
+//
+// interceptRequest may run on a Chromium worker thread (Qt 5 invokes the
+// profile interceptor off the UI thread), while setHeaders/clear are
+// called from the UI thread — so the shared state is guarded by a mutex.
+// No Q_OBJECT: the class adds no signals/slots, so it needs no moc and
+// can live entirely in this translation unit.
+
+// Canonical origin key ``scheme://host:port`` (both lower-cased, with the
+// scheme's default port filled in when the URL omits it) so scoping is by
+// full origin, not just host. Matching on host alone would still attach an
+// Authorization token across a scheme downgrade (https→http on the same
+// host) or to a different service on another port; comparing the whole
+// origin closes those leaks while remaining an exact same-origin match for
+// the page's own XHR/subresources.
+static QString originKey(const QUrl& url)
+{
+    int port = url.port();
+    if (port == -1) {
+        const QString scheme = url.scheme().toLower();
+        if (scheme == QLatin1String("https")) {
+            port = 443;
+        } else if (scheme == QLatin1String("http")) {
+            port = 80;
+        }
+    }
+    return url.scheme().toLower() + QStringLiteral("://")
+        + url.host().toLower() + QStringLiteral(":")
+        + QString::number(port);
+}
+
+class RequestHeaderInterceptor : public QWebEngineUrlRequestInterceptor
+{
+public:
+    explicit RequestHeaderInterceptor(QObject* parent = nullptr)
+        : QWebEngineUrlRequestInterceptor(parent)
+    {
+    }
+
+    void setHeaders(
+        const QString& origin,
+        const QList<QPair<QByteArray, QByteArray>>& headers)
+    {
+        QMutexLocker locker(&m_mutex);
+        m_origin = origin;
+        m_headers = headers;
+    }
+
+    void clear()
+    {
+        QMutexLocker locker(&m_mutex);
+        m_origin.clear();
+        m_headers.clear();
+    }
+
+    void interceptRequest(QWebEngineUrlRequestInfo& info) override
+    {
+        QMutexLocker locker(&m_mutex);
+        if (m_headers.isEmpty() || m_origin.isEmpty()) {
+            return;
+        }
+        // Same-origin (scheme + host + port) only. Anything else — a
+        // cross-origin redirect target, an https→http downgrade, or a
+        // different port on the same host — is deliberately excluded so
+        // the operator's headers can't leak off the asset's own origin.
+        if (originKey(info.requestUrl()) != m_origin) {
+            return;
+        }
+        for (const auto& header : m_headers) {
+            info.setHttpHeader(header.first, header.second);
+        }
+    }
+
+private:
+    QMutex m_mutex;
+    QString m_origin;
+    QList<QPair<QByteArray, QByteArray>> m_headers;
+};
 
 namespace {
 QString getServerHost()
@@ -43,6 +144,52 @@ int getServerPort()
 
     return value;
 }
+
+// QWebEnginePage that can be told, per navigation, to proceed past TLS
+// certificate errors — the web-page counterpart of the image loader's
+// ignoreSslErrors() path. Drives the per-asset ``skip_ssl_verify``
+// flag (composed with the device-wide ``verify_ssl`` setting on the
+// Python side) so a web-page asset served over HTTPS with a
+// self-signed / untrusted-CA cert renders instead of showing Chromium's
+// certificate-error page.
+//
+// The API is version-split: Qt5 exposes ``certificateError`` as a
+// virtual returning true-to-proceed; Qt6 replaced it with a signal
+// (connected in configureWebView()) and dropped the virtual. The flag
+// lives on the page either way, so ``loadPage`` sets it on the target
+// view's page before navigating and both paths read the same bit.
+//
+// No Q_OBJECT: the class declares no new signals/slots (the Qt6 signal
+// it uses is inherited), so it needs no moc pass and the call sites
+// reach it via static_cast rather than qobject_cast.
+class AnthiasWebEnginePage : public QWebEnginePage
+{
+public:
+    AnthiasWebEnginePage(QWebEngineProfile* profile, QObject* parent)
+        : QWebEnginePage(profile, parent)
+    {
+    }
+
+    void setSkipSslVerify(bool skip) { m_skipSslVerify = skip; }
+    bool skipSslVerify() const { return m_skipSslVerify; }
+
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+    // Qt5: return true to ignore the error and continue loading.
+    bool certificateError(const QWebEngineCertificateError& error) override
+    {
+        Q_UNUSED(error);
+        if (m_skipSslVerify) {
+            qDebug() << "loadPage: proceeding past certificate error "
+                        "(skip_ssl_verify enabled)";
+            return true;
+        }
+        return false;
+    }
+#endif
+
+private:
+    bool m_skipSslVerify = false;
+};
 
 // Build an Accept-Language header value from the system locale so
 // multi-language URL assets serve content in the operator's configured
@@ -96,12 +243,78 @@ QString detectAcceptLanguage()
 }
 
 
+namespace {
+// Issue #2999 — page-load watchdog interval. Chromium has no overall
+// navigation timeout, so a fetch whose packets stop arriving (WiFi
+// dropout mid-load; the TCP socket stays ESTABLISHED with no FIN/RST)
+// keeps the navigation pending indefinitely. 30 s is deliberately
+// more generous than the asset-rotation cadence and the old
+// VIDEO_TIMEOUT=20 the Python side used for stalled videos: a complex
+// dashboard on a slow uplink may legitimately take 15–20 s, and a
+// too-eager watchdog would cancel loads that were about to succeed.
+// Operators can tune it via ANTHIAS_WEBPAGE_TIMEOUT_S on the viewer
+// container. Clamped so a garbage value can't disable the watchdog
+// entirely (the whole point is that there's always *some* timeout)
+// or overflow the QTimer's millisecond int.
+constexpr int kDefaultPageLoadTimeoutS = 30;
+constexpr int kMinPageLoadTimeoutS = 5;
+constexpr int kMaxPageLoadTimeoutS = 3600;
+
+int pageLoadTimeoutMs()
+{
+    bool ok = false;
+    int seconds =
+        qEnvironmentVariableIntValue("ANTHIAS_WEBPAGE_TIMEOUT_S", &ok);
+    if (!ok || seconds <= 0) {
+        seconds = kDefaultPageLoadTimeoutS;
+    }
+    return qBound(kMinPageLoadTimeoutS, seconds, kMaxPageLoadTimeoutS)
+        * 1000;
+}
+}
+
 View::View(QWidget* parent) : QWidget(parent)
 {
+    imageRotation = rotation::linuxfbRotationOverride();
+    if (imageRotation != 0) {
+        qDebug() << "View: linuxfb screen rotation" << imageRotation
+                 << "— rotating still images in paintEvent (the linuxfb "
+                    "QPA ignores rotation=N)";
+    }
+
     webView1 = new QWebEngineView(this);
-    webView2 = new QWebEngineView(this);
     configureWebView(webView1);
-    configureWebView(webView2);
+
+    // Single-QWebEngineView rendering. ``webView2`` is aliased onto
+    // ``webView1`` so the rest of the file's historical dual-buffer
+    // logic still compiles and runs — every operation that would have
+    // targeted the off-screen ``webView2`` now lands on the same
+    // widget, and switchToNextWebView() takes its single-view fast path
+    // (show the one view, no hide/show toggle or pointer swap). A
+    // loadPage() call keeps the current page composited until
+    // the next one has painted (QtWebEngine holds the last frame across
+    // an in-place navigation), so transitions are seamless with at most
+    // a brief black frame on a slow load, never a foreign page.
+    //
+    // This was previously gated behind ``ANTHIAS_LOW_RAM=1`` (1 GB
+    // boards) purely to save the ~100 MB a second resident Chromium
+    // renderer costs. It is now unconditional because the preloaded
+    // second buffer was also *broken*: issue #2954 — on the single
+    // fullscreen surface used by the Qt6 boards (Wayland/cage on
+    // Pi 5 / x86, eglfs on pi4-64) a hidden or sibling-occluded
+    // QWebEngineView is frame-callback-throttled by Chromium and never
+    // composites, so ``loadFinished`` on the off-screen buffer did NOT
+    // mean it had painted the new page. Revealing it in
+    // switchToNextWebView() therefore showed its *stale* GPU surface —
+    // the page it last displayed two rotations earlier — for ~1 frame
+    // before the new page painted, flashing an unrelated asset on every
+    // webpage→webpage transition. Live-reproduced and the fix
+    // live-verified on a Pi 5 (grim burst capture, 2026-07-08): every
+    // transition flashed the (n-2) page before, none after. The Qt5
+    // 1 GB boards already ran this path, so only the 2 GB+ Qt6 boards
+    // change behaviour — exactly where #2954 was reported. See
+    // docs/board-enablement.md.
+    webView2 = webView1;
 
     // Both webViews share the default profile, so the HTTP-cache setup
     // is per-process, not per-view. Use in-memory only — the default
@@ -123,23 +336,62 @@ View::View(QWidget* parent) : QWidget(parent)
         qDebug() << "Accept-Language:" << acceptLanguage;
     }
 
+    // Append the Anthias product token to QtWebEngine's default
+    // User-Agent so sites still see a normal "Mozilla/5.0 ...
+    // Chrome/... Safari/..." string (preserving compatibility) while
+    // ops at the receiving end can spot that the request came from an
+    // Anthias screen and which release. The token ("Anthias/<version>")
+    // is composed once in Python by get_anthias_product_token() and
+    // passed through ANTHIAS_UA_TOKEN by _build_webview_env() in
+    // src/anthias_viewer/__init__.py, so the format lives in a single
+    // place. Left untouched when the token is absent — the Python side
+    // always sets it, so this only guards a standalone launch.
+    const QByteArray uaToken = qgetenv("ANTHIAS_UA_TOKEN");
+    if (!uaToken.isEmpty()) {
+        const QString userAgent = profile->httpUserAgent()
+            + QStringLiteral(" ") + QString::fromUtf8(uaToken);
+        profile->setHttpUserAgent(userAgent);
+        qDebug() << "User-Agent:" << userAgent;
+    }
+
+    // Per-asset custom request headers (#2215). Installed on the shared
+    // profile once; the headers themselves are staged per asset by
+    // setRequestHeaders and scoped to the target origin in startPageLoad.
+    // ``setUrlRequestInterceptor`` on QWebEngineProfile is available
+    // identically on Qt 5.13+ and Qt 6, so no version macro is needed.
+    // Parent the interceptor to the *profile* (process-lifetime), not to
+    // ``this``: the default profile can outlive the View, and if the
+    // interceptor were destroyed first the profile would be left holding
+    // a dangling pointer (use-after-free at teardown). ~View also detaches
+    // it defensively.
+    headerInterceptor = new RequestHeaderInterceptor(profile);
+    profile->setUrlRequestInterceptor(headerInterceptor);
+
     currentWebView = webView1;
     nextWebView = webView2;
     nextWebViewReady = false;
 
     connect(webView1->page(), &QWebEnginePage::authenticationRequired,
             this, &View::handleAuthRequest);
-    connect(webView2->page(), &QWebEnginePage::authenticationRequired,
-            this, &View::handleAuthRequest);
+    if (webView2 != webView1) {
+        // Skip the duplicate connect when low-RAM aliased webView2
+        // onto webView1 — Qt's connect would otherwise fire the auth
+        // handler twice per challenge.
+        connect(webView2->page(), &QWebEnginePage::authenticationRequired,
+                this, &View::handleAuthRequest);
+    }
 
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
     // QtMultimedia-backed video surface. Created hidden — only
     // made visible when ``playVideo`` fires. The QMediaPlayer +
-    // QGraphicsVideoItem live for the lifetime of this widget so
+    // QML VideoOutput live for the lifetime of this widget so
     // repeated plays don't pay pipeline-rebuild cost on every
-    // asset.
+    // asset. Qt 5 boards (Pi 1 / Pi 2 / Pi 3) skip this — video plays via
+    // GstFbdevMediaPlayer painting straight to the framebuffer.
     videoView = new VideoView(this);
     videoView->setVisible(false);
     connect(videoView, &VideoView::videoEnded, this, &View::videoEnded);
+#endif
 
     networkManager = new QNetworkAccessManager(this);
     movie = nullptr;
@@ -147,6 +399,14 @@ View::View(QWidget* parent) : QWidget(parent)
     loadGenerationId = 0;
     reloadTimer = nullptr;
     pendingReloadIntervalS = 0;
+
+    // Issue #2999 — see the member's comment in view.h. Connected
+    // once here; startPageLoad re-arms it per attempt.
+    pageLoadWatchdog = new QTimer(this);
+    pageLoadWatchdog->setSingleShot(true);
+    pageLoadWatchdog->setInterval(pageLoadTimeoutMs());
+    connect(pageLoadWatchdog, &QTimer::timeout,
+            this, &View::handlePageLoadTimeout);
 }
 
 View::~View()
@@ -154,17 +414,80 @@ View::~View()
     if (pageLoadConnection) {
         QObject::disconnect(pageLoadConnection);
     }
+    // Detach the request interceptor from the (process-lifetime) default
+    // profile before we go away, so no request can be intercepted against
+    // torn-down View state. The interceptor object itself is owned by the
+    // profile (see ctor), so we only clear the profile's pointer here.
+    QWebEngineProfile::defaultProfile()->setUrlRequestInterceptor(nullptr);
     stopReloadTimer();
     stopAnimation();
 }
 
 void View::configureWebView(QWebEngineView* view)
 {
+    // Install our certificate-error-aware page (see AnthiasWebEnginePage)
+    // in place of the default one so ``skip_ssl_verify`` web-page assets
+    // can proceed past a self-signed cert. Parented to the view, which
+    // takes ownership on setPage(). Done first so the settings/background
+    // tweaks below apply to the page that will actually be used.
+    auto* page =
+        new AnthiasWebEnginePage(QWebEngineProfile::defaultProfile(), view);
+    view->setPage(page);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    // Qt6: certificateError is a signal. Accept or reject based on the
+    // per-navigation flag loadPage() set on this page. Capturing the
+    // typed page pointer avoids a qobject_cast in the handler.
+    connect(page, &QWebEnginePage::certificateError, this,
+        [page](QWebEngineCertificateError error) {
+            if (page->skipSslVerify()) {
+                qDebug() << "loadPage: accepting certificate error "
+                            "(skip_ssl_verify enabled)";
+                error.acceptCertificate();
+            } else {
+                error.rejectCertificate();
+            }
+        });
+#endif
+
     view->settings()->setAttribute(QWebEngineSettings::LocalStorageEnabled, true);
     view->settings()->setAttribute(QWebEngineSettings::ShowScrollBars, false);
     // Match the widget's black backdrop so dark-themed URL assets don't
     // flash white between the page-load start and the first paint.
-    view->page()->setBackgroundColor(Qt::black);
+    page->setBackgroundColor(Qt::black);
+
+    // linuxfb webpage rotation: the QPA plugin doesn't rotate the
+    // QtWebEngine surface (see linuxfbRotationOverride), so images/video
+    // rotate elsewhere (paintEvent / GStreamer videoflip) but web pages
+    // would stay upright. Inject a stylesheet that turns the page root to
+    // match the physically-rotated screen so every asset type rotates on
+    // linuxfb. No-op on eglfs / wayland (imageRotation is 0 there — those
+    // rotate the whole compositor output already).
+    //
+    // Injected imperatively from loadFinished rather than as a declarative
+    // QWebEngineScript: on this Qt 5.15 (qt5pi) build a page-collection
+    // QWebEngineScript in ApplicationWorld silently never fires, whereas
+    // runJavaScript() executes reliably. ApplicationWorld (an isolated
+    // world) is used so the injection bypasses any page Content-Security-
+    // Policy that would otherwise block a stylesheet. The handler is
+    // persistent (not the one-shot swap handler in startPageLoad) so the
+    // rotation re-applies after every auto-refresh reload; the in-page
+    // MutationObserver (see webpageRotationScript) keeps it asserted across
+    // SPA DOM rewrites within a single document.
+    //
+    // Injected regardless of loadFinished's ``ok`` flag: a failed load
+    // (DNS failure, refused connection, captive portal) still leaves a
+    // QtWebEngine error-page document on screen, which must rotate too so
+    // a physically-turned panel never shows sideways text. runJavaScript
+    // on a cancelled/empty document is a harmless no-op.
+    if (imageRotation != 0) {
+        const QString script = rotation::webpageRotationScript(imageRotation);
+        connect(page, &QWebEnginePage::loadFinished, this,
+            [page, script](bool) {
+                page->runJavaScript(
+                    script, QWebEngineScript::ApplicationWorld);
+            });
+    }
+
     view->setVisible(false);
 }
 
@@ -178,17 +501,28 @@ void View::stopAnimation()
     isAnimatedImage = false;
 }
 
-void View::loadPage(const QString &uri)
+void View::loadPage(const QString &uri, bool skipSslVerify)
 {
     qDebug() << "Type: Webpage";
 
     const quint64 requestId = ++loadGenerationId;
+
+    // The page load goes into nextWebView (startPageLoad), so set the
+    // per-navigation certificate policy on that view's page now. It
+    // persists on the page across watchdog retries of the same URI.
+    // static_cast is safe: configureWebView() installs an
+    // AnthiasWebEnginePage on every view.
+    static_cast<AnthiasWebEnginePage*>(nextWebView->page())
+        ->setSkipSslVerify(skipSslVerify);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
     // Drop back to the web/image surface in case the previous asset
     // was a video. Stops the QMediaPlayer (frees its decoder
     // pipeline + audio device) and hides the graphics view so the
     // QWebEngineView paints are visible.
     hideVideoSurface();
+#endif
     currentImage = QImage();
+    fallbackToLastImageOnBlank = false;
     stopAnimation();
     // Drop any per-asset reload timer left over from the previous
     // webpage AND the prior asset's pending interval — the viewer
@@ -199,6 +533,88 @@ void View::loadPage(const QString &uri)
     pendingReloadIntervalS = 0;
     nextWebViewReady = false;
 
+    startPageLoad(uri, requestId);
+
+    qDebug() << "Loading web page:" << uri;
+}
+
+namespace {
+// Defensive re-validation of the D-Bus header payload. The server side
+// (validate_asset_headers) is the primary gate and the viewer only
+// forwards sanitised headers, but the ``setRequestHeaders`` slot is a
+// trust-no-one boundary (anything on the session bus can call it), so we
+// re-check here rather than put unsafe bytes on the wire — same posture
+// as kMaxReloadIntervalS. Mirrors the server's limits.
+constexpr int kMaxRequestHeaders = 20;
+constexpr int kMaxHeaderNameLen = 256;
+constexpr int kMaxHeaderValueLen = 4096;
+
+// RFC 7230 field-name is 1*tchar.
+bool isValidHeaderName(const QByteArray& name)
+{
+    if (name.isEmpty() || name.size() > kMaxHeaderNameLen) {
+        return false;
+    }
+    for (const char c : name) {
+        const bool tchar =
+            (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9')
+            || QByteArray("!#$%&'*+-.^_`|~").contains(c);
+        if (!tchar) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Reject CR / LF / NUL (header/request splitting) and oversized values.
+bool isValidHeaderValue(const QByteArray& value)
+{
+    if (value.size() > kMaxHeaderValueLen) {
+        return false;
+    }
+    return !value.contains('\r') && !value.contains('\n')
+        && !value.contains('\0');
+}
+}  // namespace
+
+void View::setRequestHeaders(const QString &headersJson)
+{
+    // Parse the JSON object the viewer sent into a name/value list. We
+    // don't apply it to the interceptor here — startPageLoad does that
+    // once it knows the target origin — because the header set is only
+    // meaningful together with the URL it belongs to. Store it so the
+    // very next loadPage picks it up. An empty / malformed payload
+    // leaves ``pendingHeaders`` empty, which clears any prior headers on
+    // the next load. Entries that fail validation are dropped, not
+    // applied.
+    QList<QPair<QByteArray, QByteArray>> parsed;
+    const QJsonDocument doc = QJsonDocument::fromJson(headersJson.toUtf8());
+    if (doc.isObject()) {
+        const QJsonObject obj = doc.object();
+        for (auto it = obj.constBegin(); it != obj.constEnd(); ++it) {
+            if (parsed.size() >= kMaxRequestHeaders) {
+                break;
+            }
+            if (!it.value().isString()) {
+                continue;
+            }
+            const QByteArray name = it.key().toUtf8();
+            const QByteArray value = it.value().toString().toUtf8();
+            if (!isValidHeaderName(name) || !isValidHeaderValue(value)) {
+                continue;
+            }
+            // Brace-init the QPair rather than qMakePair(), which Qt 6
+            // deprecates — keeps the same source building warning-free
+            // on both the Qt 5 and Qt 6 toolchains.
+            parsed.append({name, value});
+        }
+    }
+    pendingHeaders = parsed;
+}
+
+void View::startPageLoad(const QString &uri, quint64 requestId)
+{
     // Drop any prior loadFinished handler before stop() — a synchronous
     // loadFinished(false) emission from the previous in-flight load
     // would otherwise reach the (still-attached) handler and run with
@@ -206,9 +622,25 @@ void View::loadPage(const QString &uri)
     // detached, stop() can fire whatever it likes harmlessly.
     if (pageLoadConnection) {
         QObject::disconnect(pageLoadConnection);
+        pageLoadConnection = QMetaObject::Connection{};
     }
 
     nextWebView->stop();
+
+    pendingPageUri = uri;
+
+    // Scope the staged headers (#2215) to this URL's origin and hand them
+    // to the interceptor before the load fires. An empty ``pendingHeaders``
+    // clears any headers left from a previous asset, so a header-less
+    // page never inherits the prior page's Authorization.
+    if (headerInterceptor) {
+        if (pendingHeaders.isEmpty()) {
+            headerInterceptor->clear();
+        } else {
+            headerInterceptor->setHeaders(
+                originKey(QUrl(uri)), pendingHeaders);
+        }
+    }
 
     pageLoadConnection = connect(
         nextWebView->page(),
@@ -228,27 +660,70 @@ void View::loadPage(const QString &uri)
             }
 
             if (ok) {
-                qDebug() << "Background web page loaded successfully";
+                pageLoadWatchdog->stop();
+                pendingPageUri.clear();
+                qDebug() << "Web page loaded successfully";
                 nextWebViewReady = true;
                 switchToNextWebView();
             } else {
-                qDebug() << "Background web page failed to load";
+                // Deliberately leave the watchdog running: when it
+                // fires, handlePageLoadTimeout re-issues this URI. A
+                // load that failed fast (DNS / connection refused
+                // while the network is down) thereby gets a paced
+                // retry, which is the only retry a single-webpage
+                // playlist will ever see — view_webpage() skips the
+                // loadPage D-Bus call when the URL hasn't changed
+                // (issue #2999).
+                qDebug() << "Web page failed to load";
                 nextWebViewReady = false;
             }
         }
     );
 
-    nextWebView->load(QUrl(uri));
+    // (Re)arm the watchdog for this attempt — single-shot, so each
+    // retry gets a full interval.
+    pageLoadWatchdog->start();
 
-    qDebug() << "Loading web page in background web view:" << uri;
+    nextWebView->load(QUrl(uri));
 }
 
-void View::loadImage(const QString &preUri)
+void View::handlePageLoadTimeout()
+{
+    // Defensive: every path that cancels the pending navigation
+    // (loadImage / playVideo / a successful load) stops the watchdog
+    // and clears the URI, but if a stray timeout slips through an
+    // empty URI means there is nothing to recover.
+    if (pendingPageUri.isEmpty()) {
+        return;
+    }
+
+    qWarning() << "Webpage load did not finish within"
+               << pageLoadWatchdog->interval() / 1000
+               << "seconds — cancelling and retrying:" << pendingPageUri;
+
+    // startPageLoad stop()s the wedged navigation (cancelling its
+    // pending network I/O so stuck sockets don't pile up in
+    // Chromium's connection pool), re-issues the URI on a fresh
+    // request, and re-arms the watchdog. The generation ID is
+    // unchanged — this is still the same asset; any later asset
+    // bumps the generation and supersedes the retry's handler.
+    startPageLoad(pendingPageUri, loadGenerationId);
+}
+
+void View::loadImage(const QString &preUri, bool skipSslVerify)
 {
     qDebug() << "Type: Image";
     const quint64 requestId = ++loadGenerationId;
 
-    // ``view_image('null')`` in src/anthias_viewer/__init__.py:495
+    // Set before hideVideoSurface() below, not after, so this doesn't
+    // rely on hideVideoSurface()'s setVisible(false) deferring the
+    // repaint to the event loop. A real image fetch is starting
+    // whenever preUri isn't the video-onset sentinel, full stop; the
+    // "null" branch further down still sets this explicitly too, for
+    // anyone reading top-to-bottom without this comment.
+    fallbackToLastImageOnBlank = (preUri != QLatin1String("null"));
+
+    // ``view_image('null')`` in src/anthias_viewer/__init__.py:1504
     // is called AFTER ``media_player.play()`` to sweep any
     // lingering web/image background out of the way of the new
     // video — it is NOT a request to take down the freshly-
@@ -260,9 +735,28 @@ void View::loadImage(const QString &preUri)
     // the full 60 s asset_loop window. For a real image URI the
     // prior video must still be torn down, so the call is
     // preserved there.
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
     if (preUri != QLatin1String("null")) {
         hideVideoSurface();
     }
+#endif
+
+    // fallbackToLastImageOnBlank note for Qt5 armhf (Pi 1/2/3):
+    // playVideo(), and its own ``fallbackToLastImageOnBlank = false``,
+    // only exists in the Qt6 build (see the #if above; those boards
+    // never route video through this class at all, GstFbdevMediaPlayer
+    // in media_player.py spawns an external gst_fbdev_player process
+    // that paints straight to /dev/fb0). On Qt5 the ``"null"`` branch
+    // below is therefore the *only* place that clears the flag ahead
+    // of a video asset. The guarantee that actually holds isn't about
+    // the order of play() vs. this sentinel call (play() runs first);
+    // it's that the flag can only flip back to true inside a later,
+    // real loadImage() call, and GstFbdevMediaPlayer.stop()
+    // (media_player.py) blocks - SIGTERM then wait(), escalating to
+    // SIGKILL — until that external process has exited before
+    // view_video() returns, and asset_loop only calls the next
+    // view_image()/view_video() after that. So the flag can't reach
+    // true while the fbdev process might still be writing frames.
 
     // Cancel any pending page load so we don't keep streaming a web
     // page in the background after the user has switched to image
@@ -273,6 +767,10 @@ void View::loadImage(const QString &preUri)
         QObject::disconnect(pageLoadConnection);
         pageLoadConnection = QMetaObject::Connection{};
     }
+    // ...and its watchdog, so a stale timeout doesn't retry a webpage
+    // the playlist has rotated away from (issue #2999).
+    pageLoadWatchdog->stop();
+    pendingPageUri.clear();
     // Webpage auto-refresh only applies while a webpage is on screen;
     // killing the timer (and clearing the pending interval) here keeps
     // a stale reload from firing into the (now hidden) QWebEngineView
@@ -307,6 +805,11 @@ void View::loadImage(const QString &preUri)
     else if (preUri == "null")
     {
         qDebug() << "Black page";
+        // Already false from the top-of-function assignment; kept
+        // explicit here too since this is the branch it actually
+        // matters for (see the lastRasterImage comment in view.h and
+        // the matching comment in playVideo()).
+        fallbackToLastImageOnBlank = false;
         currentImage = QImage();
         update();
         return;
@@ -322,6 +825,21 @@ void View::loadImage(const QString &preUri)
     QNetworkRequest request(src);
     QNetworkReply* reply = networkManager->get(request);
 
+    if (skipSslVerify) {
+        // Per-asset opt-in (Asset.skip_ssl_verify) or the device-wide
+        // verify_ssl setting is off — trust self-signed / untrusted-CA
+        // hosts for this image. ignoreSslErrors() must be armed on the
+        // reply before the handshake completes, so connect it here
+        // rather than waiting for the finished handler. Without this a
+        // self-signed HTTPS image fails with SslHandshakeFailedError
+        // and renders blank (forum "web content doesn't display").
+        // Stable API on both Qt5 and Qt6.
+        connect(reply, &QNetworkReply::sslErrors, reply,
+            [reply](const QList<QSslError>&) {
+                reply->ignoreSslErrors();
+            });
+    }
+
     connect(reply, &QNetworkReply::finished, this, [this, reply, requestId]() {
         reply->deleteLater();
 
@@ -329,6 +847,16 @@ void View::loadImage(const QString &preUri)
             qDebug() << "Ignoring stale image response";
             return;
         }
+
+        // This request is over, whatever the outcome. Drop the fallback
+        // here, in the one place ``finished`` always fires (Qt emits it
+        // after errorOccurred() too), so a failed/corrupt fetch goes
+        // black rather than leaving the previous asset on screen:
+        // which would be indistinguishable from a successful rotation.
+        // The success branch below clears it again (harmlessly) via
+        // loadAsStaticImage()/tryLoadAsAnimatedGif(), so this is a no-op
+        // on the happy path.
+        fallbackToLastImageOnBlank = false;
 
         if (reply->error() == QNetworkReply::NoError) {
             QByteArray data = reply->readAll();
@@ -339,6 +867,17 @@ void View::loadImage(const QString &preUri)
             }
         } else {
             qDebug() << "Network error:" << reply->errorString();
+            // fallbackToLastImageOnBlank is already false (set above,
+            // unconditionally, before this branch runs). But nothing
+            // repaints on its own here. Without this, the stale frame
+            // painted while the fetch was in flight just stays on
+            // screen for the rest of the asset's slot, which reads as
+            // "rotating normally" instead of "this asset is broken."
+            // Confirmed on hardware (Pi 4 + Pi 3 A+):before this call
+            // the failed slot showed the previous asset for its full
+            // duration; after, it goes black immediately, matching
+            // pre-PR(master) behaviour for this failure case.
+            update();
         }
     });
 
@@ -384,16 +923,38 @@ bool View::tryLoadAsAnimatedGif(const QByteArray& data)
 
 void View::loadAsStaticImage(const QByteArray& data)
 {
-    QImage newImage;
-    if (newImage.loadFromData(data)) {
+    // Decode through a QImageReader with auto-transform enabled so the
+    // EXIF Orientation tag is honoured. QImage::loadFromData() ignores
+    // orientation, which left camera/phone photos taken in portrait
+    // (stored landscape + Orientation 6/8) drawn sideways on screen
+    // (issue 3232). setAutoTransform applies the rotation/flip during
+    // decode for every format that carries the tag (JPEG, HEIC, ...).
+    QBuffer buffer;
+    buffer.setData(data);
+    buffer.open(QIODevice::ReadOnly);
+    QImageReader reader(&buffer);
+    reader.setAutoTransform(true);
+
+    QImage newImage = reader.read();
+    if (!newImage.isNull()) {
         qDebug() << "Successfully loaded static image. Size:" << newImage.size();
         nextImage = newImage;
         webView1->setVisible(false);
         webView2->setVisible(false);
         currentImage = nextImage;
+        lastRasterImage = nextImage;
+        fallbackToLastImageOnBlank = false;
         update();
     } else {
-        qDebug() << "Failed to load image from data";
+        qDebug() << "Failed to load image from data:" << reader.errorString();
+        // Same reasoning as the network-error branch in loadImage():
+        // fallbackToLastImageOnBlank was already cleared before this
+        // function ran, but that alone doesn't repaint. Without this
+        // call, a corrupt/undecodable image would leave the previous
+        // asset frozen on screen for the rest of the slot instead of
+        // going black.Confirmed on hardware alongside the network-
+        // error fix.
+        update();
     }
 }
 
@@ -403,17 +964,55 @@ void View::paintEvent(QPaintEvent*)
     painter.setRenderHint(QPainter::SmoothPixmapTransform);
     painter.fillRect(rect(), Qt::black);
 
-    if (!currentImage.isNull()) {
-        QSize scaledSize = currentImage.size();
-        scaledSize.scale(size(), Qt::KeepAspectRatio);
-        QRect targetRect(
-            (width() - scaledSize.width()) / 2,
-            (height() - scaledSize.height()) / 2,
-            scaledSize.width(),
-            scaledSize.height()
-        );
-        painter.drawImage(targetRect, currentImage);
+    // Issue #3262, a real image fetch that starts from a blanked
+    // state (typically right after a video asset) would otherwise
+    // paint solid black for the whole QNetworkReply round-trip.
+    // Fall back to the last real frame in that case only; the
+    // video-onset / loadPage() blanks leave the flag off and stay
+    // pure black, unchanged from before. The yes/no decision itself
+    // is a pure predicate (image_fallback.cpp) so it's covered by
+    // test_image_fallback.cpp without pulling in QtWebEngine.
+    const QImage &imageToPaint =
+        image_fallback::shouldUseLastRasterImage(
+            currentImage.isNull(), fallbackToLastImageOnBlank)
+            ? lastRasterImage
+            : currentImage;
+
+    if (imageToPaint.isNull()) {
+        return;
     }
+
+    if (imageRotation == 0) {
+        QSize scaledSize = imageToPaint.size();
+        scaledSize.scale(size(), Qt::KeepAspectRatio);
+        painter.drawImage(
+            QRect(
+                (width() - scaledSize.width()) / 2,
+                (height() - scaledSize.height()) / 2,
+                scaledSize.width(),
+                scaledSize.height()),
+            imageToPaint);
+        return;
+    }
+
+    // linuxfb-only manual rotation (see linuxfbRotationOverride): rotate
+    // about the widget centre. A 90/270 turn swaps the drawable box, so
+    // the image is fit into the widget's transposed dimensions and
+    // centred — a landscape image on a portrait-turned screen is
+    // pillar-boxed, matching the GStreamer videoflip path.
+    const QSize box =
+        (imageRotation % 180 == 0) ? size() : QSize(height(), width());
+    QSize scaledSize = imageToPaint.size();
+    scaledSize.scale(box, Qt::KeepAspectRatio);
+    painter.translate(width() / 2.0, height() / 2.0);
+    painter.rotate(imageRotation);
+    painter.drawImage(
+        QRect(
+            -scaledSize.width() / 2,
+            -scaledSize.height() / 2,
+            scaledSize.width(),
+            scaledSize.height()),
+        imageToPaint);
 }
 
 void View::resizeEvent(QResizeEvent* event)
@@ -421,11 +1020,29 @@ void View::resizeEvent(QResizeEvent* event)
     QWidget::resizeEvent(event);
     webView1->setGeometry(rect());
     webView2->setGeometry(rect());
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
     if (videoView) {
         videoView->setGeometry(rect());
     }
+#endif
 }
 
+// Qt6-only: mpv/QtMultimedia video lives here. On the Qt5 linuxfb
+// boards (Pi 1/2/3), video is a separate gst_fbdev_player subprocess
+// painting straight to /dev/fb0 (see media_player.py), and this
+// function never compiles — so fallbackToLastImageOnBlank is cleared
+// on those boards only via the "null" sentinel branch in loadImage(),
+// which view_video() (anthias_viewer/__init__.py) calls before every
+// video asset. That ordering is relied on, not enforced here; if a
+// future change ever skips that call before a Qt5 video, the fallback
+// would stay armed into the video. Confirmed safe today: GstFbdev-
+// MediaPlayer.stop() blocks on Popen.wait() (SIGTERM, falling back to
+// SIGKILL) before view_video() returns, so the next view_image() for
+// the following asset can't run, and therefore can't repaint this
+// widget's currentImage onto /dev/fb0, until gst_fbdev_player has
+// actually exited and stopped writing frames. No cross-process lock
+// enforces that; it's an ordering guarantee from the caller.
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
 void View::playVideo(const QString &uri, const QVariantMap &options)
 {
     qDebug() << "Type: Video";
@@ -438,6 +1055,8 @@ void View::playVideo(const QString &uri, const QVariantMap &options)
         QObject::disconnect(pageLoadConnection);
         pageLoadConnection = QMetaObject::Connection{};
     }
+    pageLoadWatchdog->stop();
+    pendingPageUri.clear();
     stopReloadTimer();
     pendingReloadIntervalS = 0;
     webView1->stop();
@@ -445,9 +1064,12 @@ void View::playVideo(const QString &uri, const QVariantMap &options)
     webView1->setVisible(false);
     webView2->setVisible(false);
     // Blank the image canvas so an old still doesn't flash through
-    // before the first mpv frame paints.
+    // before the first mpv frame paints. Deliberate blank: leave the
+    // lastRasterImage fallback off (see the comment on
+    // fallbackToLastImageOnBlank in view.h).
     stopAnimation();
     currentImage = QImage();
+    fallbackToLastImageOnBlank = false;
     update();
 
     if (!videoView) {
@@ -475,6 +1097,7 @@ void View::hideVideoSurface()
     videoView->stop();
     videoView->setVisible(false);
 }
+#endif
 
 void View::handleAuthRequest(const QUrl& requestUrl, QAuthenticator*)
 {
@@ -512,6 +1135,8 @@ void View::setupAnimation()
     movie->start();
     movie->jumpToFrame(0);
     currentImage = movie->currentImage();
+    lastRasterImage = currentImage;
+    fallbackToLastImageOnBlank = false;
     update();
 }
 
@@ -594,6 +1219,24 @@ void View::switchToNextWebView()
         return;
     }
 
+    nextWebViewReady = false;
+
+    if (currentWebView == nextWebView) {
+        // Single-view mode (the only mode today — see the constructor).
+        // There is no off-screen buffer to reveal: the freshly-loaded
+        // page is already in the one view. Just make sure it is shown —
+        // it may have been hidden by a preceding image/video asset
+        // (loadImage()/playVideo() hide the web views) — and skip the
+        // dual-buffer hide/show + pointer swap, which on a single
+        // aliased widget would only toggle its visibility for no reason
+        // (and risk an avoidable flicker).
+        currentWebView->setVisible(true);
+        currentWebView->clearFocus();
+        armReloadTimer();
+        qDebug() << "Showing loaded web page (single-view)";
+        return;
+    }
+
     qDebug() << "Switching to next web view";
 
     currentWebView->setVisible(false);
@@ -603,8 +1246,6 @@ void View::switchToNextWebView()
     QWebEngineView* temp = currentWebView;
     currentWebView = nextWebView;
     nextWebView = temp;
-
-    nextWebViewReady = false;
 
     qDebug() << "Successfully switched to next web view";
 

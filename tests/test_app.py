@@ -29,8 +29,12 @@ straight DOM query.
 
 from __future__ import annotations
 
+import base64
+import contextlib
 import json
+import mimetypes
 import os
+import re
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -49,7 +53,6 @@ from tests._seed_data import (
     home_seed_assets,
 )
 from tests.conftest import MarketingShotFn
-
 
 BASE_URL = 'http://localhost:8080'
 SETTINGS_URL = f'{BASE_URL}/settings/'
@@ -93,7 +96,7 @@ class _TemporaryCopy:
         shutil.copy2(self.original_path, self.path)
         return self.path
 
-    def __exit__(self, *_: Any) -> None:
+    def __exit__(self, *_: object) -> None:
         try:
             os.remove(self.path)
         except FileNotFoundError:
@@ -149,6 +152,88 @@ def _disable_asset_poll(page: Page) -> None:
             if (el) el.removeAttribute('hx-trigger');
             if (window.htmx) window.htmx.process(document.body);
         }"""
+    )
+
+
+def _drop_files_on_page(
+    page: Page, paths: list[str], selector: str = 'body'
+) -> None:
+    """Drop real files on an arbitrary element, the way an operator
+    drags them in from the desktop.
+
+    Playwright has no API for a drag that starts outside the browser
+    (``set_input_files`` bypasses the gesture entirely), so the
+    DataTransfer is assembled inside the page and the three events a
+    real drop fires are dispatched by hand. The bytes are the file's
+    own, so the server receives exactly what a real drop would deliver.
+
+    ``selector`` defaults to somewhere with no dropzone under it: the
+    point of the feature is that the whole page takes drops, and the
+    handlers are bound on ``window``, so a dispatch anywhere that
+    bubbles reaches them.
+    """
+    payload = []
+    for path in paths:
+        with open(path, 'rb') as handle:
+            payload.append(
+                {
+                    'name': os.path.basename(path),
+                    'type': mimetypes.guess_type(path)[0]
+                    or 'application/octet-stream',
+                    'data': base64.b64encode(handle.read()).decode(),
+                }
+            )
+    page.evaluate(
+        """({ files, selector }) => {
+            const transfer = new DataTransfer();
+            for (const file of files) {
+                const binary = atob(file.data);
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) {
+                    bytes[i] = binary.charCodeAt(i);
+                }
+                transfer.items.add(
+                    new File([bytes], file.name, { type: file.type })
+                );
+            }
+            const target = document.querySelector(selector);
+            for (const type of ['dragenter', 'dragover', 'drop']) {
+                target.dispatchEvent(
+                    new DragEvent(type, {
+                        dataTransfer: transfer,
+                        bubbles: true,
+                        cancelable: true,
+                    })
+                );
+            }
+        }""",
+        {'files': payload, 'selector': selector},
+    )
+
+
+def _dispatch_file_dragenter(page: Page, selector: str) -> None:
+    """Start a file drag over ``selector`` without releasing it.
+
+    The drop-feedback assertions need the page mid-drag, which
+    ``_drop_files_on_page`` runs straight past. No bytes are needed —
+    the handlers read ``dataTransfer.types`` on the way in, and the
+    files only matter once the drop fires.
+    """
+    page.evaluate(
+        """(selector) => {
+            const transfer = new DataTransfer();
+            transfer.items.add(
+                new File(['x'], 'clip.mp4', { type: 'video/mp4' })
+            );
+            document.querySelector(selector).dispatchEvent(
+                new DragEvent('dragenter', {
+                    dataTransfer: transfer,
+                    bubbles: true,
+                    cancelable: true,
+                })
+            );
+        }""",
+        selector,
     )
 
 
@@ -563,6 +648,59 @@ def test_add_asset_via_url(reset_assets: None, page: Page) -> None:
 
 @pytest.mark.integration
 @pytest.mark.django_db(transaction=True)
+def test_add_asset_url_field_is_empty_on_reopen(
+    reset_assets: None, page: Page
+) -> None:
+    """Regression: the URL typed into one Add is gone by the
+    next one. The modal is hidden with ``x-show``, not unmounted, so
+    the field survives a close — the operator adding a second web
+    asset was met with the first one's URL still in the box, one
+    unnoticed Enter away from a duplicate. openAdd() resets the Add
+    pane on every open."""
+    page.goto(BASE_URL)
+    page.locator('#add-asset-button').click()
+    _wait_alpine(page, 'state.mode', 'add')
+
+    page.locator('input[name="uri"]').fill('https://engadget.com')
+    page.locator('form[action*="assets/new"] button[type="submit"]').click()
+
+    _wait_db(
+        lambda: Asset.objects.filter(uri='https://engadget.com').exists(),
+        description='first asset persisted to DB',
+    )
+    _wait_alpine(page, 'state.mode', None)
+
+    page.locator('#add-asset-button').click()
+    _wait_alpine(page, 'state.mode', 'add')
+    expect(page.locator('input[name="uri"]')).to_have_value('')
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_add_modal_reopens_on_the_url_tab(
+    reset_assets: None, page: Page
+) -> None:
+    """Same staleness one tab over: leaving the modal on Upload
+    file (or Apps) parked the next open there too, so the default entry
+    point for a web asset was whatever the last visit happened to
+    touch."""
+    page.goto(BASE_URL)
+    page.locator('#add-asset-button').click()
+    _wait_alpine(page, 'state.mode', 'add')
+
+    page.get_by_role('button', name='Upload file').click()
+    _wait_alpine(page, 'state.tab', 'file')
+    # Escape over the Cancel button: every pane renders its own footer,
+    # so several "Cancel" buttons live in this DOM at once.
+    page.keyboard.press('Escape')
+    _wait_alpine(page, 'state.mode', None)
+
+    page.locator('#add-asset-button').click()
+    _wait_alpine(page, 'state.tab', 'uri')
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
 def test_add_asset_via_image_upload(reset_assets: None, page: Page) -> None:
     image_file = '/tmp/image.png'
     page.goto(BASE_URL)
@@ -606,10 +744,29 @@ def test_add_asset_via_video_upload(reset_assets: None, page: Page) -> None:
     assert asset is not None
     assert asset.name == 'Video'
     assert asset.mimetype == 'video'
-    # Video uploads land with the placeholder default_duration while
-    # probe_video_duration runs ffprobe out-of-band on Celery.
-    assert asset.duration == settings['default_duration']
-    assert asset.is_processing is True
+    # Video uploads land with the placeholder default_duration and
+    # is_processing=True, then normalize_video_asset ffprobes the
+    # file out-of-band on Celery. Wait for the worker's terminal
+    # write instead of asserting the transient placeholder — racing
+    # the worker either way is flaky, and the wait doubles as the
+    # regression guard for the worker reading the wrong DB (it used
+    # to die with "no such table: assets", leaving the row stuck on
+    # "Processing" forever).
+    _wait_db(
+        lambda: Asset.objects.filter(is_processing=False).count() == 1,
+        timeout=30.0,
+        description='video normalisation reached terminal state',
+    )
+    asset = Asset.objects.first()
+    assert asset is not None
+    # ffprobe'd duration of tests/assets/asset.mov (5.57 s, floored),
+    # committed by the worker on both the accept and reject paths.
+    assert asset.duration == 5
+    # The test container sets no DEVICE_TYPE → empty HW-decode set →
+    # the mpeg4 source is rejected by the codec gate: on_failure
+    # writes the operator-facing error and disables the row.
+    assert asset.is_enabled is False
+    assert (asset.metadata or {}).get('error_message')
 
 
 @pytest.mark.integration
@@ -639,6 +796,213 @@ def test_add_two_uploads_in_one_modal_session(
     assets = list(Asset.objects.order_by('name'))
     assert len(assets) == 2
     assert {a.name for a in assets} == {'Standby', 'Video'}
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_add_multiple_uploads_at_once(reset_assets: None, page: Page) -> None:
+    """Regression for #3045: selecting several files in one go uploads
+    every one of them. The file input carries ``multiple`` and
+    uploadFiles() in home.ts POSTs them sequentially against the
+    single-file assets_upload endpoint. Multi-file upload existed in
+    the React UI (#2778) but was dropped in the #2818 rewrite."""
+    with (
+        _TemporaryCopy(
+            'src/anthias_server/app/static/img/standby.png', 'alpha.png'
+        ) as alpha,
+        _TemporaryCopy(
+            'src/anthias_server/app/static/img/anthias-loading.png', 'beta.png'
+        ) as beta,
+    ):
+        page.goto(BASE_URL)
+        page.locator('#add-asset-button').click()
+        _wait_alpine(page, 'state.mode', 'add')
+        page.get_by_role('button', name='Upload file').click()
+
+        # The picker only allows multi-select because the input has the
+        # `multiple` attribute — set_input_files with a list asserts it
+        # and exercises the sequential per-file upload loop.
+        page.locator('input[name="file_upload"]').set_input_files(
+            [alpha, beta]
+        )
+
+        _wait_db(
+            lambda: Asset.objects.count() == 2,
+            timeout=30.0,
+            description='both uploads persisted',
+        )
+
+    assets = list(Asset.objects.order_by('name'))
+    assert {a.name for a in assets} == {'Alpha', 'Beta'}
+    assert all(a.mimetype == 'image' for a in assets)
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_multi_upload_skips_rejected_file_and_continues(
+    reset_assets: None, page: Page
+) -> None:
+    """A file the server refuses (invalid type → HTTP 200 + error
+    toast) must not silently abort the batch: the error surfaces and
+    the remaining valid files still upload. The invalid file is first
+    in the selection so the valid one only lands if the loop carried
+    on past the rejection."""
+    junk = os.path.join(tempfile.gettempdir(), 'junk.bin')
+    with open(junk, 'wb') as fh:
+        fh.write(b'\x00\x01\x02\x03')
+    try:
+        with _TemporaryCopy(
+            'src/anthias_server/app/static/img/standby.png', 'good.png'
+        ) as good:
+            page.goto(BASE_URL)
+            page.locator('#add-asset-button').click()
+            _wait_alpine(page, 'state.mode', 'add')
+            page.get_by_role('button', name='Upload file').click()
+
+            # Playwright can't mix buffers with paths in one
+            # set_input_files call, so the junk file is written to disk
+            # above. The invalid file is first so the valid one only
+            # lands if the loop carried on past the rejection.
+            page.locator('input[name="file_upload"]').set_input_files(
+                [junk, good]
+            )
+
+            # The rejected file surfaces a server error toast...
+            toast = page.locator('.app-toast--error').first
+            expect(toast).to_be_visible(timeout=30_000)
+            expect(toast).to_contain_text('Invalid file type')
+
+            # ...and the valid file that followed it still uploads.
+            _wait_db(
+                lambda: Asset.objects.count() == 1,
+                timeout=30.0,
+                description='valid file uploaded despite earlier rejection',
+            )
+    finally:
+        try:
+            os.remove(junk)
+        except FileNotFoundError:
+            pass
+
+    asset = Asset.objects.first()
+    assert asset is not None
+    assert asset.name == 'Good'
+    assert asset.mimetype == 'image'
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_drop_file_anywhere_on_page_uploads_it(
+    reset_assets: None, page: Page
+) -> None:
+    """Dragging a file onto the asset list uploads it.
+
+    The drop target used to be the dashed zone inside the add-asset
+    modal and nothing else, so the gesture everyone tries first — drag
+    a video straight onto the schedule — fell through to the browser,
+    which navigated the tab to the local file. The drop here is
+    dispatched on the asset table, which is not a dropzone and never
+    was.
+    """
+    with _TemporaryCopy(
+        'src/anthias_server/app/static/img/standby.png', 'dropped.png'
+    ) as image:
+        page.goto(BASE_URL)
+        _disable_asset_poll(page)
+        _drop_files_on_page(page, [image], selector='#asset-table')
+
+        # The batch's progress UI lives in the add modal's upload pane,
+        # so a drop opens it there rather than uploading invisibly.
+        _wait_alpine(page, 'state.tab', 'file')
+
+        _wait_db(
+            lambda: Asset.objects.count() == 1,
+            timeout=30.0,
+            description='dropped image persisted',
+        )
+
+    asset = Asset.objects.first()
+    assert asset is not None
+    assert asset.name == 'Dropped'
+    assert asset.mimetype == 'image'
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_file_drag_is_claimed_from_the_browser(
+    reset_assets: None, page: Page
+) -> None:
+    """A drag the page does not cancel belongs to the browser, which
+    opens the dropped file and takes the page with it. Cancelling both
+    dragenter and dragover is what keeps the drop ours, so it is
+    asserted directly rather than inferred from the upload landing."""
+    page.goto(BASE_URL)
+    _disable_asset_poll(page)
+
+    claimed = page.evaluate(
+        """() => {
+            const transfer = new DataTransfer();
+            transfer.items.add(
+                new File(['x'], 'clip.mp4', { type: 'video/mp4' })
+            );
+            const target = document.getElementById('asset-table');
+            const dispatch = (type) => {
+                const event = new DragEvent(type, {
+                    dataTransfer: transfer,
+                    bubbles: true,
+                    cancelable: true,
+                });
+                target.dispatchEvent(event);
+                return event.defaultPrevented;
+            };
+            return {
+                dragenter: dispatch('dragenter'),
+                dragover: dispatch('dragover'),
+            };
+        }"""
+    )
+
+    assert claimed == {'dragenter': True, 'dragover': True}
+    # And the operator is told the page will take it.
+    expect(page.locator('.upload-drop-overlay')).to_be_visible()
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_drag_over_the_add_modals_url_pane_shows_the_drop_target(
+    reset_assets: None, page: Page
+) -> None:
+    """The Add modal open on "From URL" still takes a dropped file, so
+    it has to say so. The dashed dropzone lives on the upload pane and
+    is not on screen here, and the page overlay used to stand down for
+    any open modal — leaving the one pane where a drop works with no
+    sign that it does. It shows in its --layered form instead: the
+    card, without a second veil over a modal that already dimmed the
+    page."""
+    page.goto(BASE_URL)
+    _disable_asset_poll(page)
+    page.locator('#add-asset-button').click()
+    _wait_alpine(page, 'state.mode', 'add')
+    # openAdd() lands a non-upload open on the URL pane.
+    _wait_alpine(page, 'state.tab', 'uri')
+
+    # Dispatched on the URL box itself: it exists only on this pane,
+    # and it is where the pointer would be when the operator gives up
+    # on typing a URL and drags the file in instead.
+    _dispatch_file_dragenter(page, 'input[name="uri"]')
+
+    overlay = page.locator('.upload-drop-overlay')
+    expect(overlay).to_be_visible()
+    expect(overlay).to_have_class(re.compile(r'upload-drop-overlay--layered'))
+    # The veil is the modal's own, not two stacked.
+    assert (
+        page.evaluate(
+            """() => getComputedStyle(
+                document.querySelector('.upload-drop-overlay')
+            ).backgroundColor"""
+        )
+        == 'rgba(0, 0, 0, 0)'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -685,9 +1049,162 @@ def test_edit_changes_duration(reset_assets: None, page: Page) -> None:
     page.locator('form[action*="/update"] button[type="submit"]').click()
 
     _wait_db(
-        lambda: Asset.objects.get(asset_id=asset_active['asset_id']).duration
-        == 333,
+        lambda: (
+            Asset.objects.get(asset_id=asset_active['asset_id']).duration
+            == 333
+        ),
         description='duration update persisted',
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_edit_renames_asset(reset_assets: None, page: Page) -> None:
+    Asset.objects.create(**asset_active)
+    page.goto(BASE_URL)
+    _open_edit_modal(page, asset_active['asset_id'])
+
+    page.locator('#edit-name').fill('TPS Reports — Final Notice')
+    status = _submit_edit_form(page, asset_active['asset_id'])
+    assert status < 500
+
+    _wait_db(
+        lambda: (
+            Asset.objects.get(asset_id=asset_active['asset_id']).name
+            == 'TPS Reports — Final Notice'
+        ),
+        description='rename persisted',
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_edit_save_shows_success_toast(reset_assets: None, page: Page) -> None:
+    """Whichever submit path fires (htmx HX-Trigger or full-page
+    redirect + Django messages), a success toast must surface."""
+    Asset.objects.create(**asset_active)
+    page.goto(BASE_URL)
+    _open_edit_modal(page, asset_active['asset_id'])
+
+    page.locator('#edit-name').fill('Toast check')
+    _submit_edit_form(page, asset_active['asset_id'])
+
+    toast = page.locator('.app-toast--success').first
+    expect(toast).to_be_visible()
+    expect(toast).to_contain_text('Changes saved')
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_edit_toggles_nocache_and_skip_asset_check(
+    reset_assets: None, page: Page
+) -> None:
+    """The two Advanced switches post hidden-false/checkbox-true pairs
+    that _checkbox() resolves — both directions must persist."""
+    Asset.objects.create(**asset_active)
+    page.goto(BASE_URL)
+    _open_edit_modal(page, asset_active['asset_id'])
+    _open_advanced_section(page)
+
+    for box_id in ('edit-nocache', 'edit-skip'):
+        box = page.locator(f'#{box_id}')
+        expect(box).not_to_be_checked()
+        page.locator(f'label[for="{box_id}"]').click()
+        expect(box).to_be_checked()
+
+    status = _submit_edit_form(page, asset_active['asset_id'])
+    assert status < 500
+
+    def _flags_set() -> bool:
+        a = Asset.objects.get(asset_id=asset_active['asset_id'])
+        return a.nocache is True and a.skip_asset_check is True
+
+    _wait_db(_flags_set, description='advanced switches persisted')
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_edit_webpage_refresh_interval_persists(
+    reset_assets: None, page: Page
+) -> None:
+    """The auto-refresh field renders for webpage assets only and
+    lands in metadata.refresh_interval_s — feature #2813's UI path."""
+    Asset.objects.create(**{**asset_active, 'mimetype': 'webpage'})
+    page.goto(BASE_URL)
+    _open_edit_modal(page, asset_active['asset_id'])
+    _open_advanced_section(page)
+
+    refresh = page.locator('#edit-refresh-interval')
+    expect(refresh).to_be_visible()
+    refresh.fill('120')
+
+    status = _submit_edit_form(page, asset_active['asset_id'])
+    assert status < 500
+
+    _wait_db(
+        lambda: (
+            (
+                Asset.objects.get(asset_id=asset_active['asset_id']).metadata
+                or {}
+            ).get('refresh_interval_s')
+            == 120
+        ),
+        description='refresh interval persisted',
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_edit_refresh_interval_hidden_for_non_webpage(
+    reset_assets: None, page: Page
+) -> None:
+    Asset.objects.create(**asset_active)  # image asset
+    page.goto(BASE_URL)
+    _open_edit_modal(page, asset_active['asset_id'])
+    _open_advanced_section(page)
+    expect(page.locator('#edit-refresh-interval')).to_have_count(0)
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_edit_duration_disabled_for_video(
+    reset_assets: None, page: Page
+) -> None:
+    """Video duration is owned by the ffprobe pipeline; the edit form
+    must render it disabled so the probed value can't be clobbered."""
+    Asset.objects.create(
+        **{**asset_active, 'mimetype': 'video', 'duration': 42}
+    )
+    page.goto(BASE_URL)
+    _open_edit_modal(page, asset_active['asset_id'])
+    expect(page.locator('#edit-duration')).to_be_disabled()
+
+    status = _submit_edit_form(page, asset_active['asset_id'])
+    assert status < 500
+
+    # The POST is awaited by _submit_edit_form, so the server has
+    # already processed the save — the probed duration must survive.
+    assert Asset.objects.get(asset_id=asset_active['asset_id']).duration == 42
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_edit_modal_cancel_discards_changes(
+    reset_assets: None, page: Page
+) -> None:
+    Asset.objects.create(**asset_active)
+    page.goto(BASE_URL)
+    _open_edit_modal(page, asset_active['asset_id'])
+
+    page.locator('#edit-name').fill('Never saved')
+    page.locator('form[action*="/update"] button:has-text("Cancel")').click()
+    _wait_alpine(page, 'state.mode', None)
+
+    # Cancel fires no POST; once Alpine dropped the modal the DB can
+    # be asserted directly.
+    assert (
+        Asset.objects.get(asset_id=asset_active['asset_id']).name
+        == asset_active['name']
     )
 
 
@@ -714,6 +1231,100 @@ def test_preview_modal_opens(reset_assets: None, page: Page) -> None:
 
 @pytest.mark.integration
 @pytest.mark.django_db(transaction=True)
+def test_preview_modal_renders_image_and_done_closes(
+    reset_assets: None, page: Page
+) -> None:
+    """An image asset previews via /assets/<id>/preview inside the
+    modal; the Done button drops the Alpine state again."""
+    Asset.objects.create(**asset_active)
+    page.goto(BASE_URL)
+    expect(
+        page.locator(f'tr[data-asset-id="{asset_active["asset_id"]}"]')
+    ).to_be_visible()
+    _disable_asset_poll(page)
+
+    page.locator(
+        f'tr[data-asset-id="{asset_active["asset_id"]}"] '
+        f'button[title="Preview"]'
+    ).click()
+    _wait_alpine(
+        page,
+        'state.previewAsset && state.previewAsset.asset_id',
+        asset_active['asset_id'],
+    )
+    img = page.locator('img.preview-media')
+    expect(img).to_be_visible()
+    src = img.get_attribute('src')
+    assert src and f'/assets/{asset_active["asset_id"]}/preview' in src
+
+    page.get_by_role('button', name='Done').click()
+    _wait_alpine(page, 'state.previewAsset', None)
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_preview_iframe_is_shielded_from_a_file_drag(
+    reset_assets: None, page: Page
+) -> None:
+    """Drag events do not cross a browsing-context boundary, so a file
+    released over a webpage preview would belong to the iframe and the
+    frame would navigate away from the asset — the one surface the
+    page-wide drop handlers cannot claim. The frame leaves hit-testing
+    for the length of the drag instead, handing those events back to
+    the page, which refuses the drop without navigating anything."""
+    Asset.objects.create(**dict(asset_active, mimetype='webpage'))
+    page.goto(BASE_URL)
+    expect(
+        page.locator(f'tr[data-asset-id="{asset_active["asset_id"]}"]')
+    ).to_be_visible()
+    _disable_asset_poll(page)
+
+    page.locator(
+        f'tr[data-asset-id="{asset_active["asset_id"]}"] '
+        f'button[title="Preview"]'
+    ).click()
+    _wait_alpine(
+        page,
+        'state.previewAsset && state.previewAsset.asset_id',
+        asset_active['asset_id'],
+    )
+    frame = page.locator('iframe.preview-media--frame')
+    expect(frame).to_be_visible()
+
+    pointer_events = """() => getComputedStyle(
+        document.querySelector('iframe.preview-media--frame')
+    ).pointerEvents"""
+
+    # With no drag in flight the frame stays interactive: the shield
+    # must not cost the operator the ability to use the preview.
+    assert page.evaluate(pointer_events) == 'auto'
+
+    # A file drag entering the page. It is dispatched on the modal
+    # overlay because that is the page's own document, which the
+    # pointer has to cross to reach the frame in the middle of it.
+    page.evaluate(
+        """() => {
+            const transfer = new DataTransfer();
+            transfer.items.add(
+                new File(['x'], 'clip.mp4', { type: 'video/mp4' })
+            );
+            document.querySelector('.modal-overlay--nested').dispatchEvent(
+                new DragEvent('dragenter', {
+                    dataTransfer: transfer,
+                    bubbles: true,
+                    cancelable: true,
+                })
+            );
+        }"""
+    )
+
+    page.wait_for_function(
+        f'{pointer_events.strip()} === "none"', timeout=DEFAULT_TIMEOUT_MS
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
 def test_delete_confirm_modal_opens_with_pending_id(
     reset_assets: None, page: Page
 ) -> None:
@@ -729,6 +1340,44 @@ def test_delete_confirm_modal_opens_with_pending_id(
         f'button[title="Delete"]'
     ).click()
     _wait_alpine(page, 'state.pendingDeleteId', asset_active['asset_id'])
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_drop_over_a_dialog_says_how_to_retry(
+    reset_assets: None, page: Page
+) -> None:
+    """A dialog that owns the screen refuses the drop — but not in
+    silence. Every dragover on the page is cancelled, so the cursor
+    spends the whole drag telling the operator this is a drop target;
+    releasing into nothing after that reads as a file that vanished.
+    The refusal names the way out instead."""
+    Asset.objects.create(**asset_active)
+    page.goto(BASE_URL)
+    expect(
+        page.locator(f'tr[data-asset-id="{asset_active["asset_id"]}"]')
+    ).to_be_visible()
+    _disable_asset_poll(page)
+
+    page.locator(
+        f'tr[data-asset-id="{asset_active["asset_id"]}"] '
+        f'button[title="Delete"]'
+    ).click()
+    _wait_alpine(page, 'state.pendingDeleteId', asset_active['asset_id'])
+
+    with _TemporaryCopy(
+        'src/anthias_server/app/static/img/standby.png', 'refused.png'
+    ) as image:
+        _drop_files_on_page(page, [image])
+
+        toast = page.locator('.app-toast--info').first
+        expect(toast).to_be_visible()
+        expect(toast).to_contain_text('Close this dialog first')
+
+    # Refused means refused: no upload started, and the Add modal did
+    # not open on top of the prompt the operator was answering.
+    assert _alpine_state(page, 'state.mode') is None
+    assert Asset.objects.count() == 1
 
 
 @pytest.mark.integration
@@ -755,6 +1404,273 @@ def test_delete_confirm_removes_asset(reset_assets: None, page: Page) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 4b. Advanced schedule (day-parting) — issue #2988
+# ---------------------------------------------------------------------------
+
+
+def _open_edit_modal(page: Page, asset_id: str) -> None:
+    """Click a row's Edit button and wait for the modal's Alpine state."""
+    expect(page.locator(f'tr[data-asset-id="{asset_id}"]')).to_be_visible()
+    _disable_asset_poll(page)
+    page.locator(
+        f'tr[data-asset-id="{asset_id}"] button[title="Edit"]'
+    ).click()
+    _wait_alpine(page, 'state.mode', 'edit')
+
+
+def _open_advanced_section(page: Page) -> None:
+    """Expand the collapsible Advanced disclosure inside the edit
+    modal (closed by default when the asset has no advanced values)."""
+    toggle = page.locator('.modal-section__toggle')
+    if toggle.get_attribute('aria-expanded') != 'true':
+        toggle.click()
+    expect(page.locator('#edit-play-from')).to_be_visible()
+
+
+def _set_flatpickr_time(
+    page: Page, input_id: str, hour: int, minute: int, meridiem: str | None
+) -> None:
+    """Drive a Flatpickr time picker the way an operator does: click
+    the input so the picker pops open, type into its hour/minute
+    spinners, click the AM/PM toggle into the requested state, then
+    click a neutral spot to commit. (NOT Escape — the modal overlay
+    listens for ``keydown.escape.window`` and would close the whole
+    edit modal.) ``meridiem=None`` for 24-hour mode."""
+    page.locator(f'#{input_id}').click()
+    picker = page.locator('.flatpickr-calendar.open')
+    expect(picker).to_have_count(1)
+    expect(picker).to_be_visible()
+    # Real keystrokes, not fill(): Flatpickr's spinners select-all on
+    # focus and reformat on key input, so programmatic value-setting
+    # gets clobbered by its own normalisation pass.
+    picker.locator('input.flatpickr-hour').click()
+    page.keyboard.type(str(hour), delay=50)
+    picker.locator('input.flatpickr-minute').click()
+    page.keyboard.type(f'{minute:02d}', delay=50)
+    # Flatpickr only writes the spinner state back to the bound input
+    # on blur of the spinner — Tab commits it.
+    page.keyboard.press('Tab')
+    if meridiem is not None:
+        ampm = picker.locator('.flatpickr-am-pm')
+        expect(ampm).to_be_visible()
+        # The toggle flips on click; at most one flip needed.
+        if ampm.inner_text().strip().upper() != meridiem.upper():
+            ampm.click()
+        expect(ampm).to_have_text(meridiem.upper())
+    page.get_by_role('heading', name='Edit asset').click()
+    expect(picker).not_to_be_visible()
+
+
+def _submit_edit_form(page: Page, asset_id: str) -> int:
+    """Submit the edit form and return the HTTP status of the
+    assets_update POST it fires. Either submission path is fine —
+    an htmx hx-post answers 200 with the table partial, a native
+    form submit answers 302 back to home — the regression assertions
+    only care that the POST didn't 5xx."""
+    with page.expect_response(
+        lambda r: (
+            f'/assets/{asset_id}/update/' in r.url
+            and r.request.method == 'POST'
+        )
+    ) as resp_info:
+        page.locator('form[action*="/update"] button[type="submit"]').click()
+    return resp_info.value.status
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_edit_play_window_with_12_hour_time_picker(
+    reset_assets: None, page: Page
+) -> None:
+    """Regression for issue #2988: with the default 12-hour clock,
+    the Play from / Play until Flatpickr pickers post "02:30 PM"-shaped
+    values, which assets_update used to crash on (int('30 PM') →
+    ValueError → HTTP 500). Picking times through the real picker UI
+    must save cleanly and persist the 24-hour equivalents."""
+    from datetime import time as time_of_day
+
+    assert settings['use_24_hour_clock'] is False, (
+        'precondition: this test exercises the 12-hour clock default'
+    )
+    Asset.objects.create(**asset_active)
+    page.goto(BASE_URL)
+    _open_edit_modal(page, asset_active['asset_id'])
+    _open_advanced_section(page)
+
+    _set_flatpickr_time(page, 'edit-play-from', 2, 30, 'PM')
+    _set_flatpickr_time(page, 'edit-play-to', 11, 45, 'PM')
+
+    # The pickers must have produced 12-hour strings — that's the
+    # exact shape the original bug choked on.
+    expect(page.locator('#edit-play-from')).to_have_value('2:30 PM')
+    expect(page.locator('#edit-play-to')).to_have_value('11:45 PM')
+
+    status = _submit_edit_form(page, asset_active['asset_id'])
+    assert status < 500, (
+        f'assets_update returned HTTP {status} for a 12-hour play window'
+    )
+
+    def _persisted() -> bool:
+        a = Asset.objects.get(asset_id=asset_active['asset_id'])
+        return a.play_time_from == time_of_day(14, 30) and (
+            a.play_time_to == time_of_day(23, 45)
+        )
+
+    _wait_db(_persisted, description='12-hour play window persisted')
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_edit_availability_window_with_12_hour_datetime_picker(
+    reset_assets: None, page: Page
+) -> None:
+    """The Start / End availability pickers post the full
+    "06/15/2026 02:30 PM" shape under the default 12-hour clock —
+    saving must succeed and land the right aware datetimes."""
+    assert settings['use_24_hour_clock'] is False, (
+        'precondition: this test exercises the 12-hour clock default'
+    )
+    Asset.objects.create(**asset_active)
+    page.goto(BASE_URL)
+    _open_edit_modal(page, asset_active['asset_id'])
+
+    # Type the full datetime strings (allowInput is on; this is the
+    # same wire format the picker itself produces for m/d/Y h:i K).
+    page.locator('#edit-start').fill('06/15/2026 09:00 AM')
+    page.locator('#edit-end').fill('12/24/2026 11:30 PM')
+    # Focusing the inputs pops the calendar panel, which overlays the
+    # footer's Save button — click a neutral spot to dismiss it.
+    page.get_by_role('heading', name='Edit asset').click()
+    expect(page.locator('.flatpickr-calendar.open')).to_have_count(0)
+    # Flatpickr re-formats to its h:i K mask on close (leading-zero
+    # hour drops: '09:00 AM' → '9:00 AM') but must keep the typed
+    # date/time semantics intact — no month/day swap, no reset to
+    # the seeded values.
+    expect(page.locator('#edit-start')).to_have_value('06/15/2026 9:00 AM')
+    expect(page.locator('#edit-end')).to_have_value('12/24/2026 11:30 PM')
+
+    status = _submit_edit_form(page, asset_active['asset_id'])
+    assert status < 500, (
+        f'assets_update returned HTTP {status} for 12-hour datetimes'
+    )
+
+    def _persisted() -> bool:
+        a = Asset.objects.get(asset_id=asset_active['asset_id'])
+        if a.start_date is None or a.end_date is None:
+            return False
+        start = a.start_date
+        end = a.end_date
+        return (start.month, start.day, start.hour, start.minute) == (
+            6,
+            15,
+            9,
+            0,
+        ) and (end.month, end.day, end.hour, end.minute) == (12, 24, 23, 30)
+
+    _wait_db(_persisted, description='12-hour availability window persisted')
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_edit_play_days_and_clear_play_window(
+    reset_assets: None, page: Page
+) -> None:
+    """The weekday picker persists a play_days subset, and clearing
+    both time fields resets the day-parting window to all-day."""
+    Asset.objects.create(
+        **{
+            **asset_active,
+            'play_time_from': '09:00:00',
+            'play_time_to': '17:00:00',
+        }
+    )
+    page.goto(BASE_URL)
+    _open_edit_modal(page, asset_active['asset_id'])
+    # Asset has a non-default play window, so Advanced auto-expands.
+    expect(page.locator('#edit-play-from')).to_be_visible()
+
+    # Uncheck Sat (6) + Sun (7). The checkboxes are visually hidden
+    # behind the chip-styled labels, so click the label like a user.
+    for day in (6, 7):
+        box = page.locator(f'input[name="play_days"][value="{day}"]')
+        expect(box).to_be_checked()
+        page.locator(
+            f'label.weekday:has(input[name="play_days"][value="{day}"])'
+        ).click()
+        expect(box).not_to_be_checked()
+
+    # Clear both time fields → "play all day".
+    page.locator('#edit-play-from').fill('')
+    page.locator('#edit-play-to').fill('')
+    # Dismiss the time picker the focus popped open so it doesn't
+    # overlay the Save button.
+    page.get_by_role('heading', name='Edit asset').click()
+    expect(page.locator('.flatpickr-calendar.open')).to_have_count(0)
+
+    status = _submit_edit_form(page, asset_active['asset_id'])
+    assert status < 500
+
+    def _persisted() -> bool:
+        a = Asset.objects.get(asset_id=asset_active['asset_id'])
+        return (
+            a.get_play_days() == [1, 2, 3, 4, 5]
+            and a.play_time_from is None
+            and a.play_time_to is None
+        )
+
+    _wait_db(_persisted, description='weekday subset + cleared window')
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_delete_cancel_keeps_asset(reset_assets: None, page: Page) -> None:
+    Asset.objects.create(**asset_active)
+    page.goto(BASE_URL)
+    expect(
+        page.locator(f'tr[data-asset-id="{asset_active["asset_id"]}"]')
+    ).to_be_visible()
+    _disable_asset_poll(page)
+
+    page.locator(
+        f'tr[data-asset-id="{asset_active["asset_id"]}"] '
+        f'button[title="Delete"]'
+    ).click()
+    _wait_alpine(page, 'state.pendingDeleteId', asset_active['asset_id'])
+    page.get_by_role('button', name='Cancel').click()
+    _wait_alpine(page, 'state.pendingDeleteId', None)
+
+    # Cancel fires no POST — assert the row survived directly.
+    assert Asset.objects.filter(asset_id=asset_active['asset_id']).exists()
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_day_parted_asset_renders_schedule_chips(
+    reset_assets: None, page: Page
+) -> None:
+    """A weekday-filtered, day-parted asset must render its weekday
+    and time-window chips on the table row (12-hour clock default)."""
+    Asset.objects.create(
+        **{
+            **asset_active,
+            'play_days': '[1, 3, 5]',
+            'play_time_from': '09:00:00',
+            'play_time_to': '17:30:00',
+        }
+    )
+    page.goto(BASE_URL)
+    row = page.locator(f'tr[data-asset-id="{asset_active["asset_id"]}"]')
+    expect(row).to_be_visible()
+    for label in ('Mon', 'Wed', 'Fri'):
+        expect(row.locator('.schedule-chip', has_text=label)).to_be_visible()
+    expect(
+        row.locator('.schedule-chip', has_text='9:00 AM – 5:30 PM')
+    ).to_be_visible()
+    # No 'Everyday' chip when a weekday subset is active.
+    expect(row.locator('.schedule-chip', has_text='Everyday')).to_have_count(0)
+
+
+# ---------------------------------------------------------------------------
 # 5. Toggle enable/disable
 # ---------------------------------------------------------------------------
 
@@ -769,16 +1685,19 @@ def test_toggle_enables_asset(reset_assets: None, page: Page) -> None:
     ).to_be_visible()
     _disable_asset_poll(page)
 
+    # Target the activity toggle specifically — rows now also carry a
+    # bulk-select checkbox (#3046), so a bare input[type=checkbox] is
+    # ambiguous.
     page.locator(
         f'tr[data-asset-id="{asset_disabled["asset_id"]}"] '
-        f'input[type="checkbox"]'
+        f'.activity-toggle input[type="checkbox"]'
     ).click()
 
     _wait_db(
-        lambda: Asset.objects.get(
-            asset_id=asset_disabled['asset_id']
-        ).is_enabled
-        is True,
+        lambda: (
+            Asset.objects.get(asset_id=asset_disabled['asset_id']).is_enabled
+            is True
+        ),
         description='asset is_enabled flipped to True',
     )
 
@@ -793,14 +1712,19 @@ def test_toggle_disables_asset(reset_assets: None, page: Page) -> None:
     ).to_be_visible()
     _disable_asset_poll(page)
 
+    # Target the activity toggle specifically — rows now also carry a
+    # bulk-select checkbox (#3046), so a bare input[type=checkbox] is
+    # ambiguous.
     page.locator(
         f'tr[data-asset-id="{asset_active["asset_id"]}"] '
-        f'input[type="checkbox"]'
+        f'.activity-toggle input[type="checkbox"]'
     ).click()
 
     _wait_db(
-        lambda: Asset.objects.get(asset_id=asset_active['asset_id']).is_enabled
-        is False,
+        lambda: (
+            Asset.objects.get(asset_id=asset_active['asset_id']).is_enabled
+            is False
+        ),
         description='asset is_enabled flipped to False',
     )
 
@@ -905,6 +1829,166 @@ def test_settings_form_persists_default_duration(
         _post_default_duration(new_value)
     finally:
         _post_default_duration(original)
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_navbar_links_navigate(reset_assets: None, page: Page) -> None:
+    """The top-nav tabs must reach their pages (Integrations is
+    balena-gated and absent in the test container)."""
+    page.goto(BASE_URL)
+    page.get_by_role('link', name='Settings').click()
+    expect(
+        page.get_by_role('heading', name='Settings', exact=True)
+    ).to_be_visible()
+    page.get_by_role('link', name='System info').click()
+    expect(page.get_by_role('heading', name='System Info')).to_be_visible()
+    # Not exact=True: the tabler icon's ::before glyph joins the
+    # link's accessible name.
+    page.get_by_role('link', name='Schedule').click()
+    expect(
+        page.get_by_role('heading', name='Schedule Overview')
+    ).to_be_visible()
+
+
+def _save_settings_form(page: Page) -> None:
+    page.locator('form[action*="settings/save"] button[type="submit"]').click()
+    # The save handler redirects back to /settings.
+    expect(
+        page.get_by_role('heading', name='Settings', exact=True)
+    ).to_be_visible()
+
+
+def _set_clock_toggle(page: Page, use_24h: bool) -> None:
+    """Flip the 'Use 24-hour clock' switch through the browser and
+    save. Goes through uvicorn (not settings.save() in this process)
+    because the server keeps its own AnthiasSettings singleton."""
+    page.goto(SETTINGS_URL)
+    box = page.locator('#use_24_hour_clock')
+    if box.is_checked() != use_24h:
+        page.locator('label[for="use_24_hour_clock"]').click()
+    if use_24h:
+        expect(box).to_be_checked()
+    else:
+        expect(box).not_to_be_checked()
+    _save_settings_form(page)
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_24_hour_clock_play_window_end_to_end(
+    reset_assets: None, page: Page
+) -> None:
+    """Counterpart to the 12-hour regression: with the 24-hour clock
+    enabled in Settings, the play-window pickers run without an AM/PM
+    toggle, post H:i values, and persist. Restores the 12-hour
+    default afterwards so sibling tests keep their precondition."""
+    from datetime import time as time_of_day
+
+    Asset.objects.create(**asset_active)
+    try:
+        _set_clock_toggle(page, use_24h=True)
+
+        page.goto(BASE_URL)
+        _open_edit_modal(page, asset_active['asset_id'])
+        _open_advanced_section(page)
+
+        page.locator('#edit-play-from').click()
+        picker = page.locator('.flatpickr-calendar.open')
+        expect(picker).to_be_visible()
+        # 24-hour mode renders no AM/PM toggle.
+        expect(picker.locator('.flatpickr-am-pm')).to_have_count(0)
+        picker.locator('input.flatpickr-hour').click()
+        page.keyboard.type('14', delay=50)
+        picker.locator('input.flatpickr-minute').click()
+        page.keyboard.type('30', delay=50)
+        page.keyboard.press('Tab')
+        page.get_by_role('heading', name='Edit asset').click()
+        expect(page.locator('#edit-play-from')).to_have_value('14:30')
+
+        _set_flatpickr_time(page, 'edit-play-to', 23, 45, None)
+        expect(page.locator('#edit-play-to')).to_have_value('23:45')
+
+        status = _submit_edit_form(page, asset_active['asset_id'])
+        assert status < 500
+
+        def _persisted() -> bool:
+            a = Asset.objects.get(asset_id=asset_active['asset_id'])
+            return a.play_time_from == time_of_day(14, 30) and (
+                a.play_time_to == time_of_day(23, 45)
+            )
+
+        _wait_db(_persisted, description='24-hour play window persisted')
+    finally:
+        _set_clock_toggle(page, use_24h=False)
+
+
+def _set_date_format(page: Page, value: str) -> None:
+    page.goto(SETTINGS_URL)
+    page.locator('#date_format').select_option(value)
+    _save_settings_form(page)
+    expect(page.locator('#date_format')).to_have_value(value)
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_date_format_round_trip_in_edit_modal(
+    reset_assets: None, page: Page
+) -> None:
+    """Switch the device to dd/mm/yyyy: the availability pickers must
+    format AND parse in that shape, so saving a typed d/m/Y datetime
+    lands the right calendar day (not a swapped month/day)."""
+    Asset.objects.create(**asset_active)
+    try:
+        _set_date_format(page, 'dd/mm/yyyy')
+
+        page.goto(BASE_URL)
+        _open_edit_modal(page, asset_active['asset_id'])
+        page.locator('#edit-end').fill('24/12/2026 11:30 PM')
+        page.get_by_role('heading', name='Edit asset').click()
+        expect(page.locator('.flatpickr-calendar.open')).to_have_count(0)
+        expect(page.locator('#edit-end')).to_have_value('24/12/2026 11:30 PM')
+
+        status = _submit_edit_form(page, asset_active['asset_id'])
+        assert status < 500
+
+        def _persisted() -> bool:
+            a = Asset.objects.get(asset_id=asset_active['asset_id'])
+            if a.end_date is None:
+                return False
+            return (
+                a.end_date.day,
+                a.end_date.month,
+                a.end_date.year,
+                a.end_date.hour,
+                a.end_date.minute,
+            ) == (24, 12, 2026, 23, 30)
+
+        _wait_db(_persisted, description='d/m/Y end date persisted')
+    finally:
+        _set_date_format(page, 'mm/dd/yyyy')
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_settings_player_name_round_trip(
+    reset_assets: None, page: Page
+) -> None:
+    """Player name is the simplest free-text setting — save, reload,
+    value sticks, then restore."""
+    page.goto(SETTINGS_URL)
+    original = page.locator('#player_name').input_value()
+
+    def _set_name(value: str) -> None:
+        page.goto(SETTINGS_URL)
+        page.locator('#player_name').fill(value)
+        _save_settings_form(page)
+        expect(page.locator('#player_name')).to_have_value(value)
+
+    try:
+        _set_name('Initech Lobby Screen')
+    finally:
+        _set_name(original)
 
 
 # Inlined into the system-info marketing capture below. Lives at
@@ -1134,22 +2218,21 @@ def test_skip_buttons_publish_correct_command(
             f'expected viewer publish {expected_command!r}, got {published!r}'
         )
     finally:
-        try:
+        with contextlib.suppress(Exception):
             sub.unsubscribe()
             sub.close()
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
 # 8. Display power (experimental, HDMI-CEC) — issue #2575
 # ---------------------------------------------------------------------------
 #
-# The section is gated on cec_available(), which stats /dev/cec0 and
-# /dev/vchiq. Neither exists in the test container by default, so the
-# section is hidden on every other settings test. To exercise the
-# visible state we stub /dev/vchiq with a plain file before navigating
-# and remove it on teardown.
+# The section is gated on cec_available(), which enumerates /dev/cec*
+# and probes each with CEC_ADAP_G_CAPS. No adapter exists in the test
+# container by default, so the section is hidden on every other settings
+# test. The visible-state tests require real CEC hardware and skip
+# without it — see the cec_stub_device fixture for why it can no longer
+# be faked.
 
 # Screenshot capture is OFF by default. The original PR (#2886) used
 # screenshots for a one-time UX review; running them on every CI cycle
@@ -1178,27 +2261,28 @@ def _maybe_screenshot(page: Page, filename: str, **kwargs: Any) -> None:
 
 @pytest.fixture
 def cec_stub_device() -> Any:
-    """Create a stub `/dev/vchiq` so `diagnostics.cec_available()`
-    returns True. /dev is tmpfs+writable in the test container; we
-    create a plain file (not a real device node) — the gate only
-    `os.path.exists`s the path.
+    """Require a real CEC adapter, skipping when there is none.
+
+    This used to fake availability by creating a plain file at
+    `/dev/vchiq`, because the old gate was a bare `os.path.exists`. That
+    is no longer possible, and deliberately so: `cec_available()` now
+    enumerates `/dev/cec*` and issues `CEC_ADAP_G_CAPS` against each, so
+    a regular file fails the ioctl (ENOTTY) and is correctly rejected.
+    The gate answers "is there CEC hardware", which a touch-file cannot
+    honestly satisfy.
+
+    These are Playwright tests against a separate server process, so
+    in-process mocking cannot reach it either. The rendering logic is
+    covered without hardware by the unit tests in
+    `test_template_views.py`, which mock `diagnostics.cec_available`
+    directly; this fixture keeps the browser-level checks meaningful by
+    running them only where a real adapter exists.
     """
-    path = '/dev/vchiq'
-    created = False
-    if not os.path.exists(path):
-        try:
-            open(path, 'w').close()
-            created = True
-        except OSError:
-            pytest.skip('cannot stub /dev/vchiq in this environment')
-    try:
-        yield path
-    finally:
-        if created:
-            try:
-                os.remove(path)
-            except FileNotFoundError:
-                pass
+    from anthias_server.lib import cec
+
+    if not cec.available():
+        pytest.skip('no CEC adapter on this host')
+    yield '/dev/cec0'
 
 
 @pytest.mark.integration
@@ -1206,11 +2290,13 @@ def cec_stub_device() -> Any:
 def test_display_power_section_hidden_without_cec_adapter(
     reset_assets: None, page: Page
 ) -> None:
-    """No /dev/cec0 or /dev/vchiq in the container by default — the
-    experimental section must NOT render. Guards against accidentally
-    surfacing CEC controls on x86 / non-CEC hardware."""
-    if os.path.exists('/dev/vchiq') or os.path.exists('/dev/cec0'):
-        pytest.skip('CEC device present; cannot test the hidden case')
+    """No CEC adapter in the container by default — the experimental
+    section must NOT render. Guards against accidentally surfacing CEC
+    controls on x86 / non-CEC hardware."""
+    from anthias_server.lib import cec
+
+    if cec.available():
+        pytest.skip('CEC adapter present; cannot test the hidden case')
     page.goto(SETTINGS_URL)
     expect(
         page.get_by_role('heading', name='Settings', exact=True)

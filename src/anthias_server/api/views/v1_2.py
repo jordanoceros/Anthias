@@ -5,9 +5,8 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from anthias_server.app.models import Asset
+from anthias_common.remote_video import dispatch_remote_video_download
 from anthias_common.youtube import dispatch_download
-from anthias_server.processing import dispatch_pending_normalize
 from anthias_server.api.helpers import (
     AssetCreationError,
     finalize_asset_update,
@@ -20,7 +19,9 @@ from anthias_server.api.serializers import (
 )
 from anthias_server.api.serializers.v1_2 import CreateAssetSerializerV1_2
 from anthias_server.api.views.mixins import DeleteAssetViewMixin
+from anthias_server.app.models import Asset
 from anthias_server.lib.auth import authorized
+from anthias_server.processing import dispatch_pending_normalize
 
 
 class AssetListViewV1_2(APIView):
@@ -63,6 +64,17 @@ class AssetListViewV1_2(APIView):
         # site didn't exist.
         if serializer._pending_youtube_uri:
             dispatch_download(asset.asset_id, serializer._pending_youtube_uri)
+
+        # Same hand-off for generic remote http(s) video URLs: the
+        # serializer rewrote the row to a local destination path and
+        # flipped is_processing; the Celery task downloads the file
+        # and chains into normalize_video_asset. Live streams (RTSP /
+        # HLS / DASH) never reach this branch — the serializer's
+        # classify keeps them as literal URIs.
+        if serializer._pending_remote_video_uri:
+            dispatch_remote_video_download(
+                asset.asset_id, serializer._pending_remote_video_uri
+            )
 
         # Same hand-off as v2: the serializer's prepare_asset stamps
         # is_processing on rows that need normalisation; we dispatch
